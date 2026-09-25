@@ -213,6 +213,16 @@ impl CropEditor {
         }
     }
 
+    /// Blank the preview and forget the current source. Used before a video
+    /// thumbnail is (re)generated in the background, so the editor shows an
+    /// empty frame instead of `Picture::set_file` decoding the raw video and
+    /// painting black (GTK draws a video's first container frame, not a
+    /// meaningful one).
+    pub fn clear(&self) {
+        *self.source.borrow_mut() = None;
+        self.picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+    }
+
     pub fn set_crop(&self, crop: Option<Crop>) {
         self.state.borrow_mut().crop = crop;
         self.drawing.queue_draw();

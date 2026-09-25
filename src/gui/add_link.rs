@@ -307,10 +307,12 @@ pub(crate) fn show_add_link_dialog(
                                 save_entries(&s.entries).ok();
                                 s.entries.len() - 1
                             };
-                            // Thumbnail shells out to ffmpeg; the editor we
-                            // land in below loads its preview from the
-                            // entry's path, not the thumbnail, so it doesn't
-                            // need to wait for this.
+                            // Thumbnail shells out to ffmpeg; keep it off this
+                            // thread so the dialog closes immediately. A
+                            // video with no thumbnail yet doesn't show black
+                            // in the editor below — its own on-enter handler
+                            // notices the gap and thumbnails the entry again
+                            // before painting the crop preview.
                             super::window::spawn_thumbnail_batch(&state, vec![id]);
                             show_toast(
                                 &state,
