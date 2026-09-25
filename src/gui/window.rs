@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -455,7 +456,7 @@ fn build_library_view(
     // Side margins are set by apply_layout_bucket (tighter in compact mode).
     let search = gtk4::SearchEntry::new();
     search.add_css_class("wp-search");
-    search.set_placeholder_text(Some(t!("Search wallpapers…")));
+    search.set_placeholder_text(Some(t!("Search wallpapers or folders…")));
     search.set_margin_top(8);
     search.set_margin_bottom(2);
     // Cap the entry at a readable width instead of stretching edge-to-edge.
@@ -570,7 +571,50 @@ fn build_library_view(
     content_clamp.set_child(Some(&content));
 
     scroll.set_child(Some(&content_clamp));
-    root.append(&scroll);
+
+    // Wrap the scroller in an Overlay so a floating "back to top" button can
+    // sit above the grid without stealing layout space from it.
+    let scroll_overlay = gtk4::Overlay::new();
+    scroll_overlay.set_vexpand(true);
+    scroll_overlay.set_child(Some(&scroll));
+
+    let back_to_top = gtk4::Button::from_icon_name("go-up-symbolic");
+    back_to_top.add_css_class("osd");
+    back_to_top.add_css_class("circular");
+    back_to_top.set_halign(gtk4::Align::End);
+    back_to_top.set_valign(gtk4::Align::End);
+    back_to_top.set_margin_end(18);
+    back_to_top.set_margin_bottom(18);
+    back_to_top.set_tooltip_text(Some(t!("Back to top")));
+    back_to_top.update_property(&[gtk4::accessible::Property::Label(t!("Back to top"))]);
+    // Hidden until there is enough to scroll past — a button that does
+    // nothing at the top of a short list is just clutter.
+    back_to_top.set_visible(false);
+    {
+        let vadj = scroll.vadjustment();
+        let back_to_top = back_to_top.clone();
+        vadj.connect_value_changed(move |adj| {
+            back_to_top.set_visible(adj.value() > adj.page_size() / 2.0);
+        });
+    }
+    {
+        let scroll = scroll.clone();
+        back_to_top.connect_clicked(move |_| {
+            let adj = scroll.vadjustment();
+            let start = adj.value();
+            if start <= 0.0 {
+                return;
+            }
+            let adj_target = adj.clone();
+            let target =
+                adw::CallbackAnimationTarget::new(move |value| adj_target.set_value(value));
+            let animation = adw::TimedAnimation::new(&scroll, start, 0.0, 250, target);
+            animation.play();
+        });
+    }
+    scroll_overlay.add_overlay(&back_to_top);
+
+    root.append(&scroll_overlay);
 
     // ── Footer: anchored action bar (count left, add actions right) ──
     // Horizontal inset comes from the .footer-bar CSS padding (tighter in
@@ -783,7 +827,7 @@ fn build_library_view(
                 // is not looking at would aim the next Remove at wallpapers
                 // that are not on screen.
                 let s = state.borrow();
-                scoped_ids(&s.entries, &s.view, &q)
+                scoped_ids(&s.entries, &s.collections, &s.view, &q)
             }
         };
         {
@@ -802,6 +846,7 @@ fn build_library_view(
         });
     }
     let refresh: Rc<dyn Fn()> = {
+        let window = window.clone();
         let state = state.clone();
         let sections_box = sections_box.clone();
         let recent_box = recent_box.clone();
@@ -814,6 +859,12 @@ fn build_library_view(
         let count_label = count_label.clone();
         let toolbar = toolbar.clone();
         let sync_toolbar = sync_toolbar.clone();
+        let scroll = scroll.clone();
+        // The query a rebuild was last run for, so a rebuild triggered by a
+        // *changed* search query can tell "the results moved" (land at the
+        // top — correct) apart from "the same results were rebuilt in place"
+        // (a folder move, a rename, a tab switch — restore where we were).
+        let last_query: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         Rc::new(move || {
             // Searching an empty library is pointless: hide the field until
             // there's something to search.
@@ -827,7 +878,31 @@ fn build_library_view(
             } else {
                 tf!("{count} wallpapers", "count" => n.to_string())
             });
-            let q = home_query.borrow();
+            let q = home_query.borrow().clone();
+
+            // `populate_library` clears `sections_box` and rebuilds it from
+            // scratch. While it is briefly empty the Viewport clamps its
+            // adjustment to 0, and once the new cards land GTK's
+            // scroll-to-focus-widget can recenter on whatever kept focus
+            // (typically the card the user just clicked) — both of which
+            // yank the view back to the top of the page after every reorder,
+            // move-to-folder or Set. Save the position first and restore it
+            // after, unless the query itself just changed: landing on the
+            // top of a fresh set of search results is correct, not a bug.
+            let query_changed = *last_query.borrow() != q;
+            *last_query.borrow_mut() = q.clone();
+            let vadj = scroll.vadjustment();
+            let saved = if query_changed { 0.0 } else { vadj.value() };
+
+            // A focused card is about to be destroyed with the rest of the
+            // grid; drop focus first so GTK has nothing left to chase into
+            // the rebuilt widget tree.
+            if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&window) {
+                if focus.is_ancestor(&sections_box) {
+                    gtk4::prelude::GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+                }
+            }
+
             populate_library(
                 &state,
                 &sections_box,
@@ -838,6 +913,25 @@ fn build_library_view(
                 q.as_str(),
                 bucket.get(),
             );
+
+            if saved > 0.0 {
+                log::debug!("library refresh: vadj {saved} -> restoring");
+                let clamp = |adj: &gtk4::Adjustment| {
+                    let upper = (adj.upper() - adj.page_size()).max(0.0);
+                    saved.min(upper)
+                };
+                vadj.set_value(clamp(&vadj));
+                // The Viewport's own layout (and any scroll-to-focus it still
+                // queues) lands an event loop turn after this call returns,
+                // so restore again once that settles — the one-shot idle is
+                // the fallback for whatever the immediate `set_value` above
+                // didn't already fix.
+                let vadj2 = vadj.clone();
+                glib::idle_add_local_once(move || {
+                    let upper = (vadj2.upper() - vadj2.page_size()).max(0.0);
+                    vadj2.set_value(saved.min(upper));
+                });
+            }
         })
     };
     state.borrow_mut().refresh = Some(refresh.clone());
@@ -1370,7 +1464,11 @@ fn plan_sections(
     query: &str,
 ) -> Vec<SectionPlan> {
     let q = query.to_lowercase();
-    let keep = |e: &LibraryEntry| entry_in_scope(e, view) && entry_matches_query(e, &q);
+    let names = folder_names(collections);
+    let folder_of = |e: &LibraryEntry| e.collection.as_deref().and_then(|id| names.get(id));
+    let keep = |e: &LibraryEntry| {
+        entry_in_scope(e, view) && entry_matches_query(e, &q, folder_of(e).map(String::as_str))
+    };
     let sorted = |mut v: Vec<&LibraryEntry>| -> Vec<String> {
         library::sort_entries(&mut v, view.sort);
         v.into_iter().map(|e| e.id.clone()).collect()
@@ -1455,11 +1553,20 @@ fn plan_sections(
 /// "Select all" is built on this. Filtering by the query alone would tick cards
 /// that are not on screen, and the very next click would delete wallpapers out
 /// of a folder the user was not even looking at.
-fn scoped_ids(entries: &[LibraryEntry], view: &library::LibraryView, query: &str) -> Vec<String> {
+fn scoped_ids(
+    entries: &[LibraryEntry],
+    collections: &[library::Collection],
+    view: &library::LibraryView,
+    query: &str,
+) -> Vec<String> {
     let q = query.to_lowercase();
+    let names = folder_names(collections);
+    let folder_of = |e: &LibraryEntry| e.collection.as_deref().and_then(|id| names.get(id));
     entries
         .iter()
-        .filter(|e| entry_in_scope(e, view) && entry_matches_query(e, &q))
+        .filter(|e| {
+            entry_in_scope(e, view) && entry_matches_query(e, &q, folder_of(e).map(String::as_str))
+        })
         .map(|e| e.id.clone())
         .collect()
 }
@@ -2617,7 +2724,6 @@ fn toggle_favorite(state: &Rc<RefCell<AppState>>, idx: usize) {
 }
 
 /// Case-insensitive substring match over both the raw and prettified names
-/// (`q` must already be lowercased). Shared by home search and the palette.
 /// Nudge one card one place within its own folder. `delta` is -1 (earlier) or
 /// +1 (later).
 ///
@@ -2680,10 +2786,30 @@ fn move_entries_to_collection(
     refresh_selection(state);
 }
 
-fn entry_matches_query(e: &LibraryEntry, q: &str) -> bool {
+/// Whether `e` matches a search query (`q` must already be lowercased).
+/// Shared by home search and the palette.
+///
+/// Matches the entry's own name, or — when it belongs to a folder — that
+/// folder's name, so typing "nature" surfaces everything filed under a
+/// "Nature" folder even when none of the individual wallpaper names mention
+/// it. `folder` is looked up by the caller (see [`folder_names`]) rather than
+/// resolved here, so a hot search loop is not re-scanning `collections` once
+/// per entry.
+fn entry_matches_query(e: &LibraryEntry, q: &str, folder: Option<&str>) -> bool {
     q.is_empty()
         || e.name.to_lowercase().contains(q)
         || display_name(&e.name, e.kind).to_lowercase().contains(q)
+        || folder.is_some_and(|name| name.contains(q))
+}
+
+/// Lower-cased folder names keyed by id, for a query's-worth of
+/// [`entry_matches_query`] lookups without re-scanning `collections` per
+/// entry.
+fn folder_names(collections: &[library::Collection]) -> HashMap<&str, String> {
+    collections
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.to_lowercase()))
+        .collect()
 }
 
 /// Lazily probe media metadata (resolution / fps / file size) for entries that
@@ -3157,17 +3283,11 @@ fn sort_collections_in_place(collections: &mut [library::Collection]) {
 /// Move a folder one place in the sidebar order. Returns false at the ends.
 fn shift_collection(state: &Rc<RefCell<AppState>>, id: &str, delta: i32) -> bool {
     let mut s = state.borrow_mut();
-    sort_collections_in_place(&mut s.collections);
-    let Some(pos) = s.collections.iter().position(|c| c.id == id) else {
-        return false;
-    };
-    let target = pos as i32 + delta;
-    if target < 0 || target as usize >= s.collections.len() {
+    if !library::move_collection(&mut s.collections, id, delta) {
         return false;
     }
-    s.collections.swap(pos, target as usize);
-    library::renumber_collections(&mut s.collections);
-    sort_collections_in_place(&mut s.collections);
+    // move_collection already leaves `collections` sorted by the position it
+    // just wrote, so no further sort_collections_in_place call is needed.
     library::save_collections(&s.collections).ok();
     true
 }
@@ -3249,6 +3369,7 @@ fn show_collections_dialog(window: &adw::ApplicationWindow, state: Rc<RefCell<Ap
                     }
                 }
             };
+            let last = collections.len().saturating_sub(1);
             for (i, c) in collections.iter().enumerate() {
                 let row = adw::ActionRow::new();
                 row.set_title(&glib::markup_escape_text(&c.name));
@@ -3267,6 +3388,7 @@ fn show_collections_dialog(window: &adw::ApplicationWindow, state: Rc<RefCell<Ap
                     b.add_css_class("flat");
                     b.set_valign(gtk4::Align::Center);
                     b.set_tooltip_text(Some(tip));
+                    b.set_sensitive(if delta < 0 { i > 0 } else { i < last });
                     let state2 = state.clone();
                     let id = c.id.clone();
                     let again = again.clone();
@@ -9919,17 +10041,21 @@ mod tests {
         let inside = filed("nebula", Some(&space.id), 0);
         let outside = filed("desk", None, 0);
         let entries = vec![inside.clone(), outside.clone()];
+        let collections = [space.clone()];
 
         let all = library::LibraryView::default();
-        assert_eq!(scoped_ids(&entries, &all, "").len(), 2);
+        assert_eq!(scoped_ids(&entries, &collections, &all, "").len(), 2);
 
         let in_folder = library::LibraryView {
             sort: library::SortMode::Manual,
             collection: Some(space.id.clone()),
         };
-        assert_eq!(scoped_ids(&entries, &in_folder, ""), vec![inside.id]);
+        assert_eq!(
+            scoped_ids(&entries, &collections, &in_folder, ""),
+            vec![inside.id.clone()]
+        );
         assert!(
-            scoped_ids(&entries, &in_folder, "desk").is_empty(),
+            scoped_ids(&entries, &collections, &in_folder, "desk").is_empty(),
             "the search must narrow within the folder, not escape it"
         );
 
@@ -9937,7 +10063,63 @@ mod tests {
             sort: library::SortMode::Manual,
             collection: Some(SCOPE_UNCATEGORIZED.to_string()),
         };
-        assert_eq!(scoped_ids(&entries, &loose, ""), vec![outside.id]);
+        assert_eq!(
+            scoped_ids(&entries, &collections, &loose, ""),
+            vec![outside.id]
+        );
+    }
+
+    /// A search matching a folder's name surfaces every entry filed under it,
+    /// even when the entries' own names have nothing to do with the query —
+    /// case-insensitively, and for non-Latin names too.
+    #[test]
+    fn scoped_ids_matches_by_folder_name() {
+        let nature = library::Collection::new("Nature", 0);
+        let jp = library::Collection::new("自然", 1);
+        let a = filed("forest.mp4", Some(&nature.id), 0);
+        let b = filed("river.mp4", Some(&nature.id), 1);
+        let jp_entry = filed("a.mp4", Some(&jp.id), 0);
+        let loose = filed("skyline", None, 0);
+        let entries = vec![a.clone(), b.clone(), jp_entry.clone(), loose.clone()];
+        let collections = [nature.clone(), jp.clone()];
+        let all = library::LibraryView::default();
+
+        let mut got = scoped_ids(&entries, &collections, &all, "nature");
+        got.sort();
+        let mut want = vec![a.id.clone(), b.id.clone()];
+        want.sort();
+        assert_eq!(got, want, "lowercase query matches the folder name");
+
+        let mut got_upper = scoped_ids(&entries, &collections, &all, "NATURE");
+        got_upper.sort();
+        assert_eq!(got_upper, want, "folder-name search is case-insensitive");
+
+        assert_eq!(
+            scoped_ids(&entries, &collections, &all, "自然"),
+            vec![jp_entry.id]
+        );
+
+        // Name search inside a folder still works alongside the new
+        // folder-name matching.
+        assert_eq!(
+            scoped_ids(&entries, &collections, &all, "forest"),
+            vec![a.id]
+        );
+
+        // An uncategorized entry cannot match a folder-name query.
+        assert!(scoped_ids(&entries, &collections, &all, "nature")
+            .iter()
+            .all(|id| *id != loose.id));
+
+        // A scoped folder view still respects the folder-name query alongside
+        // the open scope.
+        let in_nature = library::LibraryView {
+            sort: library::SortMode::Manual,
+            collection: Some(nature.id.clone()),
+        };
+        let mut scoped = scoped_ids(&entries, &collections, &in_nature, "nature");
+        scoped.sort();
+        assert_eq!(scoped, want);
     }
 
     /// A folder deleted underneath a saved scope must not leave the library

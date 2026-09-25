@@ -958,6 +958,35 @@ pub fn renumber_collections(collections: &mut [Collection]) {
     }
 }
 
+/// Move a folder one place earlier (`delta < 0`) or later (`delta > 0`) in
+/// display order. Returns false when the id is unknown or the move would run
+/// off either end, so the caller can skip the save.
+///
+/// Stable-sorts by `(position, id)` first — the same order [`sort_collections_in_place`]
+/// in `window.rs` would produce — so the swap always acts on the order the
+/// sidebar actually showed, including a legacy library where every folder is
+/// still `position == 0`. `position` is then rewritten to the index for every
+/// entry, not just the two that swapped: the old approach swapped the two
+/// `Collection` structs (carrying their `position` fields with them) and then
+/// called [`renumber_collections`], which re-sorts by `position` and silently
+/// restores the pre-swap order. Writing `position = index` here means there is
+/// nothing left for a later renumber to undo.
+pub fn move_collection(cols: &mut [Collection], id: &str, delta: i32) -> bool {
+    cols.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.id.cmp(&b.id)));
+    let Some(pos) = cols.iter().position(|c| c.id == id) else {
+        return false;
+    };
+    let target = pos as i32 + delta;
+    if target < 0 || target as usize >= cols.len() {
+        return false;
+    }
+    cols.swap(pos, target as usize);
+    for (rank, c) in cols.iter_mut().enumerate() {
+        c.position = rank as u32;
+    }
+    true
+}
+
 /// Move an entry one place earlier within its own group. Returns false when it
 /// is already first (or the id is unknown), so the caller can skip the save.
 pub fn move_entry_up(entries: &mut [LibraryEntry], entry_id: &str) -> bool {
@@ -1574,6 +1603,61 @@ mod tests {
         assert!(!rename_collection(&mut cs, "nope", "Cities"));
         assert!(rename_collection(&mut cs, &id, " Cityscapes "));
         assert_eq!(cs[0].name, "Cityscapes");
+    }
+
+    /// Up and down swap neighbours and leave `position` compact 0..n. This is
+    /// the regression test for the bug where `shift_collection` swapped the
+    /// two `Collection` structs and then called `renumber_collections`, which
+    /// re-sorted by the swapped-along `position` values and silently undid
+    /// the swap.
+    #[test]
+    fn move_collection_swaps_and_renumbers() {
+        let mut cs = Vec::new();
+        let a = create_collection(&mut cs, "A");
+        let b = create_collection(&mut cs, "B");
+        let c = create_collection(&mut cs, "C");
+
+        assert!(move_collection(&mut cs, &b, -1)); // B up: A, B, C -> B, A, C
+        assert_eq!(
+            cs.iter().map(|x| x.id.clone()).collect::<Vec<_>>(),
+            [b.clone(), a.clone(), c.clone()]
+        );
+        let positions: Vec<u32> = cs.iter().map(|x| x.position).collect();
+        assert_eq!(positions, [0, 1, 2]);
+
+        assert!(move_collection(&mut cs, &c, -1)); // C up: B, A, C -> B, C, A
+        assert_eq!(
+            cs.iter().map(|x| x.id.clone()).collect::<Vec<_>>(),
+            [b.clone(), c.clone(), a.clone()]
+        );
+    }
+
+    #[test]
+    fn move_collection_stops_at_ends() {
+        let mut cs = Vec::new();
+        let a = create_collection(&mut cs, "A");
+        let b = create_collection(&mut cs, "B");
+        assert!(!move_collection(&mut cs, &a, -1)); // already first
+        assert!(!move_collection(&mut cs, &b, 1)); // already last
+        assert!(!move_collection(&mut cs, "ghost", 1)); // unknown id
+        assert_eq!(cs.iter().map(|x| x.id.clone()).collect::<Vec<_>>(), [a, b]);
+    }
+
+    /// A library upgraded before folders had `position` at all has every
+    /// folder at `position == 0`; the first move must still reorder them
+    /// rather than being a no-op tie.
+    #[test]
+    fn move_collection_on_legacy_positions_still_reorders() {
+        let mut cs: Vec<Collection> = serde_json::from_str(
+            r#"[{"id":"a","name":"A"},{"id":"b","name":"B"},{"id":"c","name":"C"}]"#,
+        )
+        .unwrap();
+        assert!(cs.iter().all(|c| c.position == 0));
+        assert!(move_collection(&mut cs, "b", -1));
+        assert_eq!(
+            cs.iter().map(|x| x.id.clone()).collect::<Vec<_>>(),
+            ["b", "a", "c"]
+        );
     }
 
     /// Deleting a folder must hand its wallpapers back, never orphan them.
