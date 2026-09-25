@@ -4,6 +4,38 @@ All notable changes to Fresco are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.45] — Unreleased
+
+### Added
+- **Search now matches folder names too** (issue #26). Typing a folder's
+  name shows every wallpaper in it, in any script (e.g. 自然).
+- **A "Back to top" button** appears once the library is scrolled past half
+  a page (issue #26).
+
+### Changed
+- **A newly added wallpaper joins the library only when you click "Set as
+  wallpaper"** (issue #27). Picking, dropping, or downloading a file opens
+  the editor on a draft; going Back discards it. Previously the file was
+  saved and marked active before Set, so its card offered "Stop wallpaper"
+  and "Remove" could stop the wallpaper that was actually playing.
+- **"Set as wallpaper" in the editor applies the wallpaper being edited**,
+  not the one currently playing with the edited crop and fit (issue #27).
+
+### Fixed
+- **"Follow System" now follows deepin's dark mode** (issue #25). deepin
+  signals dark mode through its GTK theme name (`deepin-dark`) rather than
+  the `color-scheme` setting libadwaita reads, so Fresco stayed light. On
+  deepin, and on desktops without `color-scheme` support, a dark GTK theme
+  now paints Fresco dark, and switching themes updates it live.
+- **The folder ▲/▼ buttons reorder folders again** (issue #26). The swap was
+  immediately undone by a renumbering pass, so the list only flickered. The
+  first row's ▲ and the last row's ▼ are now disabled.
+- **Applying or moving a wallpaper no longer jumps the library back to the
+  first folder** (issue #26); the scroll position is kept across the rebuild.
+- **A freshly added video no longer shows a black preview in the editor**
+  (issue #27, a 1.1.44 regression). The editor generates the thumbnail
+  itself if it opens before the background batch has.
+
 ## [1.1.44] — Unreleased
 
 ### Added

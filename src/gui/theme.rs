@@ -224,19 +224,14 @@ fn fallback_applies() -> bool {
 /// not what the desktop actually set. `gdk::Display::get_setting` instead
 /// asks the display backend directly (XSettings on X11), which still carries
 /// deepin's real `deepin-dark` / `deepin` value.
-#[allow(deprecated)]
+///
+/// Called through FFI with a `Value` pre-typed as a string: the safe
+/// `DisplayExtManual::get_setting` hands GDK an uninitialized `Value`, which
+/// the X11 backend rejects with a `g_value_set_string` CRITICAL on every call.
 fn raw_gtk_theme_name() -> Option<String> {
     use gtk4::glib;
-    use gtk4::prelude::DisplayExtManual;
 
     let display = gtk4::gdk::Display::default()?;
-    if let Some(value) = display.get_setting("gtk-theme-name") {
-        if let Ok(name) = value.get::<String>() {
-            return Some(name);
-        }
-    }
-    // Fallback: some backends hand back a `Value` that isn't pre-typed as a
-    // string until asked for one explicitly via FFI.
     unsafe {
         let mut value = glib::Value::from_type(glib::Type::STRING);
         let ok: bool = glib::translate::from_glib(gtk4::gdk::ffi::gdk_display_get_setting(
