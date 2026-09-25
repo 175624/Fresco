@@ -186,6 +186,25 @@ fn build_ui(app: &adw::Application) {
         });
     }
 
+    // deepin signals dark/light purely through the GTK theme name over
+    // XSettings, which libadwaita's own dark-notify never fires for (see
+    // `theme::set_mode`'s doc comment). Watch the raw display setting so a
+    // live deepin theme flip repaints while in System mode.
+    if let Some(display) = gtk4::gdk::Display::default() {
+        let state = state.clone();
+        display.connect_setting_changed(move |_, name| {
+            if name != "gtk-theme-name" {
+                return;
+            }
+            let s = state.borrow();
+            if s.config.theme_mode != crate::config::ThemeMode::System {
+                return;
+            }
+            theme::set_mode(s.config.theme_mode);
+            theme::apply(s.config.accent, theme::resolve_dark(s.config.theme_mode));
+        });
+    }
+
     let stack = gtk4::Stack::new();
     stack.set_transition_type(gtk4::StackTransitionType::SlideLeftRight);
     stack.set_transition_duration(220);
