@@ -71,18 +71,78 @@ impl Default for FrescoApplication {
 
 // ─── App state ────────────────────────────────────────────────────────────────
 
-/// Jump to the crop/rotate editor for entry `idx` — the same surface the
-/// file-picker add flow lands on, so link-added wallpapers get preview,
-/// rotate, and crop before being set.
+/// Jump to the crop/rotate editor for entry `idx`, already committed to
+/// `entries`. Also drops any leftover draft — reaching this always means an
+/// existing library entry, never one still waiting on "Set as wallpaper".
 pub(crate) fn open_editor(state: &Rc<RefCell<AppState>>, stack: &gtk4::Stack, idx: usize) {
-    state.borrow_mut().editing_idx = Some(idx);
+    {
+        let mut s = state.borrow_mut();
+        s.editing_idx = Some(idx);
+        s.draft = None;
+    }
     stack.set_visible_child_name("editor");
+}
+
+/// Jump to the editor on a freshly built entry that has *not* been committed
+/// to the library — the file-picker/drop and add-from-link add flows' shared
+/// landing spot. Nothing is pushed to `entries`, written to `entries.json`,
+/// or applied as the running wallpaper until "Set as wallpaper" commits it
+/// (see `commit_draft` in the Set handler); leaving the editor any other way
+/// discards it (see `discard_draft`).
+pub(crate) fn open_draft_editor(
+    state: &Rc<RefCell<AppState>>,
+    stack: &gtk4::Stack,
+    draft: LibraryEntry,
+) {
+    {
+        let mut s = state.borrow_mut();
+        s.draft = Some(draft);
+        s.editing_idx = None;
+    }
+    stack.set_visible_child_name("editor");
+}
+
+/// Leaving the editor on any path other than "Set as wallpaper" (Back, or
+/// switching to any other page) abandons a draft entirely — it was never
+/// pushed to `entries` or written to `entries.json`, so there is nothing
+/// there to undo. Only its generated thumbnail (the black-preview fix can
+/// make one before Set is ever clicked) and, for an add-from-link download,
+/// the downloaded file itself need cleaning up — and the file only when it
+/// lives inside Fresco's own `library/downloads` folder. A path the user
+/// pointed the file picker or a drag-and-drop at is never touched: Fresco
+/// doesn't own it, and deleting a user's own file on Back would be a data
+/// loss bug, not a cleanup.
+fn discard_draft(state: &Rc<RefCell<AppState>>) {
+    let Some(draft) = state.borrow_mut().draft.take() else {
+        return;
+    };
+    if let Some(thumb) = &draft.thumbnail {
+        std::fs::remove_file(thumb).ok();
+    }
+    let downloads_dir = library::library_dir().join("downloads");
+    for p in draft.path.iter().chain(draft.paths.iter()) {
+        if p.starts_with(&downloads_dir) {
+            std::fs::remove_file(p).ok();
+        }
+    }
 }
 
 pub(crate) struct AppState {
     pub(crate) config: Config,
     pub(crate) entries: Vec<LibraryEntry>,
     editing_idx: Option<usize>,
+    /// A freshly built entry that hasn't been committed to the library yet —
+    /// kept out of `entries` (and off disk) until "Set as wallpaper" is
+    /// clicked, so a file just picked, dropped, or downloaded from a link
+    /// never shows up as a card, never reads as "playing", and Back simply
+    /// discards it (`discard_draft`). `None` while editing an existing entry
+    /// (`editing_idx` is used instead); the two are never both `Some`.
+    draft: Option<LibraryEntry>,
+    /// Bumped on every editor-view visible-child-name change — entering AND
+    /// leaving alike — so a background thumbnail job started for one entry
+    /// (`spawn_thumbnail_for`) can tell, once it finishes, whether its result
+    /// still belongs to whatever the editor is now showing.
+    editor_gen: u32,
     /// Keeps the native file/folder chooser alive until it responds. Without
     /// this, the local `FileChooserNative` is dropped when the open function
     /// returns, so the portal's reply never reaches our handler.
@@ -110,6 +170,18 @@ pub(crate) struct AppState {
     /// so a scope pointing at a folder that no longer exists falls back to the
     /// whole library instead of showing an empty grid with no way out.
     pub(crate) view: library::LibraryView,
+}
+
+impl AppState {
+    /// The entry currently shown in the editor: the draft, if one is being
+    /// created, else `entries[editing_idx]`. `None` covers both "the editor
+    /// isn't open" and "editing_idx points nowhere" (shouldn't happen, but a
+    /// stale index must show nothing rather than panic).
+    pub(crate) fn editing_entry(&self) -> Option<&LibraryEntry> {
+        self.draft
+            .as_ref()
+            .or_else(|| self.editing_idx.and_then(|i| self.entries.get(i)))
+    }
 }
 
 // ─── Main window ─────────────────────────────────────────────────────────────
@@ -165,6 +237,8 @@ fn build_ui(app: &adw::Application) {
         config,
         entries,
         editing_idx: None,
+        draft: None,
+        editor_gen: 0,
         current_picker: None,
         toast: toast.clone(),
         refresh: None,
@@ -1891,8 +1965,7 @@ fn build_mini_card(
             if n_press == 1 {
                 apply_entry_by_idx(state_c.clone(), idx);
             } else if n_press == 2 {
-                state_c.borrow_mut().editing_idx = Some(idx);
-                stack_c.set_visible_child_name("editor");
+                open_editor(&state_c, &stack_c, idx);
             }
         });
     }
@@ -2127,8 +2200,7 @@ fn build_library_card(
         let state_e = state.clone();
         let stack_e = stack.clone();
         edit.connect_clicked(move |_| {
-            state_e.borrow_mut().editing_idx = Some(idx);
-            stack_e.set_visible_child_name("editor");
+            open_editor(&state_e, &stack_e, idx);
         });
     }
     actions.append(&edit);
@@ -2188,8 +2260,7 @@ fn build_library_card(
             if n_press == 1 {
                 apply_entry_by_idx(state_c.clone(), idx);
             } else if n_press == 2 {
-                state_c.borrow_mut().editing_idx = Some(idx);
-                stack_c.set_visible_child_name("editor");
+                open_editor(&state_c, &stack_c, idx);
             }
         });
     }
@@ -2449,8 +2520,7 @@ fn show_card_menu(
         let st = stack.clone();
         let p = pop.clone();
         edit.connect_clicked(move |_| {
-            s.borrow_mut().editing_idx = Some(idx);
-            st.set_visible_child_name("editor");
+            open_editor(&s, &st, idx);
             p.popdown();
         });
     }
@@ -3922,9 +3992,9 @@ pub(crate) fn spawn_thumbnail_batch(state: &Rc<RefCell<AppState>>, ids: Vec<Stri
 }
 
 /// Generate one entry's thumbnail in the background and, once ready, feed it
-/// to `crop_editor` — but only if `gen` still reads `my_gen`, i.e. the editor
-/// hasn't moved on to a different entry (or left and come back) while the
-/// ffmpeg call was running.
+/// to `crop_editor` — but only if `AppState::editor_gen` still reads
+/// `my_gen`, i.e. the editor hasn't moved on to a different entry (or left
+/// and come back) while the ffmpeg call was running.
 ///
 /// Fixes the black-first-preview regression from 618e169: `add_media_paths`
 /// used to thumbnail synchronously, so the editor always had a still frame to
@@ -3934,19 +4004,22 @@ pub(crate) fn spawn_thumbnail_batch(state: &Rc<RefCell<AppState>>, ids: Vec<Stri
 /// `Picture::set_file`, which is black for most codecs. This regenerates the
 /// same thumbnail the batch would have produced and only ever touches the
 /// crop preview, never the library grid (that stays `spawn_thumbnail_batch`'s
-/// job).
+/// job) — except for a draft, which has no grid card yet to update.
+///
+/// Works equally for a draft (looked up via `editing_entry`, written back to
+/// `AppState::draft`, nothing to save — there's no `entries.json` row for it
+/// yet) and a committed entry (looked up and written back in `entries`, as
+/// before).
 fn spawn_thumbnail_for(
     state: &Rc<RefCell<AppState>>,
     entry_id: String,
-    gen: Rc<Cell<u32>>,
     my_gen: u32,
     crop_editor: super::preview::CropEditor,
 ) {
     let Some(mut entry) = state
         .borrow()
-        .entries
-        .iter()
-        .find(|e| e.id == entry_id)
+        .editing_entry()
+        .filter(|e| e.id == entry_id)
         .cloned()
     else {
         return;
@@ -3961,17 +4034,23 @@ fn spawn_thumbnail_for(
         let Ok((thumb, baked)) = rx.recv().await else {
             return;
         };
-        if gen.get() != my_gen {
+        if state.borrow().editor_gen != my_gen {
             return; // superseded: a different entry (or none) is showing now
         }
         let Some(thumb) = thumb else { return };
         {
             let mut s = state.borrow_mut();
-            if let Some(e) = s.entries.iter_mut().find(|e| e.id == entry_id) {
+            if s.draft.as_ref().is_some_and(|d| d.id == entry_id) {
+                if let Some(d) = s.draft.as_mut() {
+                    d.thumbnail = Some(thumb.clone());
+                    d.thumbnail_rotation = baked;
+                }
+                // Not in `entries` yet — nothing to save until Set commits it.
+            } else if let Some(e) = s.entries.iter_mut().find(|e| e.id == entry_id) {
                 e.thumbnail = Some(thumb.clone());
                 e.thumbnail_rotation = baked;
+                save_entries(&s.entries).ok();
             }
-            save_entries(&s.entries).ok();
         }
         crop_editor.set_media(&thumb, baked.unwrap_or(0));
         let refresh = state.borrow().refresh.clone();
@@ -4184,21 +4263,12 @@ fn show_folder_import_choice(
 }
 
 /// The pre-1.2 "Add folder" outcome: one folder-backed slideshow, then the
-/// editor. Unchanged behaviour, now reached through a choice.
+/// editor. Unchanged behaviour, now reached through a choice — except that
+/// the slideshow lands as a draft, exactly like a single-file add: nothing
+/// is pushed to `entries`, saved, or applied until "Set as wallpaper".
 fn create_folder_slideshow(state: &Rc<RefCell<AppState>>, stack: &gtk4::Stack, folder: PathBuf) {
     let entry = library::LibraryEntry::new_slideshow(folder);
-    let id = entry.id.clone();
-    {
-        let mut s = state.borrow_mut();
-        let idx = library::commit_draft(&mut s.entries, entry);
-        s.config.wallpaper = s.entries[idx].to_wallpaper();
-        s.editing_idx = Some(idx);
-        save_entries(&s.entries).ok();
-    }
-    // Thumbnail shells out to ffmpeg; render it off the UI thread so opening
-    // the editor doesn't stall on it (see `spawn_thumbnail_batch`).
-    spawn_thumbnail_batch(state, vec![id]);
-    stack.set_visible_child_name("editor");
+    open_draft_editor(state, stack, entry);
 }
 
 /// Set an entry as the wallpaper of ONE display (a `config.monitors` override).
@@ -4607,10 +4677,25 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
             let transition = transition_from_index(transition_ref.selected());
             let power_saving = power_edit_from_index(power_ref.selected());
             let mut reseed: Option<(PathBuf, u16)> = None;
+            let mut needs_thumbnail: Option<String> = None;
             let (name, config) = {
                 let mut s = state_set.borrow_mut();
-                let idx = s.editing_idx;
-                if let Some(e) = idx.and_then(|i| s.entries.get_mut(i)) {
+                // A draft only becomes a real library entry the moment it's
+                // actually set — it was never pushed to `entries` or written
+                // to `entries.json` before now (see `add_media_paths`,
+                // `create_folder_slideshow`, `show_add_link_dialog`).
+                // `commit_draft` orders it like any other add.
+                let idx = match (s.draft.take(), s.editing_idx) {
+                    (Some(draft), _) => {
+                        let idx = library::commit_draft(&mut s.entries, draft);
+                        s.editing_idx = Some(idx);
+                        idx
+                    }
+                    (None, Some(idx)) => idx,
+                    // Set lives inside the editor; nothing open to commit.
+                    (None, None) => return,
+                };
+                if let Some(e) = s.entries.get_mut(idx) {
                     e.transition = Some(transition);
                     if e.kind == Kind::Slideshow {
                         e.interval_s = Some(interval);
@@ -4635,6 +4720,14 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
                             reseed = Some((t, e.thumbnail_baked_rotation()));
                         }
                     }
+                    if e.thumbnail.is_none() {
+                        // A just-committed draft may still be waiting on the
+                        // background job the black-preview fix kicked off
+                        // when the editor opened — or never needed one (an
+                        // image, or a folder-backed slideshow). Catch it up
+                        // now that it's a real entry with a card in the grid.
+                        needs_thumbnail = Some(e.id.clone());
+                    }
                 }
                 // Built fresh from the entry being edited — not patched onto
                 // whatever `s.config.wallpaper` already held — so Set always
@@ -4650,17 +4743,24 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
                     transition,
                     interval_s: interval,
                 };
-                let name = idx
-                    .and_then(|i| s.entries.get(i))
+                let name = s
+                    .entries
+                    .get(idx)
                     .map(|e| e.name.clone())
                     .unwrap_or_default();
-                if let Some(e) = idx.and_then(|i| s.entries.get(i)) {
+                if let Some(e) = s.entries.get(idx) {
                     s.config.wallpaper = library::wallpaper_from_editor(e, &values);
                     s.config.enabled = true;
                 }
+                // Saved as soon as it's committed, whether or not the apply
+                // below succeeds — the entry stays in the library even if
+                // starting the daemon fails.
                 save_entries(&s.entries).ok();
                 (name, s.config.clone())
             };
+            if let Some(id) = needs_thumbnail {
+                spawn_thumbnail_batch(&state_set, vec![id]);
+            }
             if let Some((thumb, baked)) = reseed {
                 crop_ref.set_media(&thumb, baked);
             }
@@ -4729,23 +4829,32 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
         let items_btn_ref = items_btn.clone();
         let tp = transition_preview.clone();
         let state2 = state.clone();
-        // Guards the async thumbnail generation below against a stale result
-        // landing after the editor has moved on (a different entry, or back
-        // to the library and in again): bumped every time this handler runs,
-        // and the background job checks it still matches before touching the
-        // preview or the entry.
-        let editor_gen = Rc::new(Cell::new(0u32));
         stack.connect_visible_child_name_notify(move |s| {
             if s.visible_child_name().as_deref() != Some("editor") {
                 tp.stop(); // free the preview timer when leaving the editor
-                editor_gen.set(editor_gen.get().wrapping_add(1)); // no result lands
+                           // Bumped on every transition, entering or leaving alike, so
+                           // a background thumbnail job started for whatever was
+                           // showing can tell a stale result from a current one — see
+                           // `spawn_thumbnail_for`.
+                {
+                    let mut st = state2.borrow_mut();
+                    st.editor_gen = st.editor_gen.wrapping_add(1);
+                }
+                // Leaving any other way than "Set as wallpaper" abandons a
+                // draft entirely (it was never pushed to `entries` or
+                // `entries.json`); Set already took it out of `draft` before
+                // switching pages, so this is a no-op on that path.
+                discard_draft(&state2);
                 return;
             }
-            let gen = editor_gen.get().wrapping_add(1);
-            editor_gen.set(gen);
+            let gen = {
+                let mut st = state2.borrow_mut();
+                st.editor_gen = st.editor_gen.wrapping_add(1);
+                st.editor_gen
+            };
             let st = state2.borrow();
             // Show the thumbnail (videos) or the image itself as the crop preview.
-            if let Some(entry) = st.editing_idx.and_then(|i| st.entries.get(i)) {
+            if let Some(entry) = st.editing_entry() {
                 title_ref.set_subtitle(&entry.name);
                 // The thumbnail already carries the entry's rotation in its
                 // pixels; tell the preview so it isn't turned a second time.
@@ -4768,13 +4877,7 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
                         // codecs. Clear the preview and generate the same
                         // thumbnail here instead, showing it once it lands.
                         ce.clear();
-                        spawn_thumbnail_for(
-                            &state2,
-                            entry.id.clone(),
-                            editor_gen.clone(),
-                            gen,
-                            ce.clone(),
-                        );
+                        spawn_thumbnail_for(&state2, entry.id.clone(), gen, ce.clone());
                     } else {
                         ce.set_media(p, 0);
                     }
@@ -4785,7 +4888,13 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
                 vol_row_ref.set_visible(has_audio);
                 // Decode-skipping only matters for moving media.
                 power_row_ref.set_visible(has_audio);
-                items_btn_ref.set_visible(matches!(entry.kind, Kind::Playlist | Kind::Slideshow));
+                // A draft has no index into `entries` for `show_items_dialog`
+                // to edit — hide the button rather than let it click through
+                // to nothing (it's Playlist/Slideshow-only regardless).
+                items_btn_ref.set_visible(
+                    st.editing_idx.is_some()
+                        && matches!(entry.kind, Kind::Playlist | Kind::Slideshow),
+                );
                 let is_slideshow = entry.kind == Kind::Slideshow;
                 interval_ref.set_visible(is_slideshow);
                 // The effect applies to any wallpaper coming up, so the picker
@@ -4812,25 +4921,29 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
                     tp.stop();
                 }
             }
-            let ent = st.editing_idx.and_then(|i| st.entries.get(i));
-            ce.set_crop(st.config.wallpaper.crop);
-            ce.set_rotation(
-                ent.and_then(|e| e.rotation)
-                    .unwrap_or(st.config.wallpaper.rotation),
-            );
-            fit_ref.set_selected(match st.config.wallpaper.fit {
+            let ent = st.editing_entry();
+            // A draft isn't the config's own wallpaper — `Config::wallpaper`
+            // still describes whatever is genuinely applied, since nothing
+            // about a draft touches it before Set. Fall back to the draft's
+            // own (all-default) `Wallpaper` instead of the running one, or a
+            // brand new add would silently inherit whatever crop/mute/volume
+            // some unrelated, already-playing wallpaper happens to have.
+            let baseline = if st.draft.is_some() {
+                ent.map(|e| e.to_wallpaper()).unwrap_or_default()
+            } else {
+                st.config.wallpaper.clone()
+            };
+            ce.set_crop(baseline.crop);
+            ce.set_rotation(ent.and_then(|e| e.rotation).unwrap_or(baseline.rotation));
+            fit_ref.set_selected(match baseline.fit {
                 Fit::Cover => 0,
                 Fit::Contain => 1,
                 Fit::Stretch => 2,
             });
-            mute_ref.set_active(ent.and_then(|e| e.mute).unwrap_or(st.config.wallpaper.mute));
-            vol_ref.set_value(
-                ent.and_then(|e| e.volume)
-                    .unwrap_or(st.config.wallpaper.volume) as f64,
-            );
+            mute_ref.set_active(ent.and_then(|e| e.mute).unwrap_or(baseline.mute));
+            vol_ref.set_value(ent.and_then(|e| e.volume).unwrap_or(baseline.volume) as f64);
             power_row_ref.set_selected(power_edit_index(
-                ent.and_then(|e| e.power_saving)
-                    .or(st.config.wallpaper.power_saving),
+                ent.and_then(|e| e.power_saving).or(baseline.power_saving),
             ));
         });
     }
@@ -6839,8 +6952,7 @@ fn add_media_paths(
                     state,
                     &tf!("“{name}” is already in your library", "name" => name),
                 );
-                state.borrow_mut().editing_idx = Some(idx);
-                stack.set_visible_child_name("editor");
+                open_editor(state, stack, idx);
                 return;
             }
         }
@@ -6861,25 +6973,34 @@ fn add_media_paths(
             library::LibraryEntry::new_image(p)
         }
     };
-    let id = entry.id.clone();
 
-    {
-        let mut s = state.borrow_mut();
-        let idx = if let Some(ei) = editing_idx {
+    if let Some(ei) = editing_idx {
+        // Replacing an existing entry's source: unchanged, still commits
+        // right away — there's no draft state involved in swapping what an
+        // already-library card points at.
+        let id = entry.id.clone();
+        {
+            let mut s = state.borrow_mut();
             s.entries[ei] = entry;
-            ei
-        } else {
-            library::commit_draft(&mut s.entries, entry)
-        };
-        s.config.wallpaper = s.entries[idx].to_wallpaper();
-        s.editing_idx = Some(idx);
-        save_entries(&s.entries).ok();
+            s.config.wallpaper = s.entries[ei].to_wallpaper();
+            s.editing_idx = Some(ei);
+            s.draft = None;
+            save_entries(&s.entries).ok();
+        }
+        // Thumbnail shells out to ffmpeg; do it off the UI thread so picking
+        // (or dropping) a file doesn't stall opening the editor.
+        spawn_thumbnail_batch(state, vec![id]);
+        spawn_metadata_probe(state);
+        stack.set_visible_child_name("editor");
+    } else {
+        // A new file → a draft, not a library entry: nothing is pushed to
+        // `entries`, saved to `entries.json`, or applied as the running
+        // wallpaper until "Set as wallpaper" is clicked (`commit_draft` in
+        // the Set handler). A video with no thumbnail yet gets one lazily,
+        // the moment the editor's on-enter handler notices the gap — see the
+        // black-preview fix there.
+        open_draft_editor(state, stack, entry);
     }
-    // Thumbnail shells out to ffmpeg; do it off the UI thread so picking (or
-    // dropping) a file doesn't stall opening the editor.
-    spawn_thumbnail_batch(state, vec![id]);
-    spawn_metadata_probe(state);
-    stack.set_visible_child_name("editor");
 }
 
 /// Folder picker → ask whether the folder becomes one timed slideshow or one
