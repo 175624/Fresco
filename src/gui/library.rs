@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Fit, Kind, PowerSaving, Slideshow, Transition, Wallpaper};
+use crate::config::{Crop, Fit, Kind, PowerSaving, Slideshow, Transition, Wallpaper};
 use crate::{t, tf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -606,6 +606,56 @@ impl LibraryEntry {
             },
         }
     }
+}
+
+/// The editor's adjustable fields, collected off the "Set as wallpaper"
+/// controls (crop tool, Fit combo, mute switch, volume slider, power-saving
+/// combo, transition picker, interval combo).
+#[derive(Debug, Clone, Copy)]
+pub struct EditorValues {
+    pub crop: Option<Crop>,
+    pub rotation: u16,
+    pub fit: Fit,
+    pub mute: bool,
+    pub volume: u8,
+    pub power_saving: Option<PowerSaving>,
+    pub transition: Transition,
+    pub interval_s: u64,
+}
+
+/// Build the [`Wallpaper`] that "Set as wallpaper" should apply: `entry`'s own
+/// source (path/paths/folder/kind), with the editor's adjustments laid on
+/// top. Built fresh from `entry` rather than patched onto whatever
+/// `Config::wallpaper` happened to already hold — patching reused the source
+/// of the wallpaper actually on screen whenever the entry being edited isn't
+/// it (e.g. opening Edit on a second card while a first one plays), which
+/// applied the second entry's *settings* to the first entry's *source* the
+/// moment Set was clicked.
+pub fn wallpaper_from_editor(entry: &LibraryEntry, values: &EditorValues) -> Wallpaper {
+    let mut w = entry.to_wallpaper();
+    w.crop = values.crop;
+    w.rotation = values.rotation;
+    w.fit = values.fit;
+    w.mute = values.mute;
+    w.volume = values.volume;
+    w.power_saving = values.power_saving;
+    w.transition = values.transition;
+    if let Some(ss) = w.slideshow.as_mut() {
+        ss.interval_s = values.interval_s;
+        ss.transition = values.transition;
+    }
+    w
+}
+
+/// Commit a just-built draft entry to the library, at the end of its group
+/// like any other newly added entry, and return its new index. Thin wrapper
+/// over [`push_entry`] so the "a draft lands at the end, ordered like a
+/// normal add" behaviour has its own name at the call site (`Set as
+/// wallpaper`) and its own test, separate from the picker/drop paths that
+/// call `push_entry` directly.
+pub fn commit_draft(entries: &mut Vec<LibraryEntry>, draft: LibraryEntry) -> usize {
+    push_entry(entries, draft);
+    entries.len() - 1
 }
 
 // ─── Library store ────────────────────────────────────────────────────────────
@@ -1612,6 +1662,74 @@ mod tests {
             e
         });
         assert_eq!(ids(&uncategorized(&entries)), ["e0", "e1", "new"]);
+    }
+
+    /// `commit_draft` orders exactly like `push_entry` (it wraps it) and
+    /// returns the index the draft landed at, so the caller can point
+    /// `editing_idx` at the same entry it just committed.
+    #[test]
+    fn commit_draft_orders_like_push_entry_and_returns_its_index() {
+        let mut entries = fixtures(2);
+        renumber(&mut entries, None);
+        let mut draft = LibraryEntry::new_image(PathBuf::from("/pics/draft.png"));
+        draft.id = "draft".into();
+        draft.name = "draft".into();
+        let idx = commit_draft(&mut entries, draft);
+        assert_eq!(idx, 2);
+        assert_eq!(entries[idx].id, "draft");
+        assert_eq!(ids(&uncategorized(&entries)), ["e0", "e1", "draft"]);
+    }
+
+    fn editor_values() -> EditorValues {
+        EditorValues {
+            crop: Some(Crop {
+                x: 0.1,
+                y: 0.1,
+                w: 0.5,
+                h: 0.5,
+            }),
+            rotation: 90,
+            fit: Fit::Contain,
+            mute: false,
+            volume: 80,
+            power_saving: Some(PowerSaving::Full),
+            transition: Transition::Blur,
+            interval_s: 15,
+        }
+    }
+
+    /// The wallpaper Set builds must take its *source* from the entry being
+    /// edited, not from whatever `Config::wallpaper` already held — the bug
+    /// this guards against applied a different, currently-playing entry's
+    /// path with the edited entry's settings.
+    #[test]
+    fn wallpaper_from_editor_takes_source_from_the_entry() {
+        let entry = LibraryEntry::new_video(PathBuf::from("/videos/edited.mp4"));
+        let w = wallpaper_from_editor(&entry, &editor_values());
+        assert_eq!(w.kind, Kind::Video);
+        assert_eq!(w.path, Some(PathBuf::from("/videos/edited.mp4")));
+        assert_eq!(w.rotation, 90);
+        assert_eq!(w.fit, Fit::Contain);
+        assert!(!w.mute);
+        assert_eq!(w.volume, 80);
+        assert_eq!(w.transition, Transition::Blur);
+    }
+
+    /// A slideshow's nested `Slideshow.interval_s`/`.transition` must follow
+    /// the edited values too, not just the wallpaper-level copies — the
+    /// daemon reads the nested copy for slideshow playback.
+    #[test]
+    fn wallpaper_from_editor_updates_the_nested_slideshow_fields() {
+        let entry = LibraryEntry::new_image_set(vec![
+            PathBuf::from("/pics/a.png"),
+            PathBuf::from("/pics/b.png"),
+        ]);
+        let w = wallpaper_from_editor(&entry, &editor_values());
+        let ss = w
+            .slideshow
+            .expect("slideshow entry must produce a Slideshow");
+        assert_eq!(ss.interval_s, 15);
+        assert_eq!(ss.transition, Transition::Blur);
     }
 
     // ─── Sorting ──────────────────────────────────────────────────────────

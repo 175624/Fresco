@@ -2336,9 +2336,10 @@ fn show_card_menu(
     // background; the library entry is kept). This is the "unset" action.
     let is_active = {
         let s = state.borrow();
+        let on_disk = Config::load().unwrap_or_else(|_| s.config.clone());
         s.entries
             .get(idx)
-            .map(|e| entry_is_active(e, &s.config))
+            .map(|e| entry_is_playing(e, &on_disk))
             .unwrap_or(false)
     };
     if is_active {
@@ -2778,8 +2779,12 @@ fn remove_entry_by_idx(state: Rc<RefCell<AppState>>, idx: usize) {
         let entry = s.entries.remove(idx);
         // Removing the wallpaper that's currently on screen must take it OFF
         // screen — otherwise the daemon keeps playing a wallpaper the user just
-        // deleted, and the desktop never returns to its own background.
-        was_active = entry_is_active(&entry, &s.config);
+        // deleted, and the desktop never returns to its own background. Check
+        // against the saved config, not `s.config`: an entry the editor has
+        // touched but never applied can make the in-memory copy claim it's
+        // active and stop a wallpaper that's actually still running.
+        let on_disk = Config::load().unwrap_or_else(|_| s.config.clone());
+        was_active = entry_is_playing(&entry, &on_disk);
         if let Some(thumb) = &entry.thumbnail {
             std::fs::remove_file(thumb).ok();
         }
@@ -2894,7 +2899,8 @@ fn remove_entries_by_ids(state: Rc<RefCell<AppState>>, ids: &std::collections::H
     let (removed, had_active) = {
         let mut s = state.borrow_mut();
         let gone = drain_by_ids(&mut s.entries, ids);
-        let had_active = gone.iter().any(|e| entry_is_active(e, &s.config));
+        let on_disk = Config::load().unwrap_or_else(|_| s.config.clone());
+        let had_active = gone.iter().any(|e| entry_is_playing(e, &on_disk));
         for e in &gone {
             if let Some(thumb) = &e.thumbnail {
                 std::fs::remove_file(thumb).ok();
@@ -2931,9 +2937,10 @@ fn confirm_remove_selected(
     let n = ids.len();
     let active_hit = {
         let s = state.borrow();
+        let on_disk = Config::load().unwrap_or_else(|_| s.config.clone());
         s.entries
             .iter()
-            .any(|e| ids.contains(&e.id) && entry_is_active(e, &s.config))
+            .any(|e| ids.contains(&e.id) && entry_is_playing(e, &on_disk))
     };
 
     let (dialog, content) = glass_dialog(window, t!("Remove wallpapers"), 400, -1);
@@ -3914,6 +3921,66 @@ pub(crate) fn spawn_thumbnail_batch(state: &Rc<RefCell<AppState>>, ids: Vec<Stri
     });
 }
 
+/// Generate one entry's thumbnail in the background and, once ready, feed it
+/// to `crop_editor` — but only if `gen` still reads `my_gen`, i.e. the editor
+/// hasn't moved on to a different entry (or left and come back) while the
+/// ffmpeg call was running.
+///
+/// Fixes the black-first-preview regression from 618e169: `add_media_paths`
+/// used to thumbnail synchronously, so the editor always had a still frame to
+/// show. Thumbnailing is now a background batch (`spawn_thumbnail_batch`),
+/// which races the editor opening — and `CropEditor::set_media` pointed
+/// straight at a bare `.mp4` decodes the container's first frame via
+/// `Picture::set_file`, which is black for most codecs. This regenerates the
+/// same thumbnail the batch would have produced and only ever touches the
+/// crop preview, never the library grid (that stays `spawn_thumbnail_batch`'s
+/// job).
+fn spawn_thumbnail_for(
+    state: &Rc<RefCell<AppState>>,
+    entry_id: String,
+    gen: Rc<Cell<u32>>,
+    my_gen: u32,
+    crop_editor: super::preview::CropEditor,
+) {
+    let Some(mut entry) = state
+        .borrow()
+        .entries
+        .iter()
+        .find(|e| e.id == entry_id)
+        .cloned()
+    else {
+        return;
+    };
+    let (tx, rx) = async_channel::bounded::<(Option<PathBuf>, Option<u16>)>(1);
+    std::thread::spawn(move || {
+        entry.generate_thumbnail();
+        let _ = tx.send_blocking((entry.thumbnail, entry.thumbnail_rotation));
+    });
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        let Ok((thumb, baked)) = rx.recv().await else {
+            return;
+        };
+        if gen.get() != my_gen {
+            return; // superseded: a different entry (or none) is showing now
+        }
+        let Some(thumb) = thumb else { return };
+        {
+            let mut s = state.borrow_mut();
+            if let Some(e) = s.entries.iter_mut().find(|e| e.id == entry_id) {
+                e.thumbnail = Some(thumb.clone());
+                e.thumbnail_rotation = baked;
+            }
+            save_entries(&s.entries).ok();
+        }
+        crop_editor.set_media(&thumb, baked.unwrap_or(0));
+        let refresh = state.borrow().refresh.clone();
+        if let Some(r) = refresh {
+            r();
+        }
+    });
+}
+
 /// "Added 7 · skipped 3 duplicates" — one toast for a whole batch.
 fn report_import(state: &Rc<RefCell<AppState>>, added: usize, skipped: usize) {
     let msg = match (added, skipped) {
@@ -4123,8 +4190,7 @@ fn create_folder_slideshow(state: &Rc<RefCell<AppState>>, stack: &gtk4::Stack, f
     let id = entry.id.clone();
     {
         let mut s = state.borrow_mut();
-        library::push_entry(&mut s.entries, entry);
-        let idx = s.entries.len() - 1;
+        let idx = library::commit_draft(&mut s.entries, entry);
         s.config.wallpaper = s.entries[idx].to_wallpaper();
         s.editing_idx = Some(idx);
         save_entries(&s.entries).ok();
@@ -4543,21 +4609,6 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
             let mut reseed: Option<(PathBuf, u16)> = None;
             let (name, config) = {
                 let mut s = state_set.borrow_mut();
-                s.config.wallpaper.crop = crop;
-                s.config.wallpaper.rotation = crop_ref.rotation();
-                s.config.wallpaper.fit = fit;
-                s.config.wallpaper.mute = mute_ref.is_active();
-                s.config.wallpaper.volume = vol_ref.value() as u8;
-                s.config.wallpaper.power_saving = power_saving;
-                // Every kind carries a transition now, so this is written
-                // unconditionally; the slideshow's own copy is kept in step for
-                // a daemon that still reads the old location.
-                s.config.wallpaper.transition = transition;
-                s.config.enabled = true;
-                if let Some(ss) = s.config.wallpaper.slideshow.as_mut() {
-                    ss.interval_s = interval;
-                    ss.transition = transition;
-                }
                 let idx = s.editing_idx;
                 if let Some(e) = idx.and_then(|i| s.entries.get_mut(i)) {
                     e.transition = Some(transition);
@@ -4585,13 +4636,30 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
                         }
                     }
                 }
+                // Built fresh from the entry being edited — not patched onto
+                // whatever `s.config.wallpaper` already held — so Set always
+                // applies *this* entry's source, even when it isn't the
+                // wallpaper currently on screen. See `wallpaper_from_editor`.
+                let values = library::EditorValues {
+                    crop,
+                    rotation: crop_ref.rotation(),
+                    fit,
+                    mute: mute_ref.is_active(),
+                    volume: vol_ref.value() as u8,
+                    power_saving,
+                    transition,
+                    interval_s: interval,
+                };
+                let name = idx
+                    .and_then(|i| s.entries.get(i))
+                    .map(|e| e.name.clone())
+                    .unwrap_or_default();
+                if let Some(e) = idx.and_then(|i| s.entries.get(i)) {
+                    s.config.wallpaper = library::wallpaper_from_editor(e, &values);
+                    s.config.enabled = true;
+                }
                 save_entries(&s.entries).ok();
-                (
-                    idx.and_then(|i| s.entries.get(i))
-                        .map(|e| e.name.clone())
-                        .unwrap_or_default(),
-                    s.config.clone(),
-                )
+                (name, s.config.clone())
             };
             if let Some((thumb, baked)) = reseed {
                 crop_ref.set_media(&thumb, baked);
@@ -4661,11 +4729,20 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
         let items_btn_ref = items_btn.clone();
         let tp = transition_preview.clone();
         let state2 = state.clone();
+        // Guards the async thumbnail generation below against a stale result
+        // landing after the editor has moved on (a different entry, or back
+        // to the library and in again): bumped every time this handler runs,
+        // and the background job checks it still matches before touching the
+        // preview or the entry.
+        let editor_gen = Rc::new(Cell::new(0u32));
         stack.connect_visible_child_name_notify(move |s| {
             if s.visible_child_name().as_deref() != Some("editor") {
                 tp.stop(); // free the preview timer when leaving the editor
+                editor_gen.set(editor_gen.get().wrapping_add(1)); // no result lands
                 return;
             }
+            let gen = editor_gen.get().wrapping_add(1);
+            editor_gen.set(gen);
             let st = state2.borrow();
             // Show the thumbnail (videos) or the image itself as the crop preview.
             if let Some(entry) = st.editing_idx.and_then(|i| st.entries.get(i)) {
@@ -4680,7 +4757,27 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
                     .or_else(|| entry.paths.first().map(|p| p.as_path()))
                     .filter(|p| p.exists())
                 {
-                    ce.set_media(p, 0);
+                    if library::is_video(p) {
+                        // No thumbnail yet — regression from 618e169:
+                        // thumbnailing moved to a background batch
+                        // (`spawn_thumbnail_batch`), so a freshly added video
+                        // can reach the editor before it's ready. Pointing
+                        // the crop preview straight at the source file makes
+                        // GTK decode the container's first frame via
+                        // `Picture::set_file`, which is black for most
+                        // codecs. Clear the preview and generate the same
+                        // thumbnail here instead, showing it once it lands.
+                        ce.clear();
+                        spawn_thumbnail_for(
+                            &state2,
+                            entry.id.clone(),
+                            editor_gen.clone(),
+                            gen,
+                            ce.clone(),
+                        );
+                    } else {
+                        ce.set_media(p, 0);
+                    }
                 }
                 // Audio rows only apply to video; interval only to slideshows.
                 let has_audio = matches!(entry.kind, Kind::Video | Kind::Playlist);
@@ -6772,8 +6869,7 @@ fn add_media_paths(
             s.entries[ei] = entry;
             ei
         } else {
-            s.entries.push(entry);
-            s.entries.len() - 1
+            library::commit_draft(&mut s.entries, entry)
         };
         s.config.wallpaper = s.entries[idx].to_wallpaper();
         s.editing_idx = Some(idx);
@@ -7182,6 +7278,18 @@ fn pending_toast(state: &Rc<RefCell<AppState>>, msg: &str) -> PendingToast {
         });
     }
     PendingToast { toast, done }
+}
+
+/// Whether `entry` is the wallpaper actually running, per the config *on
+/// disk* — not `AppState::config`, which the editor mutates in place the
+/// moment a value changes (crop, fit, the entry being pushed while it's still
+/// a draft) and only writes out, applied, on "Set as wallpaper". A menu or
+/// removal check against the in-memory copy can say a brand-new, never-set
+/// entry is "active" and then have Remove call `stop_wallpaper`, which kills
+/// whatever wallpaper is genuinely running. Reading the saved config keeps
+/// this to what the daemon is actually doing.
+fn entry_is_playing(entry: &LibraryEntry, on_disk: &Config) -> bool {
+    entry_is_active(entry, on_disk)
 }
 
 fn entry_is_active(entry: &LibraryEntry, cfg: &Config) -> bool {
@@ -9652,6 +9760,28 @@ mod tests {
         assert!(!entry_is_active(&side, &cfg));
         assign_entry_to_monitor(&mut cfg, side.to_wallpaper(), "DP-2");
         assert!(entry_is_active(&side, &cfg), "override counts as active");
+    }
+
+    /// `entry_is_playing` must judge "active" strictly by whatever `Config` it
+    /// is handed — never anything else in scope — so a call site that passes
+    /// the config just loaded from disk gets the truthful answer even while
+    /// some other in-memory copy (e.g. `AppState::config`, mutated by the
+    /// editor before "Set" is clicked) disagrees.
+    #[test]
+    fn entry_is_playing_false_when_disk_config_holds_another_path() {
+        let mut disk = Config {
+            enabled: true,
+            ..Default::default()
+        };
+        disk.wallpaper.path = Some(PathBuf::from("/playing.mp4"));
+        let draft = entry("/just-added.mp4");
+        assert!(
+            !entry_is_playing(&draft, &disk),
+            "a draft the daemon never applied must not read as playing"
+        );
+        // The entry the disk config actually names does read as playing.
+        let playing = entry("/playing.mp4");
+        assert!(entry_is_playing(&playing, &disk));
     }
 
     // ─── Folders, sorting and batch import ───────────────────────────────
