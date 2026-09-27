@@ -2,6 +2,7 @@
 //! reconciles them against the config, and serves IPC control commands.
 
 mod caja_mirror;
+pub mod cinnamon_bg;
 mod control;
 mod dde;
 mod fullscreen;
@@ -66,6 +67,27 @@ const STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 // playback progress before treating a still-running mpvpaper as wedged. 3 ≈ 6s,
 // high enough that a normally looping clip never trips it.
 const STALL_STRIKES: u32 = 3;
+
+/// Best-effort human-readable message from a caught panic payload (as handed
+/// back by `std::panic::catch_unwind`) — covers the two payload shapes `panic!`
+/// actually produces (`&'static str` and `String`); anything else logs a
+/// generic message rather than nothing at all.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Grace period for [`presentation_confirmed`]'s never-advances case: how long
+/// a still image, a paused-at-spawn video, or the static-fallback frame gets
+/// to actually render before we trust that its surface is mapped. There is no
+/// IPC signal for "first frame rendered" on media that never advances its
+/// clock, so this is a deliberately generous fixed wait rather than a poll.
+const CONFIRM_GRACE: Duration = Duration::from_secs(6);
 // Cross-monitor lockstep: the same video on two outputs plays on independent
 // mpv clocks, and per-output pauses (fullscreen on one monitor, workspace
 // switches) make them drift further apart forever. Periodically re-seat every
@@ -1909,6 +1931,21 @@ fn run_wayland_layershell() -> Result<()> {
     let mut battery_paused = false;
     let mut last_supervise = Instant::now() - SUPERVISE;
     let mut last_heartbeat_check = Instant::now();
+    // Issue #28: on Cinnamon's newer, layer-shell-capable muffin, a brand-new
+    // mpvpaper surface maps underneath cinnamon-background-daemon's own
+    // window unless that daemon is restarted afterwards. `capability::detect`
+    // already ran (we're in this function only because it chose
+    // WaylandLayerShell), so the gate below only needs to add "and is this
+    // actually Cinnamon, with the newer daemon". Cheap to recompute per
+    // restack (it's already rate-limited to roughly once per 10s+).
+    let is_cinnamon = crate::capability::is_cinnamon();
+    let mut restack_scheduler = cinnamon_bg::RestackScheduler::new();
+    // How often to check whether Cinnamon's background daemon needs
+    // (re-)activating (its bus name has no owner). Independent of restacking
+    // — this just guards against Fresco outliving the daemon on a session
+    // where something else killed it.
+    const ENSURE_DAEMON_PROBE: Duration = Duration::from_secs(30);
+    let mut next_ensure_daemon = Instant::now();
     // Display-presence probe: due immediately, then paced by whether anything is
     // still restarting (see the supervise block).
     let mut next_output_probe = Instant::now();
@@ -2181,7 +2218,56 @@ fn run_wayland_layershell() -> Result<()> {
                     || present
                         .as_ref()
                         .map_or(!o.absent, |s| s.contains(connector));
+                let was_confirmed = o.confirmed_live;
                 o.supervise(paused, MAX_RESTARTS, here);
+                if is_cinnamon && !was_confirmed && o.confirmed_live {
+                    // A brand-new mpvpaper surface (first start, stall
+                    // respawn, hotplug, static-fallback) just came up on this
+                    // output — never a `loadfile` media swap, which reuses
+                    // the existing player and so never flips this edge. Debounced
+                    // and rate-limited inside the scheduler; the gdbus round
+                    // trips run off this thread so a slow restack never stalls
+                    // the tick loop.
+                    restack_scheduler.note_spawn(Instant::now());
+                }
+            }
+            if restack_scheduler.poll(Instant::now()) {
+                std::thread::spawn(|| {
+                    if cinnamon_bg::should_restack(crate::capability::Capability::WaylandLayerShell)
+                    {
+                        // Never let a panic mid-sequence (between SIGTERM and
+                        // Start) silently leave the daemon dead — catch it,
+                        // log it, and make a best-effort attempt to bring the
+                        // daemon back regardless of where the panic landed.
+                        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            cinnamon_bg::restack_cycle,
+                        )) {
+                            log::error!(
+                                "cinnamon: restack thread panicked ({}); attempting to \
+                                 reactivate the background daemon as a safety net",
+                                panic_payload_message(&e)
+                            );
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                cinnamon_bg::ensure_daemon_running,
+                            ));
+                        }
+                    }
+                });
+            }
+            if Instant::now() >= next_ensure_daemon {
+                next_ensure_daemon = Instant::now() + ENSURE_DAEMON_PROBE;
+                if is_cinnamon {
+                    std::thread::spawn(|| {
+                        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            cinnamon_bg::ensure_daemon_running,
+                        )) {
+                            log::error!(
+                                "cinnamon: ensure_daemon_running thread panicked ({})",
+                                panic_payload_message(&e)
+                            );
+                        }
+                    });
+                }
             }
             if probed {
                 probed = false;
@@ -2439,6 +2525,23 @@ struct WlOutput {
     /// run — see [`WlOutput::supervise`]'s give-up arm — so a re-armed output
     /// that fails again does not spam either channel a second time.
     giveup_reported: bool,
+    /// Set once `supervise` has real evidence that this output's current
+    /// player is actually *presenting* — not merely that the mpv IPC socket
+    /// answers, which happens before the first frame is rendered. mpvpaper
+    /// only attaches a buffer to its layer-shell surface (the point muffin
+    /// maps it) at that first render, so confirming on "IPC alive" alone can
+    /// fire the Cinnamon restack (issue #28) before mpvpaper's surface even
+    /// exists — landing it under Cinnamon's freshly (re)mapped windows again,
+    /// with nothing left to retrigger a fix. See [`presentation_confirmed`]
+    /// for the actual evidence required. Cleared on every respawn/park. Read
+    /// by the Wayland loop only to detect the false→true edge; a `loadfile`
+    /// media swap that reuses the existing process never touches this flag.
+    confirmed_live: bool,
+    /// When the current player was spawned — the clock [`presentation_confirmed`]
+    /// measures its grace period against for media that legitimately never
+    /// advances (stills, paused-at-spawn, the static-fallback frame). Reset on
+    /// every respawn.
+    spawn_at: Instant,
     /// When a re-armed live-playback attempt (see [`RENDERER_REARM_DELAY`])
     /// is due, if this output has given up. `None` while playing normally or
     /// while a give-up is still waiting to be scheduled.
@@ -2512,6 +2615,8 @@ impl WlOutput {
             last_spawn_fail: None,
             last_spawn_detail: None,
             giveup_reported: false,
+            confirmed_live: false,
+            spawn_at: Instant::now(),
             next_rearm: None,
             rearms: 0,
             generation: 0,
@@ -2551,6 +2656,10 @@ impl WlOutput {
         // no overlays, including the failure paths.
         self.generation = self.generation.wrapping_add(1);
         drop(self.player.take());
+        // A fresh process is a new, unconfirmed surface — see the field's doc
+        // comment. The (re)confirmation happens on the next healthy
+        // `supervise` tick.
+        self.confirmed_live = false;
         self.slideshow = None;
         // The gamma, zoom and filter all died with that process, so the
         // transition is over — and must be dropped without IPC to a socket
@@ -2587,6 +2696,9 @@ impl WlOutput {
                 self.applied_paused.set(paused || static_frame);
                 self.last_spawn_fail = None;
                 self.last_spawn_detail = None;
+                // The clock `presentation_confirmed`'s grace period measures
+                // against — see the field's doc comment.
+                self.spawn_at = Instant::now();
             }
             Err(e) => {
                 log::error!("[{}] {e:#}", self.connector);
@@ -2746,6 +2858,7 @@ impl WlOutput {
             ));
         }
         drop(self.player.take());
+        self.confirmed_live = false;
         self.slideshow = None;
         self.anim.forget();
         self.animating = false;
@@ -2789,6 +2902,11 @@ impl WlOutput {
         }
         let alive = self.player.as_ref().map(|p| p.is_alive()).unwrap_or(false);
         if alive {
+            // What the position sampling saw just before this tick's sample —
+            // `check_stall` (below) overwrites `last_pos` with the new sample,
+            // so capture the old one first if `presentation_confirmed` needs
+            // to compare the two.
+            let prev_pos = self.last_pos;
             // A paused or static-fallback frame is not expected to advance — don't
             // sample. Otherwise check for a frozen-but-alive (wedged) renderer.
             let frozen = if self.static_fallback || self.applied_paused.get() {
@@ -2798,6 +2916,31 @@ impl WlOutput {
             } else {
                 self.check_stall()
             };
+            if !self.confirmed_live {
+                // mpv's IPC answers before mpvpaper has rendered a first
+                // frame — which is when mpvpaper actually attaches a buffer
+                // to its layer-shell surface and muffin maps it. Confirming
+                // on "IPC alive" alone can fire the Cinnamon restack (issue
+                // #28) before that surface exists, landing it under
+                // Cinnamon's freshly remapped windows again with nothing left
+                // to retrigger a fix — so wait for real evidence of
+                // presentation instead. Idempotent; the Wayland loop diffs
+                // this against the value from before the call to catch the
+                // false→true edge.
+                let never_advances = self.static_fallback
+                    || self.applied_paused.get()
+                    || self.player.as_ref().is_some_and(holds_frame_by_design);
+                let elapsed = Instant::now().duration_since(self.spawn_at);
+                if presentation_confirmed(
+                    never_advances,
+                    prev_pos,
+                    self.last_pos,
+                    elapsed,
+                    CONFIRM_GRACE,
+                ) {
+                    self.confirmed_live = true;
+                }
+            }
             if !frozen {
                 if !self.static_fallback {
                     self.restarts = 0;
@@ -3048,6 +3191,39 @@ fn stall_step(
         }
         (Some(_), _) => 0,
         (None, _) => strikes, // couldn't read the position; don't penalize
+    }
+}
+
+/// Whether a freshly (re)spawned player has produced real evidence that it is
+/// actually presenting frames — as opposed to merely answering mpv's IPC
+/// socket, which happens before mpvpaper renders (and so attaches a buffer
+/// to, and muffin maps) its first frame. Issue #28's Cinnamon restack must
+/// only fire once this is true, or it can run before mpvpaper's surface
+/// exists and land it under Cinnamon's own windows with nothing left to
+/// retrigger a fix.
+///
+/// `never_advances` is media that legitimately never moves its playback
+/// clock — a still image, a video paused at spawn, or the static-fallback
+/// frame — for which the only available evidence is time: whether `grace` has
+/// elapsed since spawn. Otherwise (moving media), evidence is a playback
+/// position that strictly increased between two consecutive supervise
+/// samples — reusing the
+/// same sampling `check_stall` already does, so this never adds IPC traffic
+/// (`prev_pos`/`cur_pos` should be the values immediately before/after that
+/// call). A single sample is never enough (`prev_pos` is `None` right after a
+/// respawn), so confirmation always needs at least one full supervise
+/// interval of real playback.
+fn presentation_confirmed(
+    never_advances: bool,
+    prev_pos: Option<f64>,
+    cur_pos: Option<f64>,
+    elapsed_since_spawn: Duration,
+    grace: Duration,
+) -> bool {
+    if never_advances {
+        elapsed_since_spawn >= grace
+    } else {
+        matches!((prev_pos, cur_pos), (Some(p), Some(c)) if c > p + 1e-3)
     }
 }
 
@@ -3446,8 +3622,8 @@ fn widget_clock_cfg(c: &crate::config::Clock) -> widgets::ClockCfg {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_stat_ticks, stall_step, widget_wait, WlOutput, ANIM_TICK, MIN_WIDGET_WAIT,
-        MONITOR_INTERVAL, STALL_STRIKES, TICK,
+        parse_stat_ticks, presentation_confirmed, stall_step, widget_wait, WlOutput, ANIM_TICK,
+        CONFIRM_GRACE, MIN_WIDGET_WAIT, MONITOR_INTERVAL, STALL_STRIKES, TICK,
     };
     use crate::config::{Kind, PowerSaving, Scaling, Wallpaper};
     use std::time::{Duration, Instant};
@@ -3525,6 +3701,82 @@ mod tests {
         // Progress clears the count, held frame or not.
         assert_eq!(stall_step(Some(12.5), Some(13.0), strikes, || false), 0);
         assert_eq!(stall_step(Some(12.5), Some(13.0), strikes, || true), 0);
+    }
+
+    /// `presentation_confirmed` (issue #28): mpv's IPC answers before mpvpaper
+    /// has actually rendered — and so before its layer-shell surface is
+    /// mapped — so "the socket is alive" must never be read as "presenting".
+    #[test]
+    fn presentation_confirmed_requires_real_evidence() {
+        // IPC alive but position still stuck at 0 (mpv hasn't rendered its
+        // first frame yet): not confirmed, whatever `elapsed` says — moving
+        // media is confirmed by advance, not by time.
+        assert!(!presentation_confirmed(
+            false,
+            Some(0.0),
+            Some(0.0),
+            Duration::from_secs(60),
+            CONFIRM_GRACE
+        ));
+        // Only one sample so far (fresh respawn) — nothing to compare against.
+        assert!(!presentation_confirmed(
+            false,
+            None,
+            Some(0.0),
+            Duration::ZERO,
+            CONFIRM_GRACE
+        ));
+        // The position advanced between two consecutive samples: confirmed
+        // immediately, regardless of elapsed time.
+        assert!(presentation_confirmed(
+            false,
+            Some(1.0),
+            Some(1.5),
+            Duration::ZERO,
+            CONFIRM_GRACE
+        ));
+        // A position that merely jitters within tolerance must not confirm.
+        assert!(!presentation_confirmed(
+            false,
+            Some(1.0),
+            Some(1.0 + 1e-4),
+            Duration::from_secs(60),
+            CONFIRM_GRACE
+        ));
+        // A position that goes backward (e.g. a loop restart) must not confirm.
+        assert!(!presentation_confirmed(
+            false,
+            Some(5.0),
+            Some(1.0),
+            Duration::from_secs(60),
+            CONFIRM_GRACE
+        ));
+
+        // Still image / paused-at-spawn / static-fallback: confirmed only
+        // after the grace period, never before.
+        assert!(!presentation_confirmed(
+            true,
+            Some(0.0),
+            Some(0.0),
+            CONFIRM_GRACE - Duration::from_millis(1),
+            CONFIRM_GRACE
+        ));
+        assert!(presentation_confirmed(
+            true,
+            Some(0.0),
+            Some(0.0),
+            CONFIRM_GRACE,
+            CONFIRM_GRACE
+        ));
+        // Also confirmed with no position samples at all (the static/paused
+        // branch of `supervise` never samples).
+        assert!(presentation_confirmed(
+            true,
+            None,
+            None,
+            CONFIRM_GRACE + Duration::from_secs(1),
+            CONFIRM_GRACE
+        ));
     }
 
     /// A wallpaper with nothing behind it — an empty or unreadable slideshow
