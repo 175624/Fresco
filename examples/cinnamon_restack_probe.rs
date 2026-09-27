@@ -2,7 +2,7 @@
 //! (`tests/cinnamon_bg_fake_daemon.sh`, invoked via the `#[ignore]`d
 //! `daemon::cinnamon_bg::tests::restack_against_fake_daemon`).
 //!
-//! Not part of the product; it exercises the real `cinnamon_bg::restack()`
+//! Not part of the product; it exercises the real `cinnamon_bg::restack_cycle()`
 //! and `ensure_daemon_running()` functions against whatever session bus is
 //! active in the environment (the shell harness runs this under
 //! `dbus-run-session` with a fake `org.Cinnamon.Background` service
@@ -16,7 +16,7 @@ fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     match cmd.as_str() {
         "ensure" => fresco::daemon::cinnamon_bg::ensure_daemon_running(),
-        "restack" => fresco::daemon::cinnamon_bg::restack(),
+        "restack" => fresco::daemon::cinnamon_bg::restack_cycle(),
         other => {
             eprintln!("usage: cinnamon_restack_probe <ensure|restack> (got {other:?})");
             std::process::exit(2);
