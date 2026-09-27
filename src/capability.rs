@@ -2,11 +2,22 @@
 //!
 //! X11 sessions use the embedded-mpv backend. Wayland sessions are split:
 //!  - GNOME/Mutter has no `wlr-layer-shell`, so we fall back to a static frame.
+//!  - Cinnamon's muffin *used to* have none either, but as of muffin PR #803
+//!    it now implements `zwlr_layer_shell_v1` for every client — so a current
+//!    Cinnamon session gets the same live layer-shell backend as everything
+//!    else. See `daemon::cinnamon_bg` for the restack this newer muffin needs
+//!    (it stacks new BACKGROUND surfaces under old ones, hiding mpvpaper
+//!    behind `cinnamon-background-daemon`'s own window unless that daemon is
+//!    restarted after mpvpaper comes up).
 //!  - Everything else (wlroots, KDE Plasma 6, COSMIC, …) uses the mpvpaper
 //!    layer-shell backend for live wallpapers.
 //!
 //! On Wayland we probe the live registry for `zwlr_layer_shell_v1` ourselves (no
-//! external tools) and trust that over the desktop-name heuristic.
+//! external tools) and trust that over the desktop-name heuristic below, which
+//! only runs when no Wayland connection could be made at all (so a real probe
+//! is impossible) — there we still have to guess, and guessing layer-shell for
+//! GNOME or an old Cinnamon means mpvpaper fails outright at login, so both
+//! keep defaulting to the static fallback in that fallback path only.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
@@ -80,8 +91,13 @@ fn classify(
     if !is_wayland {
         return Capability::X11;
     }
-    // Cinnamon's muffin, like GNOME's Mutter, has no layer-shell: without a
-    // registry probe, guessing layer-shell there means mpvpaper fails at login.
+    // Name-only fallback, used only when no Wayland connection could be made
+    // at all (so `probe_layer_shell` returned `None`) — a real Cinnamon
+    // session almost always reaches the probe above instead. We cannot tell
+    // an old muffin (no layer-shell) from a current one (has it, PR #803)
+    // by name alone, and guessing layer-shell for either GNOME or Cinnamon
+    // means mpvpaper fails outright at login if we guess wrong — so both
+    // still default to the static fallback here.
     if is_gnome(current_desktop) || is_cinnamon_name(current_desktop) {
         Capability::WaylandGnomeStatic
     } else {
@@ -232,7 +248,10 @@ mod tests {
     }
 
     #[test]
-    fn wayland_cinnamon_is_static() {
+    fn wayland_cinnamon_is_static_in_the_name_only_fallback() {
+        // Only reached when no Wayland connection could be made at all; a
+        // live probe (see `daemon::cinnamon_bg`) is what actually tells a
+        // current, layer-shell-capable muffin apart from an old one.
         for d in ["X-Cinnamon", "Cinnamon", "cinnamon"] {
             assert_eq!(
                 classify(Some("wayland"), true, Some(d)),

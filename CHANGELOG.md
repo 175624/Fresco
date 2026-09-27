@@ -11,6 +11,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   name shows every wallpaper in it, in any script (e.g. 自然).
 - **A "Back to top" button** appears once the library is scrolled past half
   a page (issue #26).
+- **Live video wallpapers on Cinnamon Wayland, from Cinnamon 6.8** (issue
+  #28). Cinnamon's compositor gained the `wlr-layer-shell` protocol
+  (linuxmint/muffin #803), which Fresco already detects and plays through.
+  Cinnamon draws its own wallpaper first and stacks newer background
+  surfaces underneath older ones, so once the video is on screen Fresco
+  restarts Cinnamon's background daemon, which puts Cinnamon's wallpaper
+  back underneath the video. Cinnamon 6.6 and older have no layer-shell and
+  keep the static frame.
 
 ### Changed
 - **A newly added wallpaper joins the library only when you click "Set as
@@ -35,6 +43,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A freshly added video no longer shows a black preview in the editor**
   (issue #27, a 1.1.44 regression). The editor generates the thumbnail
   itself if it opens before the background batch has.
+- **Stopping Fresco restores your wallpaper again on the latest Cinnamon**
+  (issue #28). Cinnamon now keeps wallpapers in `picture-uri-list` and
+  `background-mode`, and clears `picture-uri` after applying it, so Fresco
+  backed up an empty value and never restored the original; writing
+  `picture-uri` also collapsed per-monitor wallpapers into one. Fresco now
+  backs up and restores those two keys exactly, and leaves `picture-uri`
+  alone. Older Cinnamon, GNOME and MATE are unchanged.
 
 ## [1.1.44] — Unreleased
 
