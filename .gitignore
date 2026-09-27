@@ -19,3 +19,4 @@ docs/ARCHITECTURE_BRIEF.md
 .claude/*.tmp.*
 .claude/settings.local.json.tmp*
 flatpak/local-test.yaml
+brag-output
