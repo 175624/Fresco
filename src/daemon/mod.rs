@@ -2,6 +2,7 @@
 //! reconciles them against the config, and serves IPC control commands.
 
 mod caja_mirror;
+pub mod cinnamon_bg;
 mod control;
 mod dde;
 mod fullscreen;
@@ -1909,6 +1910,21 @@ fn run_wayland_layershell() -> Result<()> {
     let mut battery_paused = false;
     let mut last_supervise = Instant::now() - SUPERVISE;
     let mut last_heartbeat_check = Instant::now();
+    // Issue #28: on Cinnamon's newer, layer-shell-capable muffin, a brand-new
+    // mpvpaper surface maps underneath cinnamon-background-daemon's own
+    // window unless that daemon is restarted afterwards. `capability::detect`
+    // already ran (we're in this function only because it chose
+    // WaylandLayerShell), so the gate below only needs to add "and is this
+    // actually Cinnamon, with the newer daemon". Cheap to recompute per
+    // restack (it's already rate-limited to roughly once per 10s+).
+    let is_cinnamon = crate::capability::is_cinnamon();
+    let mut restack_scheduler = cinnamon_bg::RestackScheduler::new();
+    // How often to check whether Cinnamon's background daemon needs
+    // (re-)activating (its bus name has no owner). Independent of restacking
+    // — this just guards against Fresco outliving the daemon on a session
+    // where something else killed it.
+    const ENSURE_DAEMON_PROBE: Duration = Duration::from_secs(30);
+    let mut next_ensure_daemon = Instant::now();
     // Display-presence probe: due immediately, then paced by whether anything is
     // still restarting (see the supervise block).
     let mut next_output_probe = Instant::now();
@@ -2181,7 +2197,32 @@ fn run_wayland_layershell() -> Result<()> {
                     || present
                         .as_ref()
                         .map_or(!o.absent, |s| s.contains(connector));
+                let was_confirmed = o.confirmed_live;
                 o.supervise(paused, MAX_RESTARTS, here);
+                if is_cinnamon && !was_confirmed && o.confirmed_live {
+                    // A brand-new mpvpaper surface (first start, stall
+                    // respawn, hotplug, static-fallback) just came up on this
+                    // output — never a `loadfile` media swap, which reuses
+                    // the existing player and so never flips this edge. Debounced
+                    // and rate-limited inside the scheduler; the gdbus round
+                    // trips run off this thread so a slow restack never stalls
+                    // the tick loop.
+                    restack_scheduler.note_spawn(Instant::now());
+                }
+            }
+            if restack_scheduler.poll(Instant::now()) {
+                std::thread::spawn(|| {
+                    if cinnamon_bg::should_restack(crate::capability::Capability::WaylandLayerShell)
+                    {
+                        cinnamon_bg::restack();
+                    }
+                });
+            }
+            if Instant::now() >= next_ensure_daemon {
+                next_ensure_daemon = Instant::now() + ENSURE_DAEMON_PROBE;
+                if is_cinnamon {
+                    std::thread::spawn(cinnamon_bg::ensure_daemon_running);
+                }
             }
             if probed {
                 probed = false;
@@ -2439,6 +2480,13 @@ struct WlOutput {
     /// run — see [`WlOutput::supervise`]'s give-up arm — so a re-armed output
     /// that fails again does not spam either channel a second time.
     giveup_reported: bool,
+    /// Set the first time `supervise` sees this output's current player alive
+    /// (spawned or static-fallback), cleared on every respawn/park. Read by
+    /// the Wayland loop only to detect the false→true edge — a brand-new
+    /// mpvpaper surface just mapped — which is what should trigger a Cinnamon
+    /// background-daemon restack (issue #28); a `loadfile` media swap that
+    /// reuses the existing process never touches this flag.
+    confirmed_live: bool,
     /// When a re-armed live-playback attempt (see [`RENDERER_REARM_DELAY`])
     /// is due, if this output has given up. `None` while playing normally or
     /// while a give-up is still waiting to be scheduled.
@@ -2512,6 +2560,7 @@ impl WlOutput {
             last_spawn_fail: None,
             last_spawn_detail: None,
             giveup_reported: false,
+            confirmed_live: false,
             next_rearm: None,
             rearms: 0,
             generation: 0,
@@ -2551,6 +2600,10 @@ impl WlOutput {
         // no overlays, including the failure paths.
         self.generation = self.generation.wrapping_add(1);
         drop(self.player.take());
+        // A fresh process is a new, unconfirmed surface — see the field's doc
+        // comment. The (re)confirmation happens on the next healthy
+        // `supervise` tick.
+        self.confirmed_live = false;
         self.slideshow = None;
         // The gamma, zoom and filter all died with that process, so the
         // transition is over — and must be dropped without IPC to a socket
@@ -2746,6 +2799,7 @@ impl WlOutput {
             ));
         }
         drop(self.player.take());
+        self.confirmed_live = false;
         self.slideshow = None;
         self.anim.forget();
         self.animating = false;
@@ -2789,6 +2843,11 @@ impl WlOutput {
         }
         let alive = self.player.as_ref().map(|p| p.is_alive()).unwrap_or(false);
         if alive {
+            // A live IPC-responsive process is as close as we get to "the
+            // surface is mapped" without asking the compositor — see the
+            // field's doc comment. Idempotent; the Wayland loop diffs this
+            // against the value from before the call to catch the edge.
+            self.confirmed_live = true;
             // A paused or static-fallback frame is not expected to advance — don't
             // sample. Otherwise check for a frozen-but-alive (wedged) renderer.
             let frozen = if self.static_fallback || self.applied_paused.get() {
