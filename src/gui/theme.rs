@@ -27,6 +27,12 @@ thread_local! {
     // The attached provider, so `apply()` can detach the previous stylesheet.
     static PROVIDER: std::cell::RefCell<Option<gtk4::CssProvider>> =
         const { std::cell::RefCell::new(None) };
+
+    // Whether `System` mode should currently paint dark because of the deepin
+    // GTK-theme-name fallback (see `system_fallback_dark`), independent of
+    // libadwaita's own `is_dark()`. Recomputed on every `set_mode(System)`
+    // call and cleared by an explicit Light/Dark choice.
+    static FALLBACK_DARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A single resolved color palette (dark or light). Every field is a CSS
@@ -139,7 +145,20 @@ pub fn apply(accent: Accent, dark: bool) {
 }
 
 /// Map the user's [`ThemeMode`] preference onto libadwaita's color scheme.
+///
+/// libadwaita's `Default` scheme only resolves dark from the portal / GSettings
+/// `color-scheme` key. deepin (DDE) writes neither: it signals dark purely
+/// through the GTK theme name (`deepin-dark`), delivered over XSettings. It
+/// also ships the GNOME `color-scheme` schema, so
+/// [`adw::StyleManager::system_supports_color_schemes`] can report `true`
+/// while never actually flipping. So for `System` mode we additionally probe
+/// the raw GTK theme name ourselves and remember whether *that* says dark;
+/// [`resolve_dark`] ORs it with libadwaita's own resolution.
 pub fn set_mode(mode: ThemeMode) {
+    match mode {
+        ThemeMode::System => FALLBACK_DARK.with(|f| f.set(system_fallback_dark())),
+        ThemeMode::Light | ThemeMode::Dark => FALLBACK_DARK.with(|f| f.set(false)),
+    }
     adw::StyleManager::default().set_color_scheme(match mode {
         ThemeMode::System => adw::ColorScheme::Default,
         ThemeMode::Light => adw::ColorScheme::ForceLight,
@@ -155,13 +174,86 @@ pub fn is_dark() -> bool {
 /// Whether `mode` should paint dark, right now. For explicit Light/Dark this is
 /// the mode itself — critically NOT `is_dark()`, which updates asynchronously
 /// after `set_mode` and so is stale in the same call (the "clicking Light did
-/// nothing" bug). Only `System` defers to the resolved scheme.
+/// nothing" bug). `System` defers to the resolved scheme, OR'd with the
+/// deepin GTK-theme-name fallback recorded by `set_mode` (see its doc comment).
 pub fn resolve_dark(mode: ThemeMode) -> bool {
     match mode {
         ThemeMode::Light => false,
         ThemeMode::Dark => true,
-        ThemeMode::System => is_dark(),
+        ThemeMode::System => FALLBACK_DARK.with(|f| f.get()) || is_dark(),
     }
+}
+
+/// True if `name` (a GTK theme name) looks like a dark variant, e.g.
+/// `deepin-dark`, `Adwaita-dark`, `Breeze-Dark`. Case-insensitive substring
+/// match — themes don't follow one casing convention.
+fn theme_name_is_dark(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("dark")
+}
+
+/// True if a desktop-identifier value (as found in `XDG_CURRENT_DESKTOP`,
+/// `XDG_SESSION_DESKTOP`, or `DESKTOP_SESSION`, which can be colon- or
+/// semicolon-separated lists) names deepin/DDE.
+fn desktop_is_deepin(desktop: &str) -> bool {
+    desktop
+        .split([':', ';'])
+        .any(|part| matches!(part.trim().to_ascii_lowercase().as_str(), "deepin" | "dde"))
+}
+
+/// Whether the deepin GTK-theme-name fallback should be consulted at all:
+/// either the desktop is identified as deepin/DDE, or libadwaita itself
+/// admits it has no working color-scheme signal to resolve dark/light from.
+fn fallback_applies() -> bool {
+    let desktop_env = |var: &str| {
+        std::env::var(var)
+            .map(|v| desktop_is_deepin(&v))
+            .unwrap_or(false)
+    };
+    desktop_env("XDG_CURRENT_DESKTOP")
+        || desktop_env("XDG_SESSION_DESKTOP")
+        || desktop_env("DESKTOP_SESSION")
+        || !adw::StyleManager::default().system_supports_color_schemes()
+}
+
+/// Read the *raw* `gtk-theme-name` setting straight from the display's
+/// XSettings/portal source, bypassing libadwaita.
+///
+/// TRAP: libadwaita overwrites the `GtkSettings:gtk-theme-name` property on
+/// the default `GtkSettings` object, so reading it through `gtk4::Settings`
+/// after libadwaita has run gives back libadwaita's own idea of the theme,
+/// not what the desktop actually set. `gdk::Display::get_setting` instead
+/// asks the display backend directly (XSettings on X11), which still carries
+/// deepin's real `deepin-dark` / `deepin` value.
+///
+/// Called through FFI with a `Value` pre-typed as a string: the safe
+/// `DisplayExtManual::get_setting` hands GDK an uninitialized `Value`, which
+/// the X11 backend rejects with a `g_value_set_string` CRITICAL on every call.
+fn raw_gtk_theme_name() -> Option<String> {
+    use gtk4::glib;
+
+    let display = gtk4::gdk::Display::default()?;
+    unsafe {
+        let mut value = glib::Value::from_type(glib::Type::STRING);
+        let ok: bool = glib::translate::from_glib(gtk4::gdk::ffi::gdk_display_get_setting(
+            glib::translate::ToGlibPtr::to_glib_none(&display).0,
+            c"gtk-theme-name".as_ptr(),
+            glib::translate::ToGlibPtrMut::to_glib_none_mut(&mut value).0,
+        ));
+        if ok {
+            value.get::<String>().ok()
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether `System` mode should currently paint dark because of deepin's
+/// GTK-theme-name-only dark signal. See [`set_mode`]'s doc comment.
+fn system_fallback_dark() -> bool {
+    fallback_applies()
+        && raw_gtk_theme_name()
+            .map(|name| theme_name_is_dark(&name))
+            .unwrap_or(false)
 }
 
 /// Build the full stylesheet for the given accent + scheme.
@@ -460,6 +552,37 @@ mod tests {
         for accent in [Accent::Blue, Accent::Teal, Accent::Amber, Accent::Coral] {
             let (bg, _) = accent_pair(accent, true);
             assert!(build_css(accent, true).contains(bg), "{accent:?} missing");
+        }
+    }
+
+    /// deepin's dark theme names (and other desktops' dark variants) are
+    /// recognized regardless of casing; non-dark names, including deepin's
+    /// own light/auto themes, are not.
+    #[test]
+    fn theme_name_is_dark_matches_dark_variants() {
+        for dark_name in ["deepin-dark", "Adwaita-dark", "Breeze-Dark"] {
+            assert!(theme_name_is_dark(dark_name), "{dark_name} should be dark");
+        }
+        for light_name in ["deepin", "Breeze", "Adwaita", "deepin-auto", ""] {
+            assert!(
+                !theme_name_is_dark(light_name),
+                "{light_name} should not be dark"
+            );
+        }
+    }
+
+    /// deepin/DDE is recognized in single-value and colon/semicolon-joined
+    /// `XDG_CURRENT_DESKTOP`-style lists; other desktops are not.
+    #[test]
+    fn desktop_is_deepin_matches_deepin_and_dde() {
+        for desktop in ["Deepin", "DDE", "GNOME:Deepin"] {
+            assert!(desktop_is_deepin(desktop), "{desktop} should be deepin");
+        }
+        for desktop in ["GNOME", "KDE", "ubuntu:GNOME"] {
+            assert!(
+                !desktop_is_deepin(desktop),
+                "{desktop} should not be deepin"
+            );
         }
     }
 }

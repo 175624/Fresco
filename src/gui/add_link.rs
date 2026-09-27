@@ -13,7 +13,7 @@ use std::sync::Arc;
 use gtk4::{gio, glib, prelude::*};
 use libadwaita as adw;
 
-use super::library::{self, save_entries};
+use super::library;
 use super::window::{glass_dialog, show_toast, AppState};
 use crate::linkresolve::{MediaKind, ResolvedMedia};
 use crate::{t, tf};
@@ -299,19 +299,7 @@ pub(crate) fn show_add_link_dialog(
                             } else {
                                 library::LibraryEntry::new_image(path)
                             };
-                            let id = e.id.clone();
                             let name = e.name.clone();
-                            let idx = {
-                                let mut s = state.borrow_mut();
-                                s.entries.push(e);
-                                save_entries(&s.entries).ok();
-                                s.entries.len() - 1
-                            };
-                            // Thumbnail shells out to ffmpeg; the editor we
-                            // land in below loads its preview from the
-                            // entry's path, not the thumbnail, so it doesn't
-                            // need to wait for this.
-                            super::window::spawn_thumbnail_batch(&state, vec![id]);
                             show_toast(
                                 &state,
                                 &tf!(
@@ -319,15 +307,22 @@ pub(crate) fn show_add_link_dialog(
                                     "name" => name
                                 ),
                             );
-                            let refresh = state.borrow().refresh.clone();
-                            if let Some(r) = refresh {
-                                r();
-                            }
                             dialog.close();
-                            // Land in the editor, not the grid: a link-added
-                            // wallpaper deserves the same preview/rotate/crop
-                            // pass as a file-picked one before it's set.
-                            super::window::open_editor(&state, &stack, idx);
+                            // Land in the editor as a draft, not a library
+                            // entry: nothing is pushed to `entries`, saved to
+                            // `entries.json`, or applied as the running
+                            // wallpaper until "Set as wallpaper" commits it
+                            // (`commit_draft`). A video with no thumbnail yet
+                            // doesn't show black in the editor below — its
+                            // own on-enter handler notices the gap and
+                            // thumbnails the draft before painting the crop
+                            // preview (same fix as the file-picker path).
+                            // Backing out (Back, or closing the window)
+                            // discards the draft and, since this file lives
+                            // in Fresco's own `downloads` folder rather than
+                            // somewhere the user picked, deletes it too — see
+                            // `discard_draft`.
+                            super::window::open_draft_editor(&state, &stack, e);
                             break;
                         }
                         Msg::Done(Err(msg)) => {
