@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <enum id="org.cinnamon.desktop.CDesktopBackgroundStyle">
+    <value value="0" nick="none"/>
+    <value value="1" nick="wallpaper"/>
+    <value value="2" nick="centered"/>
+    <value value="3" nick="scaled"/>
+    <value value="4" nick="stretched"/>
+    <value value="5" nick="zoom"/>
+    <value value="6" nick="spanned"/>
+  </enum>
+  <enum id="org.cinnamon.desktop.CDesktopBackgroundShading">
+    <value value="0" nick="solid"/>
+    <value value="1" nick="vertical"/>
+    <value value="2" nick="horizontal"/>
+  </enum>
+</schemalist>
