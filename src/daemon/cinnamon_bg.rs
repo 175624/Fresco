@@ -23,7 +23,7 @@
 //! Cinnamon's own `backgroundManager.js` restarts the daemon itself if its bus
 //! name vanishes unexpectedly, but only once per 60s (`RESTART_LIMIT = 1`,
 //! `RESTART_WINDOW_US`) — it cannot tell our deliberate SIGTERM from a crash.
-//! Every SIGTERM we send spends that budget, so [`restack`] coalesces into one
+//! Every SIGTERM we send spends that budget, so `restack` coalesces into one
 //! restart per burst (see [`RestackScheduler`]) and always re-activates the
 //! daemon itself afterwards (`Start`), with retries.
 //!
@@ -31,7 +31,7 @@
 //! session without its wallpaper daemon.** Every path that could plausibly end
 //! with the daemon dead — a failed `Start`, a caller's thread panicking
 //! mid-sequence — has an explicit "try to bring it back anyway" step; see
-//! [`start_with_retries`] and the panic-safety net around the callers in
+//! `start_with_retries` and the panic-safety net around the callers in
 //! `daemon::mod`'s Wayland loop.
 
 use std::process::{Command, Stdio};
@@ -53,9 +53,10 @@ const MIN_INTERVAL: Duration = Duration::from_secs(10);
 /// How long to wait for the daemon to report READY (State == 1) before giving
 /// up on this attempt — mirrors Cinnamon's own `READY_FALLBACK_MS`.
 const READY_TIMEOUT: Duration = Duration::from_millis(4000);
-/// How long to wait for the bus name to vanish after SIGTERM, or to reappear
-/// after `Start`.
-const NAME_CHANGE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long to wait for the old daemon to release its bus name after SIGTERM.
+/// Tearing down its GL surfaces took over 2 s on a nested, software-rendered
+/// Cinnamon session.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(6);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const START_RETRIES: u32 = 3;
 /// How often a broken D-Bus probe (session bus unreachable, `gdbus` missing)
@@ -151,7 +152,7 @@ fn should_restack_core(
 static LIFECYCLE_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// RAII handle on [`LIFECYCLE_IN_PROGRESS`]: released (even on panic) when
+/// RAII handle on `LIFECYCLE_IN_PROGRESS`: released (even on panic) when
 /// dropped, so a caller that unwinds mid-lifecycle-operation can never leave
 /// the guard stuck held.
 struct LifecycleGuard;
@@ -177,7 +178,7 @@ impl Drop for LifecycleGuard {
 /// already-activating) `G_APPLICATION_IS_SERVICE` daemon is a documented
 /// no-op. Callers should rate-limit this themselves (it's meant to run on an
 /// occasional supervisor tick, not every tick); skips itself entirely while a
-/// restack is in progress (see [`LIFECYCLE_IN_PROGRESS`]) rather than racing it.
+/// restack is in progress (see `LIFECYCLE_IN_PROGRESS`) rather than racing it.
 pub fn ensure_daemon_running() {
     let Some(_guard) = LifecycleGuard::acquire() else {
         log::debug!(
@@ -200,7 +201,7 @@ pub fn ensure_daemon_running() {
     }
 }
 
-/// How a single [`restack`] attempt went.
+/// How a single `restack` attempt went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestackOutcome {
     /// The daemon was actually replaced and reports READY.
@@ -230,10 +231,10 @@ const RESTACK_RETRY_BACKOFF: Duration = MIN_INTERVAL;
 
 /// Public entry point: restart Cinnamon's background daemon so its window
 /// group gets recreated after mpvpaper's surfaces — see the module doc
-/// comment. Retries up to [`MAX_RESTACK_ATTEMPTS`] times (spaced by
-/// [`RESTACK_RETRY_BACKOFF`]) when an attempt reports [`RestackOutcome::NotReady`]
-/// or [`RestackOutcome::Ineffective`], and never runs concurrently with
-/// [`ensure_daemon_running`] (see [`LIFECYCLE_IN_PROGRESS`]).
+/// comment. Retries up to `MAX_RESTACK_ATTEMPTS` times (spaced by
+/// `RESTACK_RETRY_BACKOFF`) when an attempt reports `RestackOutcome::NotReady`
+/// or `RestackOutcome::Ineffective`, and never runs concurrently with
+/// [`ensure_daemon_running`] (see `LIFECYCLE_IN_PROGRESS`).
 ///
 /// Safe to call from any thread; blocks for up to roughly
 /// `MAX_RESTACK_ATTEMPTS * (2 * READY_TIMEOUT + RESTACK_RETRY_BACKOFF)` in the
@@ -329,11 +330,11 @@ fn restack() -> RestackOutcome {
         log::warn!("cinnamon: failed to signal background daemon (pid {pid}): {e}");
         return RestackOutcome::Failed;
     }
-    let exited = wait_for_name_owner(false, NAME_CHANGE_TIMEOUT);
+    let exited = wait_for_name_owner(false, EXIT_TIMEOUT);
     if !exited {
         log::warn!(
             "cinnamon: background daemon (pid {pid}) did not exit within \
-             {NAME_CHANGE_TIMEOUT:?}; restack may be ineffective"
+             {EXIT_TIMEOUT:?}; restack may be ineffective"
         );
         // Fall through anyway and try to (re)activate it — see the module's
         // "never leave the daemon dead" invariant. Whether it actually took
@@ -378,7 +379,7 @@ fn restack() -> RestackOutcome {
 }
 
 /// Call `Start` up to [`START_RETRIES`] times with backoff, logging each
-/// failure's `gdbus` error. Shared by [`restack`] and [`ensure_daemon_running`]
+/// failure's `gdbus` error. Shared by `restack` and [`ensure_daemon_running`]
 /// — both are "the daemon might be dead right now" moments the module's
 /// never-leave-it-dead invariant applies to.
 fn start_with_retries(context: &str) -> bool {
@@ -751,7 +752,7 @@ mod tests {
 
     /// Full integration test against a fake `org.Cinnamon.Background` service
     /// on an isolated session bus (`dbus-run-session`), calling the real
-    /// [`restack`] and [`ensure_daemon_running`] through the
+    /// `restack` and [`ensure_daemon_running`] through the
     /// `cinnamon_restack_probe` example binary. Asserts the exact sequence:
     /// wait for READY, SIGTERM the old pid, wait for it to exit, `Start` a
     /// new instance, wait for READY again — and that `ensure_daemon_running`
