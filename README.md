@@ -1,27 +1,40 @@
 <div align="center">
 
-<img src="data/icons/hicolor/256x256/apps/io.github.dibbayajyotiroy.Fresco.png" width="112" alt="Fresco logo — live wallpaper app for Linux" />
+<img src="https://raw.githubusercontent.com/DibbayajyotiRoy/fresco/main/data/icons/hicolor/256x256/apps/io.github.dibbayajyotiroy.Fresco.png" width="112" alt="Fresco application icon — a free, open-source live wallpaper app for Linux" />
 
 # Fresco — Live Wallpapers for Linux
 
-**Set any video, GIF, or image as an animated desktop wallpaper.** A free, open-source **Wallpaper Engine alternative for Linux**, working on **X11 and Wayland** (COSMIC, Hyprland, Sway, KDE Plasma 6, Deepin DDE).
+**Fresco is a free, open-source live wallpaper app for Linux that sets any video, GIF or image as an animated desktop wallpaper on X11 and Wayland.** A **Wallpaper Engine alternative for Linux**, working on COSMIC, Hyprland, Sway, KDE Plasma 6, and Deepin DDE.
 
 [![Release](https://img.shields.io/github/v/release/DibbayajyotiRoy/fresco?style=flat-square&label=release)](https://github.com/DibbayajyotiRoy/fresco/releases/latest)
 [![License](https://img.shields.io/github/license/DibbayajyotiRoy/fresco?style=flat-square)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DibbayajyotiRoy/fresco/publish.yml?style=flat-square&label=publish)](https://github.com/DibbayajyotiRoy/fresco/actions/workflows/publish.yml)
 [![Stars](https://img.shields.io/github/stars/DibbayajyotiRoy/fresco?style=flat-square)](https://github.com/DibbayajyotiRoy/fresco/stargazers)
 
-**Used by 1000+ people around the world.**
+**Used by 1,500+ people in 110+ countries.**
 
-[Website](https://fresco.dibbayajyoti.com) · [Install](#install) · [FAQ](#faq) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/DibbayajyotiRoy/fresco/issues)
+[Website](https://fresco.dibbayajyoti.com) · [Install](#install) · [Supported environments](#supported-environments) · [Comparison](#fresco-vs-other-live-wallpaper-options) · [FAQ](#faq) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/DibbayajyotiRoy/fresco/issues)
 
-<img src="data/screenshots/gallery.png" alt="Fresco wallpaper library showing video wallpapers on a Linux desktop" width="800" />
+<img src="https://raw.githubusercontent.com/DibbayajyotiRoy/fresco/main/data/screenshots/gallery.png" alt="Fresco wallpaper library window showing a grid of video wallpapers on a Linux desktop" width="800" />
 
 </div>
 
+## Contents
+
+- [What is Fresco?](#what-is-fresco)
+- [Quick facts](#quick-facts)
+- [Install](#install)
+- [How to set a video as your wallpaper on Linux](#how-to-set-a-video-as-your-wallpaper-on-linux)
+- [Features](#features)
+- [Supported environments](#supported-environments)
+- [Fresco vs other live wallpaper options](#fresco-vs-other-live-wallpaper-options)
+- [Performance and battery life](#performance-and-battery-life)
+- [FAQ](#faq)
+- [Privacy & terms of use](#privacy--terms-of-use)
+
 ## What is Fresco?
 
-Fresco is a free, open-source live wallpaper app for Linux. It sets videos, GIFs, images, slideshows, and video playlists as your animated desktop wallpaper through a GTK4 GUI — no terminal required. Playback is hardware-accelerated through mpv (VA-API / NVDEC), so decoding runs on the GPU and CPU usage stays near idle — see [Performance](#performance-and-battery-life) for what that costs at the wall. It installs as a `.deb` and restores your wallpaper on login.
+Fresco is a free, open-source live wallpaper app for Linux that sets any video, GIF or image as an animated desktop wallpaper on X11 and Wayland. It sets videos, GIFs, images, slideshows, and video playlists as your animated desktop wallpaper through a GTK4 GUI — no terminal required. Playback is hardware-accelerated through mpv (VA-API / NVDEC), so decoding runs on the GPU and CPU usage stays near idle — see [Performance](#performance-and-battery-life) for what that costs at the wall. It installs as a `.deb` and restores your wallpaper on login.
 
 ## Quick facts
 
@@ -29,20 +42,21 @@ Fresco is a free, open-source live wallpaper app for Linux. It sets videos, GIFs
 |---|---|
 | **What it is** | Live / video wallpaper app for the Linux desktop |
 | **Works on** | X11 and Wayland layer-shell (COSMIC, Hyprland, Sway, KDE Plasma 6, Deepin DDE) |
-| **Distros** | Ubuntu, Pop!_OS, Linux Mint, Debian, elementary OS, Deepin 25 |
+| **Distros** | Ubuntu, Pop!_OS, Linux Mint, Debian, elementary OS, Deepin 25, Kali Linux |
 | **Media formats** | mp4, webm, mkv, avi, mov, GIF, jpg/png/webp, slideshows, playlists |
 | **Desktop widgets** | Synced lyrics, clock, audio visualiser, album-art disc — drawn into the wallpaper, all off by default |
 | **Price** | Free — GPL-3.0-or-later, no ads, no account |
 | **Built with** | Rust, GTK4 / libadwaita, libmpv |
 | **Install** | Deepin App Store, `.deb` package, or one-line script |
-| **Users** | 1,000+ worldwide |
+| **Users** | 1,500+ people in 110+ countries |
+| **Languages** | English plus 12 translations |
 | **Latest version** | 1.1.45 |
 
 ## Install
 
 **Deepin 25 — App Store:** open **App Store**, search for **Fresco**, and click **Install**. Fresco is published on the deepin Community App Store, so there is nothing to download by hand and updates arrive through the store.
 
-**One-liner** (Debian, Ubuntu, Pop!_OS, Linux Mint, elementary OS, Deepin):
+**One-liner** (Debian, Ubuntu, Pop!_OS, Linux Mint, elementary OS, Deepin, Kali Linux):
 
 ```bash
 curl -fsSL https://github.com/DibbayajyotiRoy/fresco/releases/latest/download/install.sh | FRESCO_SOURCE=github bash
@@ -87,6 +101,7 @@ The wallpaper keeps playing after the window closes and comes back automatically
 | Environment | Live wallpaper | Notes |
 |---|---|---|
 | X11 (GNOME, Cinnamon, XFCE, …) | ✅ | Embedded renderer |
+| Kali Linux (Xfce, X11) | ✅ | Runs on Kali's default Xfce-on-X11 session via the same embedded renderer as other X11 desktops |
 | MATE (X11) | ✅ | Desktop icons stay visible and clickable over the wallpaper |
 | Deepin 25 (DDE, X11) | ✅ | Automatic DDE adaptation — community-verified on Deepin 25 Community build1 |
 | COSMIC (Wayland) | ✅ | layer-shell |
@@ -105,18 +120,16 @@ Deepin 25 ships X11 as its default session, and that is the session Fresco is ve
 
 ## Fresco vs other live wallpaper options
 
-| | Fresco | Wallpaper Engine | mpvpaper | xwinwrap |
-|---|---|---|---|---|
-| **Native Linux app** | ✅ | ❌ Windows; on Linux only via Steam Play/Proton | ✅ | ✅ |
-| **Graphical app (no terminal)** | ✅ | ✅ | ❌ command line | ❌ command line |
-| **X11** | ✅ | via Proton | ❌ | ✅ |
-| **Wayland layer-shell** | ✅ | ❌ | ✅ | ❌ |
-| **Hardware decode** | ✅ VA-API / NVDEC | ✅ | ✅ | depends on player |
-| **Multi-monitor, per-display** | ✅ | ✅ | one instance per output | one instance per output |
-| **Wallpaper library + scheduling** | ✅ | ✅ | ❌ | ❌ |
-| **Price** | Free (GPL-3.0) | Paid | Free (GPL) | Free |
+| | Fresco | Wallpaper Engine | Hidamari | Komorebi | mpvpaper | Variety |
+|---|---|---|---|---|---|---|
+| **Live video wallpaper** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ static images only |
+| **Wayland** | ✅ layer-shell | ❌ Windows app | ⚠️ GNOME Wayland only | — | ✅ layer-shell | — |
+| **X11** | ✅ | via Proton (unofficial) | ✅ | ✅ | ❌ | — |
+| **Graphical app (no terminal)** | ✅ | ✅ | ✅ | ✅ | ❌ command line | ✅ |
+| **Free / open source** | ✅ GPL-3.0 | ❌ paid, closed source | ✅ GPL-3.0 | ✅ GPL-3.0 | ✅ GPL-3.0 | ✅ GPL-3.0 |
+| **Actively maintained** | ✅ | ✅ | ✅ | ⚠️ low activity | ✅ | ⚠️ in maintenance mode |
 
-Fresco bundles `mpvpaper` as its Wayland renderer, so it builds on that project rather than competing with it. Comparison reflects these projects as of July 2026.
+Fresco bundles `mpvpaper` as its Wayland renderer, so it builds on that project rather than competing with it. A `—` means the project's own docs don't clearly state support either way. Comparison reflects these projects' public repositories as of September 2026.
 
 ## Performance and battery life
 
@@ -164,6 +177,18 @@ Yes, on compositors that implement the layer-shell protocol — COSMIC, Hyprland
 ### Is Fresco free?
 
 Yes. Fresco is free and open source under GPL-3.0-or-later. There are no ads, no accounts, and no paid tier.
+
+### Does Fresco work on GNOME?
+
+Yes on X11, with the full live wallpaper — video, widgets, everything. On **GNOME under Wayland**, Mutter exposes no wallpaper surface for any app to draw into, so Fresco falls back to a static frame there and widgets are unavailable; log into a GNOME on Xorg (X11) session for full live playback.
+
+### What's the difference between Fresco and mpvpaper?
+
+`mpvpaper` is a command-line mpv wrapper that plays one video as a Wayland layer-shell background — no GUI, no library, no X11 support. Fresco is a GTK4 desktop app built around it: a wallpaper library, crop/rotate editor, scheduling, multi-monitor sync, desktop widgets, and X11 support, with no terminal required. Fresco bundles `mpvpaper` as its Wayland renderer rather than replacing it — see the [comparison table](#fresco-vs-other-live-wallpaper-options).
+
+### Can I use Fresco on Kali Linux?
+
+Yes. Kali Linux is Debian-based, so Fresco installs the same way as on Debian or Ubuntu — with the `.deb` package or the one-line install script (see [Install](#install)). Kali's default desktop, Xfce on X11, is supported through Fresco's embedded X11 renderer.
 
 ### Can I use a different wallpaper on each monitor?
 
@@ -272,7 +297,7 @@ sync offset slider in the lyrics settings for exactly that.
 
 ### Which Linux distros are supported?
 
-Fresco ships a `.deb` package for Debian- and Ubuntu-based distributions: Ubuntu, Pop!_OS, Linux Mint, Debian, elementary OS, and Deepin 25. Other distributions can build from source — see [docs/INSTALL.md](docs/INSTALL.md).
+Fresco ships a `.deb` package for Debian- and Ubuntu-based distributions: Ubuntu, Pop!_OS, Linux Mint, Debian, elementary OS, Deepin 25, and Kali Linux. Other distributions can build from source — see [docs/INSTALL.md](docs/INSTALL.md).
 
 ### Fresco doesn't show up in the Deepin launcher after installing — why?
 
@@ -386,4 +411,4 @@ Bug reports, feature requests, and PRs are welcome — open an [issue](https://g
 
 ---
 
-<sub>Fresco — live wallpaper, video wallpaper, and animated desktop background for Linux (X11 and Wayland), with desktop widgets drawn into the wallpaper: desktop lyrics, a desktop clock widget, an audio visualiser (music visualizer wallpaper), and album art. A Wallpaper Engine alternative for Ubuntu, Pop!_OS, Linux Mint, Debian, elementary OS, and Deepin, and a Conky alternative for wallpaper widgets on COSMIC and Wayland. Last updated: 2026-07-31.</sub>
+<sub>Fresco — live wallpaper, video wallpaper, and animated desktop background for Linux (X11 and Wayland), with desktop widgets drawn into the wallpaper: desktop lyrics, a desktop clock widget, an audio visualiser (music visualizer wallpaper), and album art. A Wallpaper Engine alternative for Ubuntu, Pop!_OS, Linux Mint, Debian, elementary OS, Deepin, and Kali Linux, and a Conky alternative for wallpaper widgets on COSMIC and Wayland. Used by 1,500+ people in 110+ countries. Last updated: 2026-09-28.</sub>
