@@ -153,6 +153,136 @@ if [[ "$SESSION" == "wayland" ]] && ! renderer_ok; then
     libwayland-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev >/dev/null
   BUILD_DIR=$(mktemp -d)
   git clone -q --depth 1 --branch "$MPVPAPER_VERSION" https://github.com/GhostNaN/mpvpaper.git "$BUILD_DIR/mpvpaper"
+  # EGL context fallback for older GPUs: upstream 1.9 only tries desktop GL
+  # core contexts 4.6-3.0 and exits 1 if none work, even though mpv only
+  # needs GL 2.1/GLES 2.0. Embedded inline (this script runs standalone via
+  # curl | bash, with no repo checkout to read a patch file from) — keep in
+  # sync with packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch
+  # and scripts/build-mpvpaper.sh.
+  MPVPAPER_PATCH="$BUILD_DIR/egl-fallback.patch"
+  cat > "$MPVPAPER_PATCH" <<'MPVPAPER_PATCH_EOF'
+--- a/src/main.c
++++ b/src/main.c
+@@ -69,6 +69,7 @@ struct toplevel_handle_state {
+ static EGLConfig egl_config;
+ static EGLDisplay *egl_display;
+ static EGLContext *egl_context;
++static bool egl_is_gles;
+ 
+ static mpv_handle *mpv;
+ static mpv_render_context *mpv_glcontext;
+@@ -659,25 +660,89 @@ static void init_egl(struct wl_state *state) {
+     }
+ 
+     // Check for OpenGL compatibility for creating egl context
+-    static const struct { int major, minor; } gl_versions[] = {
+-        {4, 6}, {4, 5}, {4, 4}, {4, 3}, {4, 2}, {4, 1}, {4, 0},
+-        {3, 3}, {3, 2}, {3, 1}, {3, 0},
+-        {0, 0}
++    //
++    // Try desktop GL core contexts first (4.6 down to 3.0), then finally
++    // desktop GL compatibility-profile 2.1 (mpv's documented desktop-GL
++    // floor), before giving up on desktop GL entirely. Older/legacy drivers
++    // (pre-~2014 Intel/Radeon/NVIDIA, and some software rasterizers) cannot
++    // satisfy a GL 3.0+ core context, which is all the original code ever
++    // asked for, so eglCreateContext failed on them even though mpv itself
++    // only needs GL 2.1 or GLES 2.0.
++    //
++    // Per EGL_KHR_create_context, EGL_CONTEXT_OPENGL_PROFILE_MASK is ignored
++    // below GL 3.2, so there is no separate 3.0-compatibility entry here —
++    // it would just retry the same request as the 3.0-core entry above. It's
++    // the version drop to 2.1 that unlocks compatibility-only drivers, not
++    // the profile bit.
++    static const struct { int major, minor; EGLenum profile; } gl_versions[] = {
++        {4, 6, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {4, 5, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {4, 4, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {4, 3, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {4, 2, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {4, 1, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {4, 0, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {3, 3, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {3, 2, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {3, 1, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {3, 0, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT},
++        {2, 1, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT},
++        {0, 0, 0}
+     };
+     egl_context = NULL;
+     for (uint i=0; gl_versions[i].major > 0; i++) {
+         const EGLint ctx_attrib[] = {
+             EGL_CONTEXT_MAJOR_VERSION, gl_versions[i].major,
+             EGL_CONTEXT_MINOR_VERSION, gl_versions[i].minor,
++            EGL_CONTEXT_OPENGL_PROFILE_MASK, gl_versions[i].profile,
+             EGL_NONE
+         };
+         egl_context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, ctx_attrib);
+         if (egl_context) {
+             if (VERBOSE)
+-                cflp_info("OpenGL %i.%i EGL context created", gl_versions[i].major, gl_versions[i].minor);
++                cflp_info("OpenGL %i.%i (%s) EGL context created", gl_versions[i].major, gl_versions[i].minor,
++                          gl_versions[i].profile == EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT ? "core" : "compatibility");
+             break;
+         }
+     }
++
++    // Final fallback: OpenGL ES 2.0. This is mpv's documented GLES floor, and
++    // is what remains after llvmpipe/softpipe, very old GPUs, and some
++    // embedded/ARM GPU drivers that never expose desktop GL 2.1+.
++    if (!egl_context) {
++        if (eglBindAPI(EGL_OPENGL_ES_API)) {
++            const EGLint gles_win_attrib[] = {
++                EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
++                EGL_RED_SIZE, 8,
++                EGL_GREEN_SIZE, 8,
++                EGL_BLUE_SIZE, 8,
++                EGL_ALPHA_SIZE, 8,
++                EGL_NONE
++            };
++            EGLConfig gles_config;
++            EGLint gles_num_config;
++            if (eglChooseConfig(egl_display, gles_win_attrib, &gles_config, 1, &gles_num_config)) {
++                const EGLint gles_ctx_attrib[] = {
++                    EGL_CONTEXT_CLIENT_VERSION, 2,
++                    EGL_NONE
++                };
++                egl_context = eglCreateContext(egl_display, gles_config, EGL_NO_CONTEXT, gles_ctx_attrib);
++                if (egl_context) {
++                    egl_config = gles_config;
++                    egl_is_gles = true;
++                    if (VERBOSE)
++                        cflp_info("OpenGL ES 2.0 EGL context created");
++                }
++            } else {
++                cflp_error("No GLES 2.0 frame buffer config: %s", eglGetErrorString(eglGetError()));
++            }
++        }
++        // If eglBindAPI(EGL_OPENGL_ES_API) itself failed, egl_context stays
++        // NULL and we fall straight through to the "Failed to create EGL
++        // context" error below — same as any other exhausted fallback.
++    }
++
+     if (!egl_context) {
+         cflp_error("Failed to create EGL context %s", eglGetErrorString(eglGetError()));
+         exit_mpvpaper(EXIT_FAILURE);
+@@ -888,7 +953,13 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *su
+         // After making EGL_NO_SURFACE current to a context
+         // Only with the Nvidia Pro drivers will set the draw buffer state to GL_NONE
+         // So we are going to force GL_BACK just like Mesa's EGL implementation
+-        glDrawBuffer(GL_BACK);
++        //
++        // glDrawBuffer doesn't exist in GLES (only desktop GL); calling it on
++        // the GLES 2.0 fallback context resolves to a NULL/bogus function
++        // pointer and crashes. GLES's default framebuffer draw buffer is
++        // already fixed to the back buffer, so skipping it here is correct.
++        if (!egl_is_gles)
++            glDrawBuffer(GL_BACK);
+ 
+         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+ 
+MPVPAPER_PATCH_EOF
+  (cd "$BUILD_DIR/mpvpaper" && git apply --verbose "$MPVPAPER_PATCH") || { echo "mpvpaper EGL fallback patch failed to apply against $MPVPAPER_VERSION"; exit 1; }
   (cd "$BUILD_DIR/mpvpaper" && meson setup build >/dev/null && meson compile -C build >/dev/null)
   sudo install -m 755 "$BUILD_DIR/mpvpaper/build/mpvpaper" /usr/lib/fresco/mpvpaper
   rm -rf "$BUILD_DIR"

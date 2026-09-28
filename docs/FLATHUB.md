@@ -190,7 +190,14 @@ gh repo fork --clone flathub/flathub && cd flathub && git checkout --track origi
 git checkout -b fresco-submission new-pr
 mkdir io.github.dibbayajyotiroy.Fresco
 # copy the manifest in (Flathub expects the manifest at the repo root of the new app dir),
-# plus cargo-sources.json and any local module files it references
+# plus cargo-sources.json and any local module files it references — including
+# packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch, which
+# must land next to the manifest (not under packaging/mpvpaper/). Flatten the
+# mpvpaper module's `path:` in the submitted copy to the bare filename:
+#   path: ../packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch
+#   -> path: 0001-egl-context-gl-compat-and-gles-fallback.patch
+# Leave the working manifest at flatpak/io.github.dibbayajyotiroy.Fresco.yaml
+# with its ../packaging/... path as is — it stays the one source of truth.
 git add . && git commit -m "Add io.github.dibbayajyotiroy.Fresco"
 git push -u origin fresco-submission
 # Open a PR titled "Add io.github.dibbayajyotiroy.Fresco" against base branch new-pr
