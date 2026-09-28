@@ -143,10 +143,19 @@ modules:
     sources:
       - type: git
         url: https://github.com/GhostNaN/mpvpaper.git
-        # TODO(flathub): pin to a verified release tag + commit before submission
-        # (Flathub requires a commit alongside the tag for reproducibility).
-        tag: "1.4"
-        commit: "8678234c163d0b0b616ec9ff6e5e0e1c87e0e6f4"
+        # Pinned to 1.9, matching scripts/build-mpvpaper.sh (see that script
+        # for why 1.9 and not 1.4 — the NVIDIA black-wallpaper fix landed in
+        # 1.6-1.7, well after this module's previous 1.4 pin).
+        tag: "1.9"
+        commit: "131a52c266d25262c62b85f52a4a978cafae6ee2"
+      # EGL context fallback for older GPUs — see packaging/mpvpaper/ for the
+      # full rationale. Upstream 1.9's init_egl() only tries desktop GL core
+      # contexts 4.6-3.0 and exits 1 if none work, even though mpv only needs
+      # GL 2.1/GLES 2.0. flatpak-builder aborts the build if a patch source
+      # fails to apply, so a future tag bump here can't silently ship
+      # unpatched.
+      - type: patch
+        path: ../packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch
 
   # Fresco shells out to the `ffmpeg` CLI (still frames in the daemon overview,
   # rotated thumbnails in the library, browser-bridge poster) and to `ffprobe`

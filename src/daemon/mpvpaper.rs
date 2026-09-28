@@ -1333,6 +1333,13 @@ mod tests {
         format!("\x1b[1;31m[-] {msg}\x1b[0m")
     }
 
+    /// mpvpaper's real `cflp_info()` form — unlike `cflp_error`, info lines
+    /// carry no colour prefix (see upstream `src/cflogprinter.c`), just the
+    /// "[*] " tag and the trailing reset escape.
+    fn cflp_info(msg: &str) -> String {
+        format!("[*] {msg}\x1b[0m")
+    }
+
     /// The early-exit fingerprints must map mpvpaper's real messages (verbatim
     /// from upstream src/main.c, in their real ANSI-coloured stdout form) to
     /// the right code, and must never leak the message itself — only the
@@ -1386,6 +1393,51 @@ mod tests {
         ] {
             assert!(e.code().starts_with("exited_early:"), "{}", e.code());
             assert!(!e.code().contains('/'), "codes carry no paths");
+        }
+    }
+
+    /// The vendored EGL-fallback patch (packaging/mpvpaper/) adds a GLES 2.0
+    /// fallback to mpvpaper's init_egl(). When that fallback *also* fails
+    /// (no desktop GL context and no GLES config), the patched binary still
+    /// ends its output with the original, unchanged "Failed to create EGL
+    /// context" line — so it must classify identically to stock mpvpaper's
+    /// total EGL failure: `EarlyExit::Egl` with token `tok:egl_context`, not
+    /// `tok:egl_fbconfig` (the GLES-config line was deliberately reworded so
+    /// it carries none of `RULES`' needles and can't shadow this one).
+    #[test]
+    fn patched_gles_fallback_total_failure_classifies_as_egl_context() {
+        use std::os::unix::process::ExitStatusExt;
+        let exit = |c: i32| std::process::ExitStatus::from_raw(c << 8);
+        let output = format!(
+            "{}\n{}",
+            cflp_error("No GLES 2.0 frame buffer config: EGL_BAD_MATCH"),
+            cflp_error("Failed to create EGL context EGL_BAD_MATCH"),
+        );
+        assert_eq!(
+            classify_early_exit(&exit(1), &output),
+            EarlyExit::Egl,
+            "{output}"
+        );
+        assert_eq!(exit_detail(&exit(1), &output).sig, "tok:egl_context");
+    }
+
+    /// The patch's new success info lines (desktop GL compatibility-profile
+    /// and GLES 2.0 contexts) must not accidentally match any failure rule —
+    /// an exit-0 run that only printed these lines is a clean start, not a
+    /// misclassified failure.
+    #[test]
+    fn patched_success_info_lines_do_not_match_failure_rules() {
+        use std::os::unix::process::ExitStatusExt;
+        let exit = |c: i32| std::process::ExitStatus::from_raw(c << 8);
+        for line in [
+            cflp_info("OpenGL 2.1 (compatibility) EGL context created"),
+            cflp_info("OpenGL ES 2.0 EGL context created"),
+        ] {
+            assert_eq!(
+                classify_early_exit(&exit(0), &line),
+                EarlyExit::CleanExit,
+                "{line}"
+            );
         }
     }
 
@@ -1639,5 +1691,64 @@ exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet
         std::env::remove_var("FRESCO_TEST_PIDFILE");
         let _ = std::fs::remove_file(&fake);
         let _ = std::fs::remove_file(&pidfile);
+    }
+
+    /// `install.sh` embeds the mpvpaper EGL-fallback patch inline (inside a
+    /// `<<'MPVPAPER_PATCH_EOF'` heredoc) because it runs standalone via
+    /// `curl | bash` with no repo checkout to read the packaged patch file
+    /// from. That inline copy and
+    /// `packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch`
+    /// (applied by `scripts/build-mpvpaper.sh` and the Flatpak manifest) must
+    /// stay byte-identical, or the two build paths silently diverge. This
+    /// test catches that drift.
+    #[test]
+    fn install_sh_mpvpaper_patch_matches_packaged_patch() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let install_sh = std::fs::read_to_string(root.join("install.sh"))
+            .expect("read install.sh");
+        let patch_file = std::fs::read_to_string(root.join(
+            "packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch",
+        ))
+        .expect("read packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch");
+
+        let heredoc_body = extract_heredoc_body(&install_sh, "MPVPAPER_PATCH_EOF")
+            .expect("install.sh must contain a MPVPAPER_PATCH_EOF heredoc");
+        let patch_diff_body = extract_diff_body(&patch_file)
+            .expect("packaged patch must contain a diff body (--- or diff --git line)");
+
+        assert_eq!(
+            heredoc_body.trim_end(),
+            patch_diff_body.trim_end(),
+            "install.sh's inline MPVPAPER_PATCH_EOF heredoc has drifted from \
+             packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch. \
+             Update whichever one is stale so both build paths apply the same \
+             EGL fallback patch."
+        );
+    }
+
+    /// Extracts the body of a `<<'MARKER'` ... `MARKER` heredoc from `script`
+    /// (exclusive of the marker lines themselves).
+    fn extract_heredoc_body(script: &str, marker: &str) -> Option<String> {
+        let start_needle = format!("<<'{marker}'");
+        let start = script.find(&start_needle)?;
+        let body_start = script[start..].find('\n')? + start + 1;
+        let end_needle = format!("\n{marker}\n");
+        let end = script[body_start..].find(&end_needle)? + body_start;
+        Some(script[body_start..end].to_string())
+    }
+
+    /// Extracts a patch file's diff body, skipping any explanatory `#`
+    /// header, starting from the first `diff --git` or `---` line.
+    fn extract_diff_body(patch: &str) -> Option<String> {
+        let idx = patch
+            .lines()
+            .position(|l| l.starts_with("diff --git") || l.starts_with("---"))?;
+        Some(
+            patch
+                .lines()
+                .skip(idx)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 }

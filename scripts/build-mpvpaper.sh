@@ -35,8 +35,17 @@ VERSION="1.9"
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}/release"
 
+# EGL context fallback for older GPUs (see packaging/mpvpaper/ for the full
+# rationale). Upstream 1.9 only tries desktop GL core contexts 4.6-3.0 and
+# gives up; this adds a compat-profile and GLES 2.0 fallback so mpvpaper
+# doesn't exit 1 on hardware that can't do GL 3.0 core. Applying it is not
+# optional: a version bump that silently drops it must fail the build, not
+# ship a renderer that regresses to the pre-fix black-screen behavior.
+PATCH="$ROOT/packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch"
+
 command -v meson >/dev/null 2>&1 || { echo "meson is required"; exit 1; }
 command -v ninja >/dev/null 2>&1 || { echo "ninja is required"; exit 1; }
+[[ -f "$PATCH" ]] || { echo "missing mpvpaper EGL fallback patch: $PATCH"; exit 1; }
 
 mkdir -p "$TARGET"
 BUILD_DIR="$(mktemp -d)"
@@ -46,6 +55,7 @@ echo "Building mpvpaper $VERSION into $TARGET ..."
 cd "$BUILD_DIR"
 git clone --depth 1 --branch "$VERSION" https://github.com/GhostNaN/mpvpaper.git mpvpaper
 cd mpvpaper
+git apply --verbose "$PATCH" || { echo "mpvpaper EGL fallback patch failed to apply against $VERSION — fix the patch before shipping"; exit 1; }
 meson setup build
 meson compile -C build
 cp build/mpvpaper "$TARGET/mpvpaper"
