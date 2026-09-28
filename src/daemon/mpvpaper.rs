@@ -677,6 +677,18 @@ impl WaylandPlayer {
         tail_text(&self.stderr_tail)
     }
 
+    /// The same content-free fingerprint [`ExitDetail`] gives a failed spawn,
+    /// but for a child that started fine and later died on its own —
+    /// `supervise`'s "dead" mode, which otherwise reports only `cause=spawn_ok`
+    /// with no exit status or fingerprint at all. `None` while the child is
+    /// still alive, or if it has already been reaped (`is_alive`/this method
+    /// only ever calls `try_wait` once per exit — call it before anything else
+    /// reads the child's status away).
+    pub fn runtime_exit_detail(&self) -> Option<ExitDetail> {
+        let status = self.inner.borrow_mut().child.try_wait().ok().flatten()?;
+        Some(exit_detail(&status, &tail_text(&self.stderr_tail)))
+    }
+
     /// The mpvpaper process id (it renders and decodes in-process), so status
     /// can account its CPU/RSS alongside the daemon's own.
     pub fn pid(&self) -> u32 {
@@ -1634,6 +1646,18 @@ exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet
             !player.is_alive(),
             "supervisor must detect the backend death (basis of T6 restart)"
         );
+
+        // A death that follows a successful spawn used to leave `supervise`'s
+        // give-up report with no exit status or fingerprint at all
+        // (`cause=spawn_ok` and nothing else) because only a failed *spawn*
+        // populated an `ExitDetail`. `runtime_exit_detail` must give the same
+        // content-free `exit=`/`sig=` pair for this kill -9 death, and it must
+        // stay content-free — no path, no raw message text.
+        let detail = player
+            .runtime_exit_detail()
+            .expect("a reaped child must yield an ExitDetail");
+        assert_eq!(detail.status, "s9", "SIGKILL must be reported as signal 9");
+        assert!(!format!("{detail}").contains('/'), "content-free: {detail}");
 
         std::env::remove_var("FRESCO_MPVPAPER");
         std::env::remove_var("FRESCO_TEST_PIDFILE");

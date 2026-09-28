@@ -377,6 +377,17 @@ impl PlayerHandle {
         }
     }
 
+    /// The content-free `exit=`/`sig=` fingerprint for a Wayland renderer that
+    /// has just been found dead (call only once `is_alive` has said so — see
+    /// [`crate::daemon::mpvpaper::WaylandPlayer::runtime_exit_detail`]).
+    /// Always `None` on X11, which never exits out from under the daemon.
+    fn runtime_exit_detail(&self) -> Option<crate::daemon::mpvpaper::ExitDetail> {
+        match self {
+            PlayerHandle::X11(_) => None,
+            PlayerHandle::Wayland(p) => p.runtime_exit_detail(),
+        }
+    }
+
     /// Renderer pid, where there is a separate process to have one.
     ///
     /// `None` on X11, where mpv is embedded rather than spawned as a paper
@@ -2956,6 +2967,14 @@ impl WlOutput {
             // fall through to the restart path below
         } else if let Some(p) = self.player.as_ref() {
             self.last_down = "dead";
+            // A death after a successful spawn used to leave `renderer_giveup`
+            // with cause=spawn_ok and nothing else — no exit status, no
+            // fingerprint — because only a failed *spawn* ever populated
+            // `last_spawn_detail`. Reap the same content-free detail here so a
+            // runtime death is exactly as legible as a spawn failure.
+            if let Some(d) = p.runtime_exit_detail() {
+                self.last_spawn_detail = Some(d.to_string());
+            }
             match p.stderr_tail() {
                 Some(tail) if !tail.is_empty() => log::warn!(
                     "[{}] renderer exited; its last output was:\n{tail}",
@@ -4177,5 +4196,134 @@ mod tests {
         std::env::remove_var("FRESCO_MPVPAPER");
         let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_file(&media);
+    }
+
+    fn have(bin: &str) -> bool {
+        std::process::Command::new("which")
+            .arg(bin)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Fake mpvpaper wrapping a real headless mpv, exactly like
+    /// [`crate::daemon::mpvpaper`]'s own `FAKE_MPVPAPER` fixture — an mpv
+    /// spawned with `--idle=yes` stays alive (and answers IPC) even though the
+    /// "image" it's pointed at is not a real one, which is all a rapid-Set
+    /// test needs: a genuinely live, genuinely supervised process.
+    const FAKE_MPVPAPER_IMAGE: &str = "#!/bin/sh\n\
+opts=\"$2\"\n\
+file=\"$4\"\n\
+sock=\"\"\n\
+for tok in $opts; do\n\
+  case \"$tok\" in\n\
+    input-ipc-server=*) sock=\"${tok#input-ipc-server=}\" ;;\n\
+  esac\n\
+done\n\
+exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet --input-ipc-server=\"$sock\" --image-display-duration=inf --loop-file=inf \"$file\"\n";
+
+    /// Reproduction attempt for the production race: a burst of GUI `Set`
+    /// clicks on an already-live image wallpaper, 6s and then 3s apart (the
+    /// telemetry's cadence), each going through `apply_wallpaper` exactly as
+    /// the Wayland IPC loop's `Request::Apply` handler does.
+    ///
+    /// `apply_wallpaper` takes the `media_only` branch for every one of these
+    /// (same kind/fit/rotation/mute/volume/crop/scaling/power-saving, just a
+    /// new path) — which only sends an IPC `loadfile replace` and never calls
+    /// `respawn`, never kills the child, and never touches `restarts`. If the
+    /// telemetry's 5 counted failures were the daemon counting its own kills
+    /// or replacements, this rapid-Set burst — interleaved with `supervise`
+    /// ticks exactly as the real 2s SUPERVISE cadence would run them — must
+    /// grow `restarts` and/or replace the child pid. It does neither: the
+    /// process spawned once at the top survives every Set untouched, and
+    /// `restarts` never leaves 0. That rules the hypothesis out for the
+    /// image/image, same-settings case telemetry showed (`kind=Image`,
+    /// `cause=spawn_ok`) — the counted failures must have been the child
+    /// actually exiting on its own between supervise ticks, not the daemon
+    /// mistaking its own actions for deaths.
+    #[test]
+    fn rapid_sets_do_not_inflate_restarts_or_replace_the_child() {
+        use std::os::unix::fs::PermissionsExt;
+        if !have("mpv") {
+            eprintln!("skip rapid_sets_do_not_inflate_restarts_or_replace_the_child: mpv not installed");
+            return;
+        }
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let id = std::process::id();
+        let fake = std::env::temp_dir().join(format!("fresco-fake-mpvpaper-rapid-{id}.sh"));
+        std::fs::write(&fake, FAKE_MPVPAPER_IMAGE).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("FRESCO_MPVPAPER", &fake);
+
+        let img_a = std::env::temp_dir().join(format!("fresco-rapid-a-{id}.png"));
+        let img_b = std::env::temp_dir().join(format!("fresco-rapid-b-{id}.png"));
+        std::fs::write(&img_a, b"not really a png").unwrap();
+        std::fs::write(&img_b, b"also not really a png").unwrap();
+
+        let mut o = WlOutput::new(
+            "DP-1".into(),
+            Wallpaper {
+                kind: Kind::Image,
+                path: Some(img_a.clone()),
+                ..Default::default()
+            },
+            Scaling::Balanced,
+            PowerSaving::Full,
+        );
+        o.respawn(false, false);
+        assert!(
+            o.player.as_ref().is_some_and(|p| p.is_alive()),
+            "the fake backend must come up for the test to mean anything"
+        );
+        let pid = o.player.as_ref().and_then(|p| p.child_pid());
+        assert!(pid.is_some(), "must be able to observe the child's pid");
+
+        const MAX: u32 = 5;
+        // GUI Set, GUI Set 6s later, a supervise tick, then two more Sets 3s
+        // apart with a tick after each — the telemetry's exact shape, minus
+        // the wall-clock sleeps (nothing here is time-based).
+        let mut toggle = false;
+        for _ in 0..6 {
+            toggle = !toggle;
+            let next = if toggle { img_b.clone() } else { img_a.clone() };
+            o.apply_wallpaper(
+                Wallpaper {
+                    kind: Kind::Image,
+                    path: Some(next),
+                    ..Default::default()
+                },
+                Scaling::Balanced,
+                PowerSaving::Full,
+                false,
+            );
+            assert_eq!(
+                o.restarts, 0,
+                "a media-only Set must never spend the restart budget"
+            );
+            o.supervise(false, MAX, true);
+            assert_eq!(
+                o.restarts, 0,
+                "supervising a still-alive, self-swapped player must not count a death"
+            );
+        }
+        assert!(
+            o.player.as_ref().is_some_and(|p| p.is_alive()),
+            "the same process must still be running after the whole burst"
+        );
+        assert_eq!(
+            o.player.as_ref().and_then(|p| p.child_pid()),
+            pid,
+            "rapid Sets must reuse the child, never kill and replace it"
+        );
+        assert!(!o.giveup_reported);
+        assert!(!o.static_fallback);
+
+        std::env::remove_var("FRESCO_MPVPAPER");
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(&img_a);
+        let _ = std::fs::remove_file(&img_b);
     }
 }
