@@ -1728,11 +1728,10 @@ exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet
     #[test]
     fn install_sh_mpvpaper_patch_matches_packaged_patch() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let install_sh = std::fs::read_to_string(root.join("install.sh"))
-            .expect("read install.sh");
-        let patch_file = std::fs::read_to_string(root.join(
-            "packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch",
-        ))
+        let install_sh = std::fs::read_to_string(root.join("install.sh")).expect("read install.sh");
+        let patch_file = std::fs::read_to_string(
+            root.join("packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch"),
+        )
         .expect("read packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch");
 
         let heredoc_body = extract_heredoc_body(&install_sh, "MPVPAPER_PATCH_EOF")
@@ -1767,12 +1766,6 @@ exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet
         let idx = patch
             .lines()
             .position(|l| l.starts_with("diff --git") || l.starts_with("---"))?;
-        Some(
-            patch
-                .lines()
-                .skip(idx)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        Some(patch.lines().skip(idx).collect::<Vec<_>>().join("\n"))
     }
 }

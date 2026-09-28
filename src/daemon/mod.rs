@@ -4247,7 +4247,9 @@ exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet
     fn rapid_sets_do_not_inflate_restarts_or_replace_the_child() {
         use std::os::unix::fs::PermissionsExt;
         if !have("mpv") {
-            eprintln!("skip rapid_sets_do_not_inflate_restarts_or_replace_the_child: mpv not installed");
+            eprintln!(
+                "skip rapid_sets_do_not_inflate_restarts_or_replace_the_child: mpv not installed"
+            );
             return;
         }
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
