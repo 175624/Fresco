@@ -28,8 +28,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and "Remove" could stop the wallpaper that was actually playing.
 - **"Set as wallpaper" in the editor applies the wallpaper being edited**,
   not the one currently playing with the edited crop and fit (issue #27).
+- **Renderer failure reports now say how a running renderer died.** When
+  the Wayland renderer started fine but then kept dying, the report carried
+  no exit status, only `cause=spawn_ok`. It now gets the same content-free
+  `exit=… sig=…` fingerprint that startup failures already had.
 
 ### Fixed
+- **Live wallpapers now start on older GPUs that lack an OpenGL 3.0 core
+  context.** The bundled Wayland renderer (mpvpaper) only ever tried desktop
+  OpenGL *core* contexts down to 3.0. On older Intel, Radeon and NVIDIA
+  hardware it exited immediately, leaving a black wallpaper and a "graphics
+  driver problem" notice. A vendored patch (`packaging/mpvpaper/`) adds an
+  OpenGL 2.1 fallback and then OpenGL ES 2.0, matching what mpv itself
+  needs.
 - **"Follow System" now follows deepin's dark mode** (issue #25). deepin
   signals dark mode through its GTK theme name (`deepin-dark`) rather than
   the `color-scheme` setting libadwaita reads, so Fresco stayed light. On
