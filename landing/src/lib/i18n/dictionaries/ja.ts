@@ -22,6 +22,7 @@ export const ja: Dictionary = {
       "linux 動画 壁紙",
       "ubuntu 動く壁紙",
       "wallpaper engine linux 代替",
+      "kali linux ライブ壁紙",
     ],
   },
 
@@ -57,10 +58,21 @@ export const ja: Dictionary = {
     body: "動画・GIF・画像を、そのまま Linux のデスクトップに設定できます。ハードウェア再生なので CPU 使用率はほぼゼロ、X11 でも Wayland でも動作します。アプリを閉じてもデーモンが再生を続けます。",
     install: "Fresco をインストール",
     star: "GitHub でスター",
+    sendToComputer: "自分のパソコンに送る",
+    sendToComputerShareTitle: "Fresco",
+    sendToComputerShareText: "Fresco：無料でオープンソースの Linux 用ライブ壁紙アプリ。",
+    linkCopied: "リンクをコピーしました。Linux PC で開いてください。",
+    howToInstall: "インストール方法",
     newUsers24h: (n: string) => `過去24時間で${n}人が Fresco を使い始めました`,
     builtBy: "開発",
     activeToday: (n: string) => `過去24時間で${n}人が Fresco を使いました`,
     newToday: (n: string) => `うち新規 ${n}人`,
+    desktopActivities: "アクティビティ",
+    desktopClock: "10:42",
+    desktopIconHome: "ホーム",
+    desktopIconPictures: "ピクチャ",
+    desktopIconDocument: "メモ",
+    desktopIconTrash: "ゴミ箱",
   },
 
   stats: {
@@ -99,7 +111,7 @@ export const ja: Dictionary = {
     labelInstall: "インストール",
     what: "Fresco は Linux 向けの無料オープンソースのライブ壁紙アプリです。動画・GIF・画像・スライドショー・プレイリストを、GPU ハードウェア デコードで動くデスクトップ背景として設定できます。無料の Wallpaper Engine 代替であり、Wayland では mpvpaper の GUI としても使えます。",
     platforms:
-      "あらゆる X11 デスクトップ（Ubuntu、Pop!_OS、Linux Mint、Debian）に加えて、Wayland の layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）に対応。GNOME Wayland では静止フレームにフォールバックします。",
+      "あらゆる X11 デスクトップ（Ubuntu、Pop!_OS、Linux Mint、Debian、Kali Linux）に加えて、Wayland の layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）に対応。GNOME Wayland では静止フレームにフォールバックします。",
     widgets:
       "ウィンドウではなく壁紙そのものに描画される 4 つのウィジェット。時間同期の歌詞、6 テーマの時計、オーディオ ビジュアライザー、回転するレコード上のアルバム アート。ウィンドウの上に浮かぶことも、クリックを奪うこともありません。すべて既定でオフ。ライブ壁紙のサーフェスがない GNOME Wayland では利用できません。",
     licenseLead: "GPL-3.0、ずっと無料。",
@@ -338,11 +350,8 @@ export const ja: Dictionary = {
   },
 
   supported: {
-    kicker: "動作環境",
     title: "Fresco が動く場所。",
-    lead: "Deepin 25 の DDE を含むあらゆる X11 デスクトップと、Wayland の layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）で、主要な Debian 系・Ubuntu 系ディストリビューションに対応します。GNOME Wayland では静止フレームにフォールバックします。",
-    deployed: (distros: number, formats: number) =>
-      `動作実績: ライブ対応コンポジタ 6 · 静止フォールバック 1 · ディストリ ${distros} · 形式 ${formats}`,
+    lead: "Deepin 25 の DDE を含むあらゆる X11 デスクトップと、Wayland の layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）で、主要な Debian 系・Ubuntu 系・Kali Linux ディストリビューションに対応します。GNOME Wayland では静止フレームにフォールバックします。",
     sessionsTitle: "セッションとコンポジタ",
     distrosTitle: (n: number) => `検証済みディストリビューション · ${n}`,
     formatsTitle: (n: number) => `対応形式 · ${n}`,
@@ -381,9 +390,10 @@ export const ja: Dictionary = {
 
   download: {
     kicker: "ダウンロード",
-    title: "Debian、Ubuntu、Pop!_OS、Mint に導入。",
+    title: "Debian、Ubuntu、Pop!_OS、Mint、Kali に導入。",
     badge: "X11 · Wayland",
     lead: "公式のワンライナー インストーラー、または .deb リリースのどちらでも。クリップボードにコピーすればすぐ実行できます。ウィンドウを閉じても Fresco は再生を続けます。",
+    worksOnTitle: "対応環境",
     cardTitle: "ワンライナー インストール",
     cardBody:
       "ターミナルで実行してください。常に最新の .deb をダウンロードしてインストールします:",
@@ -393,8 +403,10 @@ export const ja: Dictionary = {
     gpuNote:
       "CPU 使用率を最小にするには、GPU のハードウェア デコード ドライバー（Intel media VA ドライバー、Mesa VA ドライバー、または NVDEC 用の NVIDIA プロプライエタリ ドライバー）をインストールしてください。",
     storeLabel: "deepin アプリストアでも配信中",
-    storeBody:
-      "deepin 25 ではアプリストアを開き、Fresco を検索して「インストール」をクリックするだけ。アップデートはストア経由で届きます。",
+    storeDesc: "deepin 25 の DDE デスクトップ向けに作られ、検証済み。アイコンもそのまま表示されます。",
+    storeStep1: "アプリストアを開く",
+    storeStep2: "「Fresco」を検索",
+    storeStep3: "インストールをクリック。アップデートはストア経由で届きます。",
     copy: "コピー",
     copied: "コピーしました",
   },
@@ -516,5 +528,5 @@ export const ja: Dictionary = {
   ],
 
   softwareDescription:
-    "Fresco は Linux 向けの無料オープンソースのライブ壁紙アプリです。動画・GIF・画像・スライドショー・プレイリストを、ハードウェア アクセラレーション再生で動くデスクトップ背景として設定でき、さらに 4 つのデスクトップ ウィジェット（時間同期の歌詞、時計、オーディオ ビジュアライザー、回転するレコード上のアルバム アート）を壁紙そのものに描画できます。Pop!_OS、Ubuntu、Linux Mint、Debian、elementary OS 向けの無料の Wallpaper Engine 代替で、X11 と Wayland layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）に対応します。",
+    "Fresco は Linux 向けの無料オープンソースのライブ壁紙アプリです。動画・GIF・画像・スライドショー・プレイリストを、ハードウェア アクセラレーション再生で動くデスクトップ背景として設定でき、さらに 4 つのデスクトップ ウィジェット（時間同期の歌詞、時計、オーディオ ビジュアライザー、回転するレコード上のアルバム アート）を壁紙そのものに描画できます。Pop!_OS、Ubuntu、Linux Mint、Debian、Kali Linux、elementary OS 向けの無料の Wallpaper Engine 代替で、X11 と Wayland layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）に対応します。",
 };

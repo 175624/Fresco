@@ -37,6 +37,16 @@
   user-select: none;
 }
 
+/* Only the active step's widget is visible; switching crossfades in place. */
+.sc-widget {
+  transition: opacity 400ms var(--ease-house, ease-out);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sc-widget {
+    transition: none;
+  }
+}
+
 .sc-line {
   position: absolute;
   overflow: hidden;
@@ -180,5 +190,22 @@
 @media (prefers-reduced-motion: reduce) {
   .sc-desk .sc-anim {
     animation: none;
+  }
+}
+
+/* ---- stepper auto-advance progress line --------------------------------- */
+
+.sc-progress {
+  transform-origin: left;
+  animation: sc-progress-fill linear forwards;
+  animation-play-state: var(--sc-progress-state, running);
+}
+
+@keyframes sc-progress-fill {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
   }
 }

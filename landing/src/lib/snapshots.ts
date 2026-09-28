@@ -29,6 +29,7 @@ const DISTROS = [
   "Ubuntu",
   "Linux Mint",
   "Debian",
+  "Kali Linux",
   "elementary OS",
 ];
 
@@ -53,7 +54,7 @@ export function homeSnapshot(siteUrl: string): Snapshot {
       type: "document",
       title: "Fresco - Live wallpapers for Linux",
       summary:
-        "Fresco is a free, open-source live-wallpaper app for Linux. It sets video, GIF, image, slideshow, and playlist wallpapers as your animated desktop background. GUI-first, hardware-accelerated via mpv (VA-API, NVDEC) so CPU stays near zero. Runs on any X11 session (Pop!_OS, Ubuntu, Linux Mint, Debian, elementary OS) and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, KDE Plasma 6) via a bundled mpvpaper backend; GNOME Wayland uses a static-frame fallback. A free alternative to Wallpaper Engine. License GPL-3.0. Supported formats: " +
+        "Fresco is a free, open-source live-wallpaper app for Linux. It sets video, GIF, image, slideshow, and playlist wallpapers as your animated desktop background. GUI-first, hardware-accelerated via mpv (VA-API, NVDEC) so CPU stays near zero. Runs on any X11 session (Pop!_OS, Ubuntu, Linux Mint, Debian, Kali Linux, elementary OS) and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, KDE Plasma 6) via a bundled mpvpaper backend; GNOME Wayland uses a static-frame fallback. A free alternative to Wallpaper Engine. License GPL-3.0. Supported formats: " +
         FORMATS.join(", ") +
         ". Supported distros: " +
         DISTROS.join(", ") +

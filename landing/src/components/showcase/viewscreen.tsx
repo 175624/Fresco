@@ -8,6 +8,7 @@ import {
   NowPlaying,
   Visualiser,
 } from "@/components/showcase/widgets";
+import type { WidgetId } from "@/components/showcase/widget-ids";
 
 /* Placeholder track lines, written for this page: not from any song. */
 const LYRICS = [
@@ -28,15 +29,16 @@ const LINE_SECONDS = 4;
  * bottom right). Decoration only: the whole frame is aria-hidden, and the
  * hero carries the labelled video.
  *
- * Widgets are plain DOM layers marked `data-widget`, visible in the server
- * markup; showcase.tsx hides and paints them in on desktop scroll.
+ * Widgets are plain DOM layers marked `data-widget`; only the `active` one
+ * (driven by the showcase.tsx stepper) is visible, crossfading in place when
+ * the visitor switches steps.
  *
  * While the screen is in view and the tab is visible, a 1 Hz tick keeps the
  * clock on the visitor's local time. The video, the bars, the turning record
  * and the lyric lines additionally need motion allowed; otherwise the poster
  * and a still frame stand in.
  */
-export function Viewscreen() {
+export function Viewscreen({ active }: { active: WidgetId }) {
   const screenRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [now, setNow] = useState<Date | null>(null);
@@ -123,22 +125,22 @@ export function Viewscreen() {
         <div className="sc-desk absolute inset-0">
           <div
             data-widget="clock"
-            className="absolute"
-            style={{ left: lu(NOS.left), top: lu(NOS.top) }}
+            className="sc-widget absolute"
+            style={{ left: lu(NOS.left), top: lu(NOS.top), opacity: active === "clock" ? 1 : 0 }}
           >
             <NosClock now={now} />
           </div>
           <div
             data-widget="disc"
-            className="absolute"
-            style={{ left: lu(DISC.left), top: lu(DISC.top) }}
+            className="sc-widget absolute"
+            style={{ left: lu(DISC.left), top: lu(DISC.top), opacity: active === "disc" ? 1 : 0 }}
           >
             <Disc />
           </div>
           <div
             data-widget="lyrics"
-            className="absolute"
-            style={{ left: lu(NP.left), top: lu(NP.top) }}
+            className="sc-widget absolute"
+            style={{ left: lu(NP.left), top: lu(NP.top), opacity: active === "lyrics" ? 1 : 0 }}
           >
             <NowPlaying
               lyric={LYRICS[line]}
@@ -147,8 +149,8 @@ export function Viewscreen() {
           </div>
           <div
             data-widget="visualizer"
-            className="absolute"
-            style={{ left: lu(VIZ.left), top: lu(VIZ.top) }}
+            className="sc-widget absolute"
+            style={{ left: lu(VIZ.left), top: lu(VIZ.top), opacity: active === "visualizer" ? 1 : 0 }}
           >
             <Visualiser />
           </div>

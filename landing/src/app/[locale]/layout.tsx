@@ -190,6 +190,7 @@ export default async function RootLayout({
           target="_blank"
           rel="noopener noreferrer"
           nameFont="var(--font-inter)"
+          className="hidden! sm:flex!"
         />
         <Analytics />
       </body>

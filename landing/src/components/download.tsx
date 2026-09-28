@@ -3,12 +3,12 @@ import {
   Cpu,
   Download as DownloadIcon,
   Package,
-  Search,
   Store,
   Terminal,
 } from "lucide-react";
 import { CopyButton } from "@/components/copy-button";
 import { SplitWords } from "@/components/motion/split-words";
+import { DISTROS } from "@/lib/content";
 import {
   APT_INSTALL,
   INSTALL_ONELINER,
@@ -18,6 +18,15 @@ import {
 import { cn } from "@/lib/utils";
 import type { Dictionary } from "@/lib/i18n";
 import "@/styles/finale.css";
+
+function Dot({ live }: { live: boolean }) {
+  return (
+    <span
+      aria-hidden
+      className={`size-2 shrink-0 rounded-full ${live ? "bg-ok" : "bg-warn"}`}
+    />
+  );
+}
 
 /**
  * One shell command with its copy button. `--terminal` is dark in both
@@ -108,10 +117,86 @@ function InstallCard({
 }
 
 /**
- * The conversion close. Three equal routes, each with exactly one action:
- * paste the one-line installer, download the .deb, or install from the
+ * Compact "works on" strip: the compositor/session chips with the live /
+ * static-fallback legend, and the tested distros on one muted line. Used to
+ * answer "will it run on my distro/desktop?" right where people are about to
+ * install, instead of in its own band earlier on the page. Keeps the
+ * `#supported` anchor (nav/footer/FAQ links to it) working.
+ */
+function WorksOn({ dict }: { dict: Dictionary }) {
+  const s = dict.supported;
+
+  /** Proper nouns, identical in every locale, except the translated X11 row. */
+  const compositors: { name: string; live: boolean }[] = [
+    { name: "COSMIC", live: true },
+    { name: "Hyprland", live: true },
+    { name: "Sway", live: true },
+    { name: "KDE Plasma 6", live: true },
+    { name: s.sessions.x11.label, live: true },
+    { name: "Deepin DDE", live: true },
+    { name: "GNOME Wayland", live: false },
+  ];
+
+  return (
+    <div
+      id="supported"
+      data-reveal="fade"
+      data-delay="0.2"
+      className="mx-auto mt-10 max-w-4xl scroll-mt-24 sm:mt-12"
+    >
+      <h3 className="sr-only">{dict.download.worksOnTitle}</h3>
+      <div className="flex flex-col items-center gap-3 sm:flex-row sm:flex-wrap sm:justify-center sm:gap-x-6 sm:gap-y-3">
+        <ul className="flex flex-wrap items-center justify-center gap-2">
+          {compositors.map((c) => (
+            <li
+              key={c.name}
+              className="inline-flex items-center gap-2 rounded-full border border-hairline bg-surface px-3 py-1.5 text-sm font-medium text-ink-muted"
+            >
+              <Dot live={c.live} />
+              {c.name}
+              <span className="sr-only">: {c.live ? s.live : s.fallback}</span>
+            </li>
+          ))}
+        </ul>
+        {/* Visible key for the dots; each chip already announces its own
+            status, so this is hidden from assistive tech. */}
+        <p
+          aria-hidden
+          className="flex shrink-0 items-center gap-4 text-sm text-ink-subtle"
+        >
+          <span className="inline-flex items-center gap-1.5">
+            <Dot live />
+            {s.live}
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <Dot live={false} />
+            {s.fallback}
+          </span>
+        </p>
+      </div>
+
+      <p className="mt-4 text-center text-sm text-ink-faint">
+        <span className="mr-3 inline-block font-medium text-ink-subtle first-letter:uppercase">
+          {s.distrosTitle(DISTROS.length)}
+        </span>
+        {DISTROS.map((name, i) => (
+          <Fragment key={name}>
+            {i > 0 ? " · " : null}
+            <span className="whitespace-nowrap">{name}</span>
+          </Fragment>
+        ))}
+      </p>
+    </div>
+  );
+}
+
+/**
+ * The conversion close. Three equal routes, each with exactly one primary
+ * action: paste the one-line installer, download the .deb, or open the
  * deepin App Store. The .deb card carries the apt line because that is the
- * step that follows its download.
+ * step that follows its download. Directly under the lead sits the "works
+ * on" strip, so the last doubt ("will it run on my distro/desktop?") is
+ * answered right where people are about to install.
  */
 export function Download({ dict }: { dict: Dictionary }) {
   const d = dict.download;
@@ -144,6 +229,8 @@ export function Download({ dict }: { dict: Dictionary }) {
             </p>
           </div>
 
+          <WorksOn dict={dict} />
+
           <ul
             data-reveal="stagger"
             className="mt-12 grid gap-4 sm:mt-16 md:grid-cols-2 lg:grid-cols-3 lg:gap-5"
@@ -169,7 +256,7 @@ export function Download({ dict }: { dict: Dictionary }) {
 
             <InstallCard icon={Package} title=".deb">
               <p className="mt-2 text-base leading-6 text-ink-subtle">
-                Debian · Ubuntu · Pop!_OS · Mint
+                Debian · Ubuntu · Pop!_OS · Mint · Kali
               </p>
               <div className="mt-auto pt-6">
                 <a
@@ -195,15 +282,30 @@ export function Download({ dict }: { dict: Dictionary }) {
             </InstallCard>
 
             <InstallCard icon={Store} title={d.storeLabel}>
-              <div className="mt-auto pt-6">
-                <p className="flex gap-3 rounded-lg bg-raised p-4 text-base leading-6 text-ink-muted">
-                  <Search
-                    aria-hidden
-                    className="mt-1 size-4 shrink-0 text-ink-faint"
-                  />
-                  {d.storeBody}
-                </p>
-              </div>
+              <p className="mt-2 text-base leading-6 text-ink-subtle">
+                {d.storeDesc}
+              </p>
+              {/* No public web URL for the deepin App Store listing to link
+                  out to, so this card is an honest 3-step guide instead of a
+                  button that would go nowhere useful. */}
+              <ol className="mt-auto flex flex-col gap-2.5 pt-6 text-sm leading-6 text-ink-muted">
+                {[d.storeStep1, d.storeStep2, d.storeStep3].map(
+                  (step, i) => (
+                    <li
+                      key={i}
+                      className="flex items-start gap-3 rounded-lg bg-raised p-3.5"
+                    >
+                      <span
+                        aria-hidden
+                        className="flex size-6 shrink-0 items-center justify-center rounded-full bg-accent/10 text-sm font-semibold text-accent"
+                      >
+                        {i + 1}
+                      </span>
+                      <span className="pt-0.5">{step}</span>
+                    </li>
+                  ),
+                )}
+              </ol>
             </InstallCard>
           </ul>
 

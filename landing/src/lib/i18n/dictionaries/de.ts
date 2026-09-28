@@ -23,6 +23,7 @@ export const de: Dictionary = {
       "video hintergrund linux",
       "animierter hintergrund ubuntu",
       "wallpaper engine linux alternative",
+      "kali linux live hintergrund",
     ],
   },
 
@@ -58,12 +59,23 @@ export const de: Dictionary = {
     body: "Mach jedes Video, GIF oder Bild zu deinem Linux-Desktop. Hardwarebeschleunigte Wiedergabe hält die CPU nahe null, unter X11 und Wayland. Schließ die App: Der Daemon spielt weiter.",
     install: "Fresco installieren",
     star: "Stern auf GitHub",
+    sendToComputer: "An meinen Computer senden",
+    sendToComputerShareTitle: "Fresco",
+    sendToComputerShareText: "Fresco: eine kostenlose Open-Source-App für animierte Live-Hintergründe unter Linux.",
+    linkCopied: "Link kopiert. Auf deinem Linux-PC öffnen.",
+    howToInstall: "So installierst du es",
     newUsers24h: (n: string) =>
       `${n} Menschen haben in den letzten 24 Stunden mit Fresco angefangen`,
     builtBy: "Entwickelt von",
     activeToday: (n: string) =>
       `${n} Menschen haben Fresco in den letzten 24 Stunden genutzt`,
     newToday: (n: string) => `${n} neu`,
+    desktopActivities: "Aktivitäten",
+    desktopClock: "10:42",
+    desktopIconHome: "Start",
+    desktopIconPictures: "Bilder",
+    desktopIconDocument: "Notizen",
+    desktopIconTrash: "Papierkorb",
   },
 
   stats: {
@@ -102,7 +114,7 @@ export const de: Dictionary = {
     labelInstall: "Installation",
     what: "Fresco ist eine kostenlose Open-Source-App für animierte Hintergründe unter Linux: Sie setzt Videos, GIFs, Bilder, Diashows und Playlists als bewegten Desktophintergrund, mit Hardware-Dekodierung auf der GPU. Eine kostenlose Wallpaper-Engine-Alternative und unter Wayland zugleich eine Oberfläche für mpvpaper.",
     platforms:
-      "Jeder X11-Desktop (Ubuntu, Pop!_OS, Linux Mint, Debian) sowie Wayland-Compositoren mit layer-shell: COSMIC, Hyprland, Sway, KDE Plasma 6. Unter GNOME mit Wayland wird auf ein Standbild zurückgegriffen.",
+      "Jeder X11-Desktop (Ubuntu, Pop!_OS, Linux Mint, Debian, Kali Linux) sowie Wayland-Compositoren mit layer-shell: COSMIC, Hyprland, Sway, KDE Plasma 6. Unter GNOME mit Wayland wird auf ein Standbild zurückgegriffen.",
     widgets:
       "Vier Widgets, die in den Hintergrund selbst gezeichnet werden statt in ein Fenster: zeitsynchroner Songtext, eine Uhr mit sechs Designs, ein Audio-Visualizer und das Albumcover auf einer drehenden Schallplatte. Nichts schwebt über deinen Fenstern, nichts fängt einen Klick ab. Alle sind standardmäßig aus. Unter GNOME mit Wayland nicht verfügbar, da es dort keine Fläche für animierte Hintergründe gibt.",
     licenseLead: "GPL-3.0, für immer kostenlos.",
@@ -342,11 +354,8 @@ export const de: Dictionary = {
   },
 
   supported: {
-    kicker: "Getestete Umgebungen",
     title: "Wo Fresco läuft.",
-    lead: "Auf jedem X11-Desktop, einschließlich DDE von deepin 25, und auf Wayland-Compositoren mit layer-shell (COSMIC, Hyprland, Sway und KDE Plasma 6), quer durch die verbreiteten Debian- und Ubuntu-Distributionen. GNOME mit Wayland bekommt ein Standbild.",
-    deployed: (distros: number, formats: number) =>
-      `Getestet: 6 animierte Compositoren · 1 Standbild-Rückfall · ${distros} Distributionen · ${formats} Formate`,
+    lead: "Auf jedem X11-Desktop, einschließlich DDE von deepin 25, und auf Wayland-Compositoren mit layer-shell (COSMIC, Hyprland, Sway und KDE Plasma 6), quer durch die verbreiteten Debian-, Ubuntu- und Kali-Linux-Distributionen. GNOME mit Wayland bekommt ein Standbild.",
     sessionsTitle: "Sitzungen und Compositoren",
     distrosTitle: (n: number) => `Getestete Distributionen · ${n}`,
     formatsTitle: (n: number) => `Unterstützte Formate · ${n}`,
@@ -385,9 +394,10 @@ export const de: Dictionary = {
 
   download: {
     kicker: "Download",
-    title: "Installieren unter Debian, Ubuntu, Pop!_OS und Mint.",
+    title: "Installieren unter Debian, Ubuntu, Pop!_OS, Mint und Kali.",
     badge: "X11 · Wayland",
     lead: "Der offizielle Einzeiler-Installer oder das .deb-Release. Beide Wege landen in deiner Zwischenablage und laufen sofort. Fresco spielt weiter, nachdem du das Fenster geschlossen hast.",
+    worksOnTitle: "Läuft auf",
     cardTitle: "Installation in einer Zeile",
     cardBody:
       "Führ das in einem Terminal aus. Es lädt und installiert das neueste .deb für dich, immer die aktuellste Version:",
@@ -397,8 +407,11 @@ export const de: Dictionary = {
     gpuNote:
       "Für die geringste CPU-Last installiere den Hardware-Dekodierungstreiber deiner GPU (Intel media VA driver, Mesa VA drivers oder den proprietären NVIDIA-Treiber für NVDEC).",
     storeLabel: "Auch im deepin App Store",
-    storeBody:
-      "Unter deepin 25 den App Store öffnen, nach Fresco suchen und auf Installieren klicken. Updates kommen über den Store.",
+    storeDesc:
+      "Gebaut und verifiziert für den DDE-Desktop von deepin 25, Symbole inklusive.",
+    storeStep1: "App Store öffnen",
+    storeStep2: "Nach \"Fresco\" suchen",
+    storeStep3: "Auf Installieren klicken. Updates kommen über den Store.",
     copy: "Kopieren",
     copied: "Kopiert",
   },
@@ -520,5 +533,5 @@ export const de: Dictionary = {
   ],
 
   softwareDescription:
-    "Fresco ist eine kostenlose Open-Source-App für animierte Hintergründe unter Linux. Sie setzt Video-, GIF-, Bild-, Diashow- und Playlist-Hintergründe als bewegten Desktophintergrund mit hardwarebeschleunigter Wiedergabe und kann vier Desktop-Widgets in den Hintergrund selbst zeichnen: zeitsynchronen Songtext, eine Uhr, einen Audio-Visualizer und das Albumcover auf einer drehenden Schallplatte. Eine kostenlose Wallpaper-Engine-Alternative für Pop!_OS, Ubuntu, Linux Mint, Debian und elementary OS, unter X11 und auf Wayland-Compositoren mit layer-shell (COSMIC, Hyprland, Sway, KDE Plasma 6).",
+    "Fresco ist eine kostenlose Open-Source-App für animierte Hintergründe unter Linux. Sie setzt Video-, GIF-, Bild-, Diashow- und Playlist-Hintergründe als bewegten Desktophintergrund mit hardwarebeschleunigter Wiedergabe und kann vier Desktop-Widgets in den Hintergrund selbst zeichnen: zeitsynchronen Songtext, eine Uhr, einen Audio-Visualizer und das Albumcover auf einer drehenden Schallplatte. Eine kostenlose Wallpaper-Engine-Alternative für Pop!_OS, Ubuntu, Linux Mint, Debian, Kali Linux und elementary OS, unter X11 und auf Wayland-Compositoren mit layer-shell (COSMIC, Hyprland, Sway, KDE Plasma 6).",
 };

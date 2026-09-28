@@ -28,6 +28,7 @@ export const en = {
       "video wallpaper linux",
       "animated wallpaper ubuntu",
       "wallpaper engine linux alternative",
+      "kali linux live wallpaper",
     ],
   },
 
@@ -63,6 +64,12 @@ export const en = {
     body: "Set any video, GIF, or image as your Linux desktop. Hardware-accelerated playback keeps CPU near zero, on X11 and Wayland. Close the app; the daemon keeps it playing.",
     install: "Install Fresco",
     star: "Star on GitHub",
+    /** Phone-only primary CTA (Fresco is a Linux desktop app). */
+    sendToComputer: "Send to my computer",
+    sendToComputerShareTitle: "Fresco",
+    sendToComputerShareText: "Fresco: a free, open-source live wallpaper app for Linux.",
+    linkCopied: "Link copied. Open it on your Linux PC.",
+    howToInstall: "How to install",
     /** Live social proof beside the CTAs (installs first seen in 24h). */
     newUsers24h: (n: string) =>
       `${n} people started using Fresco in the last 24 hours`,
@@ -71,6 +78,13 @@ export const en = {
     /** Live pill: installs active in 24h, then installs first seen in 24h. */
     activeToday: (n: string) => `${n} people used Fresco in the last 24 hours`,
     newToday: (n: string) => `${n} new`,
+    /** Decorative desktop-scene overlay drawn over the demo video (aria-hidden). */
+    desktopActivities: "Activities",
+    desktopClock: "10:42",
+    desktopIconHome: "Home",
+    desktopIconPictures: "Pictures",
+    desktopIconDocument: "Notes",
+    desktopIconTrash: "Trash",
   },
 
   stats: {
@@ -110,7 +124,7 @@ export const en = {
     labelInstall: "Install",
     what: "Fresco is a free, open-source live wallpaper app for Linux: it sets video, GIF, image, slideshow, and playlist wallpapers as your animated desktop background, with GPU hardware decoding. A free Wallpaper Engine alternative and a GUI for mpvpaper on Wayland.",
     platforms:
-      "Any X11 desktop (Ubuntu, Pop!_OS, Linux Mint, Debian), plus Wayland layer-shell compositors: COSMIC, Hyprland, Sway, KDE Plasma 6. GNOME Wayland falls back to a static frame.",
+      "Any X11 desktop (Ubuntu, Pop!_OS, Linux Mint, Debian, Kali Linux), plus Wayland layer-shell compositors: COSMIC, Hyprland, Sway, KDE Plasma 6. GNOME Wayland falls back to a static frame.",
     widgets:
       "Four widgets painted into the wallpaper itself, not into a window: time-synced song lyrics, a clock with six themes, an audio visualiser, and album art on a turning record. Nothing floats over your windows and nothing intercepts a click. All off by default; unavailable on GNOME Wayland, which has no live wallpaper surface.",
     licenseLead: "GPL-3.0, free forever.",
@@ -347,11 +361,8 @@ export const en = {
   },
 
   supported: {
-    kicker: "Deployed environments",
     title: "Where Fresco runs.",
-    lead: "On any X11 desktop, including deepin 25's DDE, and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, and KDE Plasma 6) across the popular Debian and Ubuntu distributions. GNOME Wayland gets a static-frame fallback.",
-    deployed: (distros: number, formats: number) =>
-      `Deployed: 6 live compositors · 1 static fallback · ${distros} distros · ${formats} formats`,
+    lead: "On any X11 desktop, including deepin 25's DDE, and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, and KDE Plasma 6) across the popular Debian, Ubuntu, and Kali Linux distributions. GNOME Wayland gets a static-frame fallback.",
     sessionsTitle: "Sessions and compositors",
     distrosTitle: (n: number) => `Tested distributions · ${n}`,
     formatsTitle: (n: number) => `Supported formats · ${n}`,
@@ -390,9 +401,10 @@ export const en = {
 
   download: {
     kicker: "Download",
-    title: "Deploy on Debian, Ubuntu, Pop!_OS, and Mint.",
+    title: "Install on Debian, Ubuntu, Pop!_OS, Mint, and Kali.",
     badge: "X11 · Wayland",
     lead: "The official one-line installer or the .deb release. Either path copies to your clipboard and runs instantly. Fresco keeps playing after you close the window.",
+    worksOnTitle: "Works on",
     cardTitle: "One-line install",
     cardBody:
       "Run this in a terminal. It downloads and installs the latest .deb for you, always the newest release:",
@@ -402,8 +414,11 @@ export const en = {
     gpuNote:
       "For the lowest CPU usage, install your GPU's hardware-decode driver (Intel media VA driver, Mesa VA drivers, or the NVIDIA proprietary driver for NVDEC).",
     storeLabel: "Also on the deepin App Store",
-    storeBody:
-      "On deepin 25, open App Store, search for Fresco and click Install. Updates arrive through the store.",
+    storeDesc:
+      "Built and verified for deepin 25's DDE desktop, icons and all.",
+    storeStep1: "Open App Store",
+    storeStep2: "Search for \"Fresco\"",
+    storeStep3: "Click Install. Updates arrive through the store.",
     copy: "Copy",
     copied: "Copied",
   },
@@ -528,7 +543,7 @@ export const en = {
 
   /** SoftwareApplication.description in the JSON-LD graph. */
   softwareDescription:
-    "Fresco is a free, open-source live-wallpaper app for Linux. It sets video, GIF, image, slideshow, and playlist wallpapers as your animated desktop background, with hardware-accelerated playback, and can draw four desktop widgets into the wallpaper itself: time-synced song lyrics, a clock, an audio visualiser, and album art on a turning record. A free Wallpaper Engine alternative for Pop!_OS, Ubuntu, Linux Mint, Debian, and elementary OS, on X11 and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, KDE Plasma 6).",
+    "Fresco is a free, open-source live-wallpaper app for Linux. It sets video, GIF, image, slideshow, and playlist wallpapers as your animated desktop background, with hardware-accelerated playback, and can draw four desktop widgets into the wallpaper itself: time-synced song lyrics, a clock, an audio visualiser, and album art on a turning record. A free Wallpaper Engine alternative for Pop!_OS, Ubuntu, Linux Mint, Debian, Kali Linux, and elementary OS, on X11 and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, KDE Plasma 6).",
 };
 
 /**

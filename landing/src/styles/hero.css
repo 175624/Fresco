@@ -109,6 +109,26 @@
   opacity: 0;
 }
 
+/* ---- Mobile vs desktop primary CTA -------------------------------------- */
+
+/* Both variants render server-side; only one is ever visible, decided purely
+   by CSS so there is no hydration flash. A phone can't install a Linux app,
+   so small touch screens get "Send to my computer" instead of "Install". */
+.hero-cta-desktop {
+  display: flex;
+}
+.hero-cta-mobile {
+  display: none;
+}
+@media (max-width: 767px) and (pointer: coarse) {
+  .hero-cta-desktop {
+    display: none;
+  }
+  .hero-cta-mobile {
+    display: flex;
+  }
+}
+
 /* ---- Product frame ------------------------------------------------------ */
 
 /* Soft, static, indigo-tinted elevation. Never animated itself: the frame

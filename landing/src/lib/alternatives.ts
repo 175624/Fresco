@@ -127,7 +127,7 @@ export const ALTERNATIVES: Alternative[] = [
     reasons: [
       {
         title: "Actively maintained",
-        body: "Regular releases that install cleanly on current Ubuntu, Pop!_OS, Mint, and Debian.",
+        body: "Regular releases that install cleanly on current Ubuntu, Pop!_OS, Mint, Debian, and Kali.",
       },
       {
         title: "Modern playback",

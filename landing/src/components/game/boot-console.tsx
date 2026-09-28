@@ -4,6 +4,8 @@
 import { Fragment, type CSSProperties } from "react";
 import { ArrowUpRight, Download, Github, Store } from "lucide-react";
 import { DemoVideo } from "@/components/hero/demo-video";
+import { DesktopOverlay } from "@/components/hero/desktop-overlay";
+import { SendToComputer } from "@/components/hero/send-to-computer";
 import {
   AUTHOR_NAME,
   GITHUB_URL,
@@ -117,29 +119,43 @@ export function BootConsole({
           style={order(3)}
           className="hero-in mt-7 flex w-full flex-col items-stretch gap-3 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center sm:justify-center"
         >
-          <a
-            href="#download"
-            className="hero-press inline-flex h-12 items-center justify-center gap-2 rounded-[10px] bg-primary px-6 text-[15px] font-medium text-primary-foreground hover:bg-primary/90"
-          >
-            <Download className="size-4" aria-hidden />
-            {hero.install}
-          </a>
-          <a
-            href="#download"
-            className="hero-press inline-flex h-12 items-center justify-center gap-2 rounded-[10px] border border-hairline-strong bg-surface px-5 text-[15px] font-medium text-ink hover:bg-raised"
-          >
-            <Store className="size-4 text-ink-subtle" aria-hidden />
-            {dict.download.storeLabel}
-          </a>
-          <a
-            href={GITHUB_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hero-press hidden h-12 items-center justify-center gap-2 rounded-[10px] px-3 text-[15px] font-medium text-ink-subtle hover:text-ink sm:inline-flex"
-          >
-            <Github className="size-4" aria-hidden />
-            {hero.star}
-          </a>
+          <div className="hero-cta-desktop w-full flex-col items-stretch gap-3 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
+            <a
+              href="#download"
+              className="hero-press inline-flex h-12 items-center justify-center gap-2 rounded-[10px] bg-primary px-6 text-[15px] font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              <Download className="size-4" aria-hidden />
+              {hero.install}
+            </a>
+            <a
+              href="#download"
+              className="hero-press inline-flex h-12 items-center justify-center gap-2 rounded-[10px] border border-hairline-strong bg-surface px-5 text-[15px] font-medium text-ink hover:bg-raised"
+            >
+              <Store className="size-4 text-ink-subtle" aria-hidden />
+              {dict.download.storeLabel}
+            </a>
+            <a
+              href={GITHUB_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hero-press hidden h-12 items-center justify-center gap-2 rounded-[10px] px-3 text-[15px] font-medium text-ink-subtle hover:text-ink sm:inline-flex"
+            >
+              <Github className="size-4" aria-hidden />
+              {hero.star}
+            </a>
+          </div>
+
+          <div className="hero-cta-mobile w-full flex-col items-center gap-3">
+            <SendToComputer
+              label={hero.sendToComputer}
+              shareTitle={hero.sendToComputerShareTitle}
+              shareText={hero.sendToComputerShareText}
+              copied={hero.linkCopied}
+            />
+            <a href="#download" className="text-[13px] font-medium text-ink-subtle underline-offset-4 hover:underline">
+              {hero.howToInstall}
+            </a>
+          </div>
         </div>
 
         {showPill ? (
@@ -204,16 +220,9 @@ export function BootConsole({
 
         <div className="hero-stage relative mt-8 w-full max-w-[64rem] sm:mt-12">
           <div aria-hidden className="hero-glow" />
-          <div className="hero-frame overflow-hidden rounded-[16px] border border-hairline-strong bg-surface">
-            <div
-              aria-hidden
-              className="flex h-8 items-center gap-1.5 border-b border-hairline bg-raised px-3.5 sm:h-10 sm:gap-2 sm:px-4"
-            >
-              <span className="size-2.5 rounded-full bg-hairline-strong" />
-              <span className="size-2.5 rounded-full bg-hairline-strong" />
-              <span className="size-2.5 rounded-full bg-hairline-strong" />
-            </div>
+          <div className="hero-frame relative overflow-hidden rounded-[16px] border border-hairline-strong bg-surface">
             <DemoVideo />
+            <DesktopOverlay dict={hero} />
           </div>
 
           <p className="mt-6 text-[13px] text-ink-subtle">

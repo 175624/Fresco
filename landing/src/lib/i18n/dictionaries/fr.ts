@@ -23,6 +23,7 @@ export const fr: Dictionary = {
       "fond d'ecran video linux",
       "wallpaper anime ubuntu",
       "alternative wallpaper engine linux",
+      "fond d'ecran anime kali linux",
     ],
   },
 
@@ -58,12 +59,23 @@ export const fr: Dictionary = {
     body: "Mets n'importe quelle vidéo, GIF ou image sur ton bureau Linux. La lecture accélérée par le matériel garde le processeur quasi inactif, sous X11 comme sous Wayland. Ferme l'application : le démon continue la lecture.",
     install: "Installer Fresco",
     star: "Étoile sur GitHub",
+    sendToComputer: "Envoyer à mon ordinateur",
+    sendToComputerShareTitle: "Fresco",
+    sendToComputerShareText: "Fresco : une application de fond d'écran animé gratuite et open source pour Linux.",
+    linkCopied: "Lien copié. Ouvre-le sur ton PC Linux.",
+    howToInstall: "Comment l'installer",
     newUsers24h: (n: string) =>
       `${n} personnes ont commencé à utiliser Fresco ces dernières 24 heures`,
     builtBy: "Créé par",
     activeToday: (n: string) =>
       `${n} personnes ont utilisé Fresco ces dernières 24 heures`,
     newToday: (n: string) => `${n} nouvelles`,
+    desktopActivities: "Activités",
+    desktopClock: "10:42",
+    desktopIconHome: "Accueil",
+    desktopIconPictures: "Images",
+    desktopIconDocument: "Notes",
+    desktopIconTrash: "Corbeille",
   },
 
   stats: {
@@ -102,7 +114,7 @@ export const fr: Dictionary = {
     labelInstall: "Installation",
     what: "Fresco est une application gratuite et open source de fonds d'écran animés pour Linux : elle met des vidéos, des GIF, des images, des diaporamas et des playlists en fond de bureau animé, avec décodage matériel sur le GPU. Une alternative gratuite à Wallpaper Engine, et une interface graphique pour mpvpaper sous Wayland.",
     platforms:
-      "N'importe quel bureau X11 (Ubuntu, Pop!_OS, Linux Mint, Debian), ainsi que les compositeurs Wayland avec layer-shell : COSMIC, Hyprland, Sway, KDE Plasma 6. Sous GNOME avec Wayland, repli sur une image fixe.",
+      "N'importe quel bureau X11 (Ubuntu, Pop!_OS, Linux Mint, Debian, Kali Linux), ainsi que les compositeurs Wayland avec layer-shell : COSMIC, Hyprland, Sway, KDE Plasma 6. Sous GNOME avec Wayland, repli sur une image fixe.",
     widgets:
       "Quatre widgets dessinés dans le fond d'écran lui-même, pas dans une fenêtre : paroles synchronisées, une horloge à six thèmes, un visualiseur audio et la pochette de l'album sur un disque qui tourne. Rien ne flotte au-dessus de tes fenêtres et rien n'intercepte un clic. Tous désactivés par défaut. Indisponibles sous GNOME avec Wayland, qui n'offre pas de surface de fond animé.",
     licenseLead: "GPL-3.0, gratuit pour toujours.",
@@ -342,11 +354,8 @@ export const fr: Dictionary = {
   },
 
   supported: {
-    kicker: "Environnements testés",
     title: "Où tourne Fresco.",
-    lead: "Sur n'importe quel bureau X11, y compris le DDE de deepin 25, et sur les compositeurs Wayland avec layer-shell (COSMIC, Hyprland, Sway et KDE Plasma 6), à travers les distributions Debian et Ubuntu les plus répandues. GNOME avec Wayland reçoit une image fixe.",
-    deployed: (distros: number, formats: number) =>
-      `Testé : 6 compositeurs animés · 1 repli fixe · ${distros} distributions · ${formats} formats`,
+    lead: "Sur n'importe quel bureau X11, y compris le DDE de deepin 25, et sur les compositeurs Wayland avec layer-shell (COSMIC, Hyprland, Sway et KDE Plasma 6), à travers les distributions Debian, Ubuntu et Kali Linux les plus répandues. GNOME avec Wayland reçoit une image fixe.",
     sessionsTitle: "Sessions et compositeurs",
     distrosTitle: (n: number) => `Distributions testées · ${n}`,
     formatsTitle: (n: number) => `Formats pris en charge · ${n}`,
@@ -385,9 +394,10 @@ export const fr: Dictionary = {
 
   download: {
     kicker: "Télécharger",
-    title: "À déployer sur Debian, Ubuntu, Pop!_OS et Mint.",
+    title: "À installer sur Debian, Ubuntu, Pop!_OS, Mint et Kali.",
     badge: "X11 · Wayland",
     lead: "L'installeur officiel en une ligne ou le paquet .deb. Les deux chemins se copient dans ton presse-papiers et s'exécutent immédiatement. Fresco continue de lire après la fermeture de la fenêtre.",
+    worksOnTitle: "Fonctionne sur",
     cardTitle: "Installation en une ligne",
     cardBody:
       "Lance ceci dans un terminal. Il télécharge et installe le dernier .deb pour toi, toujours la version la plus récente :",
@@ -397,8 +407,11 @@ export const fr: Dictionary = {
     gpuNote:
       "Pour l'usage processeur le plus bas, installe le pilote de décodage matériel de ton GPU (pilote Intel media VA, pilotes VA de Mesa, ou le pilote propriétaire NVIDIA pour NVDEC).",
     storeLabel: "Aussi sur l'App Store de deepin",
-    storeBody:
-      "Sur deepin 25, ouvre l'App Store, cherche Fresco et clique sur Installer. Les mises à jour arrivent par la boutique.",
+    storeDesc:
+      "Conçu et vérifié pour le bureau DDE de deepin 25, icônes comprises.",
+    storeStep1: "Ouvre l'App Store",
+    storeStep2: "Cherche \"Fresco\"",
+    storeStep3: "Clique sur Installer. Les mises à jour arrivent par la boutique.",
     copy: "Copier",
     copied: "Copié",
   },
@@ -520,5 +533,5 @@ export const fr: Dictionary = {
   ],
 
   softwareDescription:
-    "Fresco est une application gratuite et open source de fond d'écran animé pour Linux. Elle applique des fonds d'écran vidéo, GIF, image, diaporama et playlist comme fond de bureau animé, avec une lecture accélérée par le matériel, et peut dessiner quatre widgets dans le fond d'écran lui-même : paroles synchronisées, une horloge, un visualiseur audio et la pochette d'album sur un disque qui tourne. Une alternative gratuite à Wallpaper Engine pour Pop!_OS, Ubuntu, Linux Mint, Debian et elementary OS, sous X11 et sur les compositeurs Wayland avec layer-shell (COSMIC, Hyprland, Sway, KDE Plasma 6).",
+    "Fresco est une application gratuite et open source de fond d'écran animé pour Linux. Elle applique des fonds d'écran vidéo, GIF, image, diaporama et playlist comme fond de bureau animé, avec une lecture accélérée par le matériel, et peut dessiner quatre widgets dans le fond d'écran lui-même : paroles synchronisées, une horloge, un visualiseur audio et la pochette d'album sur un disque qui tourne. Une alternative gratuite à Wallpaper Engine pour Pop!_OS, Ubuntu, Linux Mint, Debian, Kali Linux et elementary OS, sous X11 et sur les compositeurs Wayland avec layer-shell (COSMIC, Hyprland, Sway, KDE Plasma 6).",
 };

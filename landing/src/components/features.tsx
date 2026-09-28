@@ -1,7 +1,26 @@
 import "@/styles/spec.css";
 import "@/styles/showcase.css";
 import type { ReactNode } from "react";
-import { ArrowUpRight, Check, ChevronDown, Monitor } from "lucide-react";
+import {
+  ArrowUpRight,
+  AudioLines,
+  BatteryCharging,
+  Check,
+  Clock,
+  Cpu,
+  Film,
+  Globe,
+  Images,
+  LayoutGrid,
+  Layers,
+  ListMusic,
+  Mic2,
+  Monitor,
+  Palette,
+  SlidersHorizontal,
+  Volume2,
+  type LucideIcon,
+} from "lucide-react";
 import { GITHUB_URL } from "@/lib/site";
 import type { Dictionary } from "@/lib/i18n";
 import { SpecHead } from "@/components/spec/spec-head";
@@ -39,6 +58,25 @@ const ROW_ORDER = [
 /** Not shipped in a stable release yet: marked with a muted badge. */
 const SOON_ROWS = new Set<RowId>(["newTab"]);
 
+/** A small, sensible icon per capability, for the compact manifest grid. */
+const ROW_ICONS: Record<RowId, LucideIcon> = {
+  hwDecode: Cpu,
+  sessions: Layers,
+  catalog: LayoutGrid,
+  video: Film,
+  slideshow: Images,
+  playlist: ListMusic,
+  lyrics: Mic2,
+  visualiser: AudioLines,
+  editor: SlidersHorizontal,
+  audio: Volume2,
+  displays: Monitor,
+  schedule: Clock,
+  power: BatteryCharging,
+  newTab: Globe,
+  themes: Palette,
+};
+
 /**
  * Features, told as two things: the desktop widgets (the real-widget
  * showcase, which carries the `whats-new` anchor the nav links to) and
@@ -60,7 +98,7 @@ export function Features({ dict }: { dict: Dictionary }) {
     <section
       id="features"
       aria-labelledby="features-title"
-      className="border-b border-hairline py-24 sm:py-32"
+      className="border-b border-hairline py-16 sm:py-20"
     >
       <div className="wrap">
         <div className="mx-auto max-w-6xl">
@@ -72,7 +110,7 @@ export function Features({ dict }: { dict: Dictionary }) {
           />
 
           {/* 1. Desktop widgets. */}
-          <div id="whats-new" className="mt-16 sm:mt-24">
+          <div id="whats-new" className="mt-12 sm:mt-16">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between lg:gap-16">
               <h3
                 data-reveal="fade"
@@ -118,7 +156,7 @@ function MultiMonitor({ rows }: { rows: Rows }) {
   const power = rows.power;
 
   return (
-    <div className="mt-24 sm:mt-32 lg:mt-40">
+    <div className="mt-10 sm:mt-14 lg:mt-16">
       <div className="grid gap-8 lg:grid-cols-2 lg:items-end lg:gap-16">
         <div data-reveal="fade">
           <p className="inline-flex items-center gap-1.5 rounded-full bg-accent/10 px-3 py-1 text-sm font-medium text-accent">
@@ -153,7 +191,7 @@ function MultiMonitor({ rows }: { rows: Rows }) {
       <div
         aria-hidden
         data-reveal="stagger"
-        className="mt-12 grid grid-cols-2 items-end gap-3 sm:mt-16 sm:grid-cols-[1fr_1.3fr_1fr] sm:gap-5 lg:gap-8"
+        className="mt-8 grid grid-cols-2 items-end gap-3 sm:mt-10 sm:grid-cols-[1fr_1.3fr_1fr] sm:gap-5 lg:gap-8"
       >
         <Screen>
           <MonitorVideo name="ocean" className="absolute inset-0 size-full object-cover" />
@@ -184,7 +222,7 @@ function Screen({ children, className }: { children: ReactNode; className?: stri
   );
 }
 
-/** Every capability, compact, collapsed by default but always in the DOM. */
+/** Every capability, always visible as a compact icon grid (no disclosure). */
 function Manifest({ dict }: { dict: Dictionary }) {
   const f = dict.features;
   const total = ROW_ORDER.length;
@@ -192,82 +230,57 @@ function Manifest({ dict }: { dict: Dictionary }) {
   const shipping = total - soon;
 
   return (
-    <details className="mt-24 overflow-hidden rounded-[16px] border border-hairline bg-surface sm:mt-32">
-      <summary className="spec-summary flex items-center justify-between gap-4 px-5 py-4 transition-colors duration-150 hover:bg-raised/60 sm:px-6 sm:py-5">
-        <span className="block min-w-0 text-lg font-semibold text-ink first-letter:uppercase">
-          {f.manifest(total)}
-        </span>
-        <span
-          aria-hidden
-          className="grid size-9 shrink-0 place-items-center rounded-lg border border-hairline text-ink-muted"
-        >
-          <ChevronDown className="spec-chevron size-4" />
-        </span>
-      </summary>
+    <div className="mt-10 sm:mt-12">
+      <h3
+        data-reveal="fade"
+        className="text-lg font-semibold text-ink first-letter:uppercase"
+      >
+        {f.manifest(total)}
+      </h3>
 
-      <table role="table" className="spec-manifest w-full border-collapse border-t border-hairline text-left">
-        <caption className="sr-only">{f.manifest(total)}</caption>
-        <thead role="rowgroup">
-          <tr role="row" className="border-b border-hairline">
-            <th
-              role="columnheader"
-              scope="col"
-              className="px-5 py-3 text-sm font-medium text-ink-faint sm:px-6 md:w-[17rem]"
+      <ul
+        data-reveal="stagger"
+        className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
+      >
+        {ROW_ORDER.map((id) => {
+          const row = f.rows[id];
+          const isSoon = SOON_ROWS.has(id);
+          const Icon = ROW_ICONS[id];
+          return (
+            <li
+              key={id}
+              className="flex gap-3 rounded-[12px] border border-hairline bg-surface p-3.5"
             >
-              {f.thCapability}
-            </th>
-            <th role="columnheader" scope="col" className="px-4 py-3 text-sm font-medium text-ink-faint">
-              {f.thWhatYouGet}
-            </th>
-            <th
-              role="columnheader"
-              scope="col"
-              className="px-5 py-3 text-right text-sm font-medium text-ink-faint sm:px-6 md:w-[12rem]"
-            >
-              {f.thStatus}
-            </th>
-          </tr>
-        </thead>
-        <tbody role="rowgroup">
-          {ROW_ORDER.map((id) => {
-            const row = f.rows[id];
-            const isSoon = SOON_ROWS.has(id);
-            return (
-              <tr key={id} role="row" className="border-b border-hairline last:border-0">
-                <th
-                  role="rowheader"
-                  scope="row"
-                  className="px-5 py-3.5 align-top text-base font-medium text-ink sm:px-6"
-                >
+              <span
+                aria-hidden
+                className="mt-0.5 grid size-7 shrink-0 place-items-center rounded-lg bg-accent/10 text-accent"
+              >
+                <Icon className="size-3.5" strokeWidth={2} />
+              </span>
+              <div className="min-w-0">
+                <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-base font-medium text-ink">
                   {row.title}
-                </th>
-                <td role="cell" className="px-4 py-3.5 align-top text-base text-ink-subtle">
-                  {row.description}
-                </td>
-                <td role="cell" className="px-5 py-3.5 align-top sm:px-6 md:text-right">
-                  {isSoon ? (
-                    <span className="inline-flex rounded-md border border-hairline-strong bg-raised px-2 py-0.5 text-sm font-medium text-ink-subtle">
-                      {row.status}
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1.5 text-sm text-ink-muted">
-                      <Check aria-hidden className="size-3.5 text-ok" strokeWidth={2.5} />
+                  {isSoon && (
+                    <span className="inline-flex rounded-md border border-hairline-strong bg-raised px-1.5 py-0.5 text-xs font-medium text-ink-subtle">
                       {row.status}
                     </span>
                   )}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+                </p>
+                {row.description && (
+                  <p className="mt-1 text-sm leading-snug text-ink-subtle">{row.description}</p>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
 
-      <div className="border-t border-hairline px-5 py-4 text-sm sm:px-6">
+      <div className="mt-3 text-sm">
         <p className="text-ink-faint first-letter:uppercase">{f.footnote}</p>
         <p className="mt-2 text-ink-muted first-letter:uppercase">
           {f.tally(shipping, total, soon)}
         </p>
       </div>
-    </details>
+    </div>
   );
 }

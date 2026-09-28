@@ -8,7 +8,6 @@ import { Features } from "@/components/features";
 import { Comparison } from "@/components/comparison";
 import { HowItWorks } from "@/components/how-it-works";
 import { VideoShowcase } from "@/components/video-showcase";
-import { Supported } from "@/components/supported";
 import { Download } from "@/components/download";
 import { Faq } from "@/components/faq";
 import { SiteFooter } from "@/components/site-footer";
@@ -21,8 +20,9 @@ import { isLocale, type Locale } from "@/lib/i18n/config";
 /**
  * Conversion-first order: say what it is and hand over the download (hero),
  * prove it (numbers, people), show what you get (features, the real widgets),
- * remove doubt (how it works, compare, demos, where it runs), then close
- * (download) and answer the rest (at a glance, FAQ).
+ * remove doubt (how it works, compare, demos), then close (download, which
+ * also answers "will it run on my distro/desktop?") and answer the rest
+ * (at a glance, FAQ).
  */
 export default async function Home({
   params,
@@ -52,7 +52,6 @@ export default async function Home({
         <HowItWorks dict={dict} />
         <Comparison dict={dict} />
         <VideoShowcase dict={dict} />
-        <Supported dict={dict} />
         <Download dict={dict} />
         <AtAGlance dict={dict} version={stats.version} />
         <Faq dict={dict} />

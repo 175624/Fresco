@@ -1,13 +1,16 @@
 /**
  * Anonymous field quotes for the testimonials section.
  *
- * Provenance, snapshot 2026-09-15, two sources:
+ * Provenance, snapshot refreshed 2026-09-28, two sources:
  *   - the in-app `feedback` table (the thumbs up / down prompt inside
  *     Fresco): rows rated +1 only. Country comes from the reporter's IANA
  *     timezone; `os` is the table's value ("linux").
  *   - user support messages, vetted as positive, self-contained and
- *     anonymous. They carry no timezone, so no country (rendered as the
- *     anonymous label); `os` is the distro from the thread's environment.
+ *     anonymous. A support thread opened from the in-app feedback prompt
+ *     shares a ticket with a feedback row, and takes that row's timezone
+ *     for the country; a direct support thread carries no timezone, so no
+ *     country (rendered as the anonymous label). `os` is the distro from
+ *     the thread's environment.
  * Rows were skipped if they contained names, contact details, links,
  * personal details, profanity, a bug report or complaint, or needed context
  * to read. A comment present in both sources is listed once.
@@ -115,5 +118,43 @@ export const FIELD_QUOTES: readonly FieldQuote[] = [
     os: "LMDE 7 (gigi)",
     version: "1.1.40",
     date: "2026-08-29",
+  },
+  {
+    // feedback, America/Sao_Paulo (locale pt_BR; also sent as a support message a moment later)
+    quote: "é um app muito bom e util. um projeto muito promissor.",
+    lang: "pt-BR",
+    country: "BR",
+    os: "linux",
+    version: "1.1.44",
+    date: "2026-09-27",
+  },
+  {
+    // support (thread opened from the feedback prompt; that row's timezone Asia/Karachi)
+    quote:
+      "its super good and it dosent hides your apps also the best becuase i found this a super good app the best app!!",
+    lang: "en",
+    country: "PK",
+    os: "Linux Mint 22.3",
+    version: "1.1.44",
+    date: "2026-09-27",
+  },
+  {
+    // feedback, Europe/Vienna
+    quote: "Its Nice better then Wallpaper engine also cause its frree and easy to use :D",
+    lang: "en",
+    country: "AT",
+    os: "linux",
+    version: "1.1.43",
+    date: "2026-09-26",
+  },
+  {
+    // support (thread opened from the feedback prompt; that row's timezone Africa/Lagos, locale en_NG)
+    quote:
+      "Hey, I just wanted to say thank you. I've been loving the app and how it performs on my PC, and I'll try to spread the word as much as I can",
+    lang: "en",
+    country: "NG",
+    os: "Linux Mint 22.3",
+    version: "1.1.44",
+    date: "2026-09-25",
   },
 ];

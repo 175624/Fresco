@@ -20,6 +20,7 @@ export const zhCn: Dictionary = {
       "linux 视频壁纸",
       "ubuntu 动态壁纸",
       "wallpaper engine linux 替代",
+      "kali linux 动态壁纸",
     ],
   },
 
@@ -54,10 +55,21 @@ export const zhCn: Dictionary = {
     body: "把任意视频、GIF 或图片设为 Linux 桌面背景。硬件加速播放让 CPU 占用几乎为零，X11 与 Wayland 都可用。关掉应用，守护进程会继续播放。",
     install: "安装 Fresco",
     star: "在 GitHub 点星",
+    sendToComputer: "发送到我的电脑",
+    sendToComputerShareTitle: "Fresco",
+    sendToComputerShareText: "Fresco：一款免费开源的 Linux 动态壁纸应用。",
+    linkCopied: "链接已复制，请在你的 Linux 电脑上打开。",
+    howToInstall: "如何安装",
     newUsers24h: (n: string) => `过去 24 小时有 ${n} 人开始使用 Fresco`,
     builtBy: "开发者",
     activeToday: (n: string) => `过去 24 小时有 ${n} 人使用了 Fresco`,
     newToday: (n: string) => `其中新用户 ${n} 人`,
+    desktopActivities: "活动概览",
+    desktopClock: "10:42",
+    desktopIconHome: "主目录",
+    desktopIconPictures: "图片",
+    desktopIconDocument: "笔记",
+    desktopIconTrash: "回收站",
   },
 
   stats: {
@@ -95,7 +107,7 @@ export const zhCn: Dictionary = {
     labelInstall: "安装",
     what: "Fresco 是一款面向 Linux 的免费开源动态壁纸应用：可以把视频、GIF、图片、幻灯片和播放列表设为动态桌面背景，并使用 GPU 硬件解码。它既是免费的 Wallpaper Engine 替代方案，也是 Wayland 上 mpvpaper 的图形界面。",
     platforms:
-      "任何 X11 桌面（Ubuntu、Pop!_OS、Linux Mint、Debian），以及支持 layer-shell 的 Wayland 合成器：COSMIC、Hyprland、Sway、KDE Plasma 6。GNOME Wayland 下会回退为静态画面。",
+      "任何 X11 桌面（Ubuntu、Pop!_OS、Linux Mint、Debian、Kali Linux），以及支持 layer-shell 的 Wayland 合成器：COSMIC、Hyprland、Sway、KDE Plasma 6。GNOME Wayland 下会回退为静态画面。",
     widgets:
       "四个直接绘制在壁纸上而非窗口里的组件：时间同步歌词、六种主题的时钟、音频可视化，以及旋转唱片上的专辑封面。它们不会浮在窗口上方，也不会拦截点击。四个默认都关闭。GNOME Wayland 没有动态壁纸绘制面，因此无法使用。",
     licenseLead: "GPL-3.0，永久免费。",
@@ -330,11 +342,8 @@ export const zhCn: Dictionary = {
   },
 
   supported: {
-    kicker: "已验证环境",
     title: "Fresco 能在哪里运行。",
-    lead: "支持任意 X11 桌面（包括 deepin 25 的 DDE），以及支持 layer-shell 的 Wayland 合成器（COSMIC、Hyprland、Sway 和 KDE Plasma 6），覆盖主流的 Debian 与 Ubuntu 发行版。GNOME Wayland 下会回退为静态画面。",
-    deployed: (distros: number, formats: number) =>
-      `已验证：6 个动态合成器 · 1 个静态回退 · ${distros} 个发行版 · ${formats} 种格式`,
+    lead: "支持任意 X11 桌面（包括 deepin 25 的 DDE），以及支持 layer-shell 的 Wayland 合成器（COSMIC、Hyprland、Sway 和 KDE Plasma 6），覆盖主流的 Debian、Ubuntu 与 Kali Linux 发行版。GNOME Wayland 下会回退为静态画面。",
     sessionsTitle: "会话与合成器",
     distrosTitle: (n: number) => `已测试发行版 · ${n}`,
     formatsTitle: (n: number) => `支持格式 · ${n}`,
@@ -373,9 +382,10 @@ export const zhCn: Dictionary = {
 
   download: {
     kicker: "下载",
-    title: "可部署在 Debian、Ubuntu、Pop!_OS 与 Mint 上。",
+    title: "可安装在 Debian、Ubuntu、Pop!_OS、Mint 与 Kali 上。",
     badge: "X11 · Wayland",
     lead: "官方一行安装命令，或直接下载 .deb 安装包。两种方式都能一键复制到剪贴板并立即执行。关闭窗口后 Fresco 仍会继续播放。",
+    worksOnTitle: "支持环境",
     cardTitle: "一行命令安装",
     cardBody:
       "在终端中运行以下命令。它会自动下载并安装最新的 .deb，始终是最新版本：",
@@ -385,8 +395,10 @@ export const zhCn: Dictionary = {
     gpuNote:
       "为了把 CPU 占用降到最低，请安装显卡对应的硬件解码驱动（Intel media VA 驱动、Mesa VA 驱动，或用于 NVDEC 的 NVIDIA 专有驱动）。",
     storeLabel: "已上架 deepin 应用商店",
-    storeBody:
-      "在 deepin 25 中打开应用商店，搜索 Fresco 并点击安装。更新会通过应用商店推送。",
+    storeDesc: "专为 deepin 25 的 DDE 桌面打造并通过验证，桌面图标照常显示。",
+    storeStep1: "打开应用商店",
+    storeStep2: "搜索“Fresco”",
+    storeStep3: "点击安装。更新会通过应用商店推送。",
     copy: "复制",
     copied: "已复制",
   },
@@ -508,5 +520,5 @@ export const zhCn: Dictionary = {
   ],
 
   softwareDescription:
-    "Fresco 是一款面向 Linux 的免费开源动态壁纸应用。它可以把视频、GIF、图片、幻灯片和播放列表设为动态桌面背景，支持硬件加速播放，还能把四个桌面组件直接绘制到壁纸上：时间同步歌词、时钟、音频可视化，以及旋转唱片上的专辑封面。它是面向 Pop!_OS、Ubuntu、Linux Mint、Debian 和 elementary OS 的免费 Wallpaper Engine 替代方案，支持 X11 以及 Wayland layer-shell 合成器（COSMIC、Hyprland、Sway、KDE Plasma 6）。",
+    "Fresco 是一款面向 Linux 的免费开源动态壁纸应用。它可以把视频、GIF、图片、幻灯片和播放列表设为动态桌面背景，支持硬件加速播放，还能把四个桌面组件直接绘制到壁纸上：时间同步歌词、时钟、音频可视化，以及旋转唱片上的专辑封面。它是面向 Pop!_OS、Ubuntu、Linux Mint、Debian、Kali Linux 和 elementary OS 的免费 Wallpaper Engine 替代方案，支持 X11 以及 Wayland layer-shell 合成器（COSMIC、Hyprland、Sway、KDE Plasma 6）。",
 };

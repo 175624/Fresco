@@ -20,8 +20,8 @@ const COVER_PX = 2560;
 
 /**
  * Aria-hidden copies the row needs. The loop shifts by one period P, so a
- * screen of width W stays covered while W <= copies * P. Seven cards give
- * P ~ 2630px, so one copy.
+ * screen of width W stays covered while W <= copies * P. Eleven cards give
+ * P ~ 4136px, so one copy.
  */
 function loopCopies(n: number) {
   const period = n * (ITEM_REM + GAP_REM) * 16;
