@@ -2,18 +2,12 @@ import { PageHeader } from "@/components/page-header";
 import { StatCard } from "@/components/stat-card";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorPanel } from "@/components/error-panel";
-import { SeverityBadge, type Severity } from "@/components/badges";
-import {
-  DataTable,
-  NullCell,
-  TBody,
-  TD,
-  TH,
-  THead,
-  TR,
-} from "@/components/data-table";
+import type { Severity } from "@/components/badges";
+import { DataTable, TBody, TH, THead, TR } from "@/components/data-table";
+import { ErrorGroupRow } from "@/app/reliability/error-group-row";
 import { getErrorsSince } from "@/lib/data";
-import { formatNumber, formatRelative } from "@/lib/format";
+import { parseErrorSignature } from "@/lib/error-signature";
+import { formatNumber } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -48,31 +42,97 @@ export default async function ReliabilityPage() {
     errors7dRows.map((e) => e.install_id).filter(Boolean)
   ).size;
 
+  type Signature = {
+    signature: string;
+    count: number;
+    installs: number;
+    lastSeen: string;
+  };
   type Group = {
     kind: string;
     version: string;
     count: number;
+    installs: number;
     lastSeen: string;
     latestDetail: string | null;
+    signatures: Signature[];
   };
-  const groups = new Map<string, Group>();
+
+  // kind+version -> signature -> mutable accumulator, so a group's "12 rows"
+  // can be broken down by root cause (see error-signature.ts) instead of
+  // shown with a single, potentially misleading sample detail.
+  type SigAcc = {
+    count: number;
+    installs: Set<string>;
+    lastSeen: string;
+  };
+  type GroupAcc = {
+    kind: string;
+    version: string;
+    count: number;
+    installs: Set<string>;
+    lastSeen: string;
+    latestDetail: string | null;
+    signatures: Map<string, SigAcc>;
+  };
+  const groups = new Map<string, GroupAcc>();
   for (const e of errors) {
     const version = e.version?.trim() || "unknown";
     const key = `${e.kind} ${version}`;
-    const g = groups.get(key);
-    if (g) {
-      g.count += 1;
-    } else {
-      groups.set(key, {
+    let g = groups.get(key);
+    if (!g) {
+      g = {
         kind: e.kind,
         version,
-        count: 1,
+        count: 0,
+        installs: new Set(),
         lastSeen: e.created_at,
         latestDetail: e.detail,
+        signatures: new Map(),
+      };
+      groups.set(key, g);
+    }
+    g.count += 1;
+    if (e.install_id) g.installs.add(e.install_id);
+    // Rows arrive oldest-first (see getErrorsSince) — every later row is a
+    // newer "last seen" for the group and, when it matches, for its
+    // signature bucket too.
+    g.lastSeen = e.created_at;
+    g.latestDetail = e.detail;
+
+    const signature = parseErrorSignature(e.detail);
+    const sig = g.signatures.get(signature);
+    if (!sig) {
+      g.signatures.set(signature, {
+        count: 1,
+        installs: new Set(e.install_id ? [e.install_id] : []),
+        lastSeen: e.created_at,
       });
+    } else {
+      sig.count += 1;
+      if (e.install_id) sig.installs.add(e.install_id);
+      sig.lastSeen = e.created_at;
     }
   }
-  const grouped = [...groups.values()].sort((a, b) => b.count - a.count);
+
+  const grouped: Group[] = [...groups.values()]
+    .map((g) => ({
+      kind: g.kind,
+      version: g.version,
+      count: g.count,
+      installs: g.installs.size,
+      lastSeen: g.lastSeen,
+      latestDetail: g.latestDetail,
+      signatures: [...g.signatures.entries()]
+        .map(([signature, s]) => ({
+          signature,
+          count: s.count,
+          installs: s.installs.size,
+          lastSeen: s.lastSeen,
+        }))
+        .sort((a, b) => b.count - a.count),
+    }))
+    .sort((a, b) => b.count - a.count);
 
   return (
     <div className="space-y-3">
@@ -114,51 +174,22 @@ export default async function ReliabilityPage() {
         <DataTable>
           <THead>
             <TR>
+              <TH className="w-[28px]" />
               <TH className="w-[90px]">Severity</TH>
-              <TH className="w-[180px]">Kind</TH>
-              <TH className="w-[100px]">Version</TH>
-              <TH className="w-[80px] text-right">Count</TH>
+              <TH className="w-[160px]">Kind</TH>
+              <TH className="w-[90px]">Version</TH>
+              <TH className="w-[130px] text-right">Rows / installs</TH>
               <TH className="w-[100px] text-right">Last seen</TH>
               <TH>Latest detail</TH>
             </TR>
           </THead>
           <TBody>
             {grouped.map((g) => (
-              <TR key={`${g.kind}-${g.version}`}>
-                <TD>
-                  <SeverityBadge severity={groupSeverity(g.count)} />
-                </TD>
-                <TD>
-                  <span className="block truncate font-mono text-sm font-medium text-stone-900">
-                    {g.kind}
-                  </span>
-                </TD>
-                <TD>
-                  <span className="font-mono text-meta text-stone-500">
-                    {g.version}
-                  </span>
-                </TD>
-                <TD className="text-right text-sm text-stone-900 tabular-nums">
-                  {formatNumber(g.count)}
-                </TD>
-                <TD className="text-right">
-                  <span className="font-mono text-meta text-stone-500">
-                    {formatRelative(g.lastSeen)}
-                  </span>
-                </TD>
-                <TD>
-                  {g.latestDetail ? (
-                    <span
-                      className="block truncate font-mono text-meta text-stone-500"
-                      title={g.latestDetail}
-                    >
-                      {g.latestDetail}
-                    </span>
-                  ) : (
-                    <NullCell />
-                  )}
-                </TD>
-              </TR>
+              <ErrorGroupRow
+                key={`${g.kind}-${g.version}`}
+                group={g}
+                severity={groupSeverity(g.count)}
+              />
             ))}
           </TBody>
         </DataTable>
