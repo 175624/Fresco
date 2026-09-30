@@ -1181,6 +1181,7 @@ impl Daemon {
             return;
         };
         let Some(path) = want.effective_path().map(|p| p.to_path_buf()) else {
+            log::warn!("schedule: the scheduled wallpaper has no usable file path; not switching");
             return;
         };
         log::info!(
@@ -1622,8 +1623,18 @@ impl SchedState {
 
     /// The wallpaper to switch to now, if any (None = nothing to do this tick).
     fn due(&mut self, config: &Config) -> Option<Wallpaper> {
-        let want = schedule_desired_wallpaper(config)?;
-        let path = want.effective_path()?.to_path_buf();
+        self.due_for(config, schedule_desired_wallpaper(config)?)
+    }
+
+    /// [`Self::due`] with the wall-clock lookup factored out, so tests can
+    /// feed it the wallpaper a given (possibly jumped) clock time would want.
+    fn due_for(&mut self, config: &Config, want: Wallpaper) -> Option<Wallpaper> {
+        let Some(path) = want.effective_path().map(|p| p.to_path_buf()) else {
+            // Level-triggered and silent-by-default is how a schedule that
+            // "never switches" hid in the field: say why, once per tick.
+            log::warn!("schedule: the scheduled wallpaper has no usable file path; not switching");
+            return None;
+        };
         if self.hold.as_deref() == Some(path.as_path()) {
             return None; // user's manual choice holds this slot
         }
@@ -4327,5 +4338,95 @@ exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet
         let _ = std::fs::remove_file(&fake);
         let _ = std::fs::remove_file(&img_a);
         let _ = std::fs::remove_file(&img_b);
+    }
+}
+
+#[cfg(test)]
+mod sched_clock_jump_tests {
+    use super::*;
+    use crate::config::{Kind, Schedule, ScheduleMode};
+    use chrono::NaiveDate;
+
+    fn wp(path: &str) -> Wallpaper {
+        Wallpaper {
+            kind: Kind::Video,
+            path: Some(PathBuf::from(path)),
+            ..Default::default()
+        }
+    }
+    fn schedule() -> Schedule {
+        Schedule {
+            mode: ScheduleMode::Daynight,
+            day: Some(wp("/day.mp4")),
+            night: Some(wp("/night.mp4")),
+            day_start: "07:00".into(),
+            night_start: "17:16".into(),
+            lat: None,
+            lon: None,
+            at: vec![],
+        }
+    }
+    /// What the scheduler wants when the wall clock reads `h:m` (the daemon's
+    /// `due` feeds exactly this into `due_for`).
+    fn want_at(s: &Schedule, h: u32, m: u32) -> Wallpaper {
+        let now = NaiveDate::from_ymd_opt(2026, 9, 30)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap();
+        crate::schedule::desired(s, now, 0).unwrap().clone()
+    }
+    fn cfg_showing(path: &str) -> Config {
+        Config {
+            wallpaper: wp(path),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resume_across_boundary_switches_once() {
+        let s = schedule();
+        let cfg = cfg_showing("/day.mp4");
+        let mut st = SchedState::default();
+        assert!(st.due_for(&cfg, want_at(&s, 16, 0)).is_none());
+        // Suspend at 16:00, wake at 17:20: the boundary was missed entirely.
+        let got = st.due_for(&cfg, want_at(&s, 17, 20)).unwrap();
+        assert_eq!(got.effective_path().unwrap().to_str(), Some("/night.mp4"));
+        st.applied = Some(PathBuf::from("/night.mp4"));
+        assert!(st.due_for(&cfg, want_at(&s, 17, 21)).is_none());
+    }
+
+    #[test]
+    fn hold_expires_when_a_jump_crosses_the_boundary() {
+        let s = schedule();
+        // User manually applied /other.mp4 during the day slot: hold = day.
+        let cfg = cfg_showing("/other.mp4");
+        let mut st = SchedState {
+            applied: None,
+            hold: Some(PathBuf::from("/day.mp4")),
+        };
+        assert!(st.due_for(&cfg, want_at(&s, 12, 0)).is_none());
+        assert!(st.hold.is_some());
+        let got = st.due_for(&cfg, want_at(&s, 20, 0)).unwrap();
+        assert_eq!(got.effective_path().unwrap().to_str(), Some("/night.mp4"));
+        assert!(st.hold.is_none());
+    }
+
+    #[test]
+    fn clock_set_backwards_switches_back() {
+        let s = schedule();
+        let cfg = cfg_showing("/night.mp4");
+        let mut st = SchedState {
+            applied: Some(PathBuf::from("/night.mp4")),
+            hold: None,
+        };
+        let got = st.due_for(&cfg, want_at(&s, 9, 0)).unwrap();
+        assert_eq!(got.effective_path().unwrap().to_str(), Some("/day.mp4"));
+    }
+
+    #[test]
+    fn wallpaper_without_a_path_is_skipped() {
+        let cfg = cfg_showing("/day.mp4");
+        let mut st = SchedState::default();
+        assert!(st.due_for(&cfg, Wallpaper::default()).is_none());
     }
 }

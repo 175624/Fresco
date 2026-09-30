@@ -52,6 +52,40 @@ pub fn next_change_secs(s: &Schedule, now: NaiveDateTime, utc_offset_minutes: i3
     Some(delta as u64)
 }
 
+/// The next slot change after `now`: when it happens (local wall time,
+/// minute precision) and the wallpaper that takes over then. Drives the
+/// "Next switch at …" hint in Advanced; None when the schedule is unusable.
+pub fn next_switch(
+    s: &Schedule,
+    now: NaiveDateTime,
+    utc_offset_minutes: i32,
+) -> Option<(NaiveTime, &Wallpaper)> {
+    let secs = next_change_secs(s, now, utc_offset_minutes)?;
+    let at = now.checked_add_signed(chrono::Duration::seconds(secs as i64))?;
+    let w = desired(s, at, utc_offset_minutes)?;
+    Some((at.time(), w))
+}
+
+/// "Next switch at 17:16: name" — pure so the wording is testable.
+pub fn next_switch_hint(at: NaiveTime, name: &str) -> String {
+    crate::tf!(
+        "Next switch at {time}: {name}",
+        "time" => at.format("%H:%M").to_string(),
+        "name" => name
+    )
+}
+
+/// Index of `target` among the library's paths, or None when it is no longer
+/// there. Callers must NOT default to 0: showing (and later saving) the first
+/// library item for a wallpaper that left the library silently rewrites the
+/// schedule.
+pub fn library_position<'a>(
+    paths: impl IntoIterator<Item = Option<&'a std::path::Path>>,
+    target: &std::path::Path,
+) -> Option<usize> {
+    paths.into_iter().position(|p| p == Some(target))
+}
+
 /// Resolve the schedule into (start-time, wallpaper) slots for `now`'s date.
 fn slot_times(
     s: &Schedule,
@@ -376,5 +410,98 @@ mod tests {
             ..daynight()
         };
         assert!(desired(&s, at((2026, 12, 21), (12, 0)), 60).is_none());
+    }
+
+    // ── Issue #32: reporter's schedule + edge cases ──
+
+    fn reporter() -> Schedule {
+        Schedule {
+            night_start: "17:16".into(),
+            ..daynight()
+        }
+    }
+    fn at_s(h: u32, m: u32, sec: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 9, 30)
+            .unwrap()
+            .and_hms_opt(h, m, sec)
+            .unwrap()
+    }
+
+    #[test]
+    fn reporters_case_1715_day_1716_night() {
+        let s = reporter();
+        assert_eq!(path_of(desired(&s, at_s(17, 15, 0), 0)), "/day.mp4");
+        assert_eq!(path_of(desired(&s, at_s(17, 16, 0), 0)), "/night.mp4");
+        assert_eq!(next_change_secs(&s, at_s(17, 15, 0), 0), Some(60));
+        let (t, w) = next_switch(&s, at_s(17, 15, 0), 0).unwrap();
+        assert_eq!(t.format("%H:%M").to_string(), "17:16");
+        assert_eq!(path_of(Some(w)), "/night.mp4");
+    }
+
+    #[test]
+    fn night_before_day_wraps_midnight_both_sides() {
+        // Night 01:00–07:00 is unusual but valid: night_start < day_start.
+        let s = Schedule {
+            day_start: "07:00".into(),
+            night_start: "01:00".into(),
+            ..daynight()
+        };
+        assert_eq!(path_of(desired(&s, at_s(0, 30, 0), 0)), "/day.mp4");
+        assert_eq!(path_of(desired(&s, at_s(1, 0, 0), 0)), "/night.mp4");
+        assert_eq!(path_of(desired(&s, at_s(6, 59, 0), 0)), "/night.mp4");
+        assert_eq!(path_of(desired(&s, at_s(23, 59, 0), 0)), "/day.mp4");
+        // Before the first slot: next change is today's 01:00.
+        assert_eq!(next_change_secs(&s, at_s(0, 30, 0), 0), Some(1800));
+        // After the last slot: next change wraps to tomorrow's 01:00.
+        assert_eq!(next_change_secs(&s, at_s(23, 0, 0), 0), Some(2 * 3600));
+    }
+
+    #[test]
+    fn equal_start_times_are_deterministic() {
+        let s = Schedule {
+            day_start: "08:00".into(),
+            night_start: "08:00".into(),
+            ..daynight()
+        };
+        let a = path_of(desired(&s, at_s(3, 0, 0), 0)).to_string();
+        let b = path_of(desired(&s, at_s(8, 0, 0), 0)).to_string();
+        let c = path_of(desired(&s, at_s(20, 0, 0), 0)).to_string();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert!(next_change_secs(&s, at_s(8, 0, 0), 0).is_some());
+        assert!(next_switch(&s, at_s(8, 0, 0), 0).is_some());
+    }
+
+    #[test]
+    fn invalid_or_empty_times_yield_none() {
+        for bad in ["", "  ", "7", "25:00", "07:60", "ab:cd"] {
+            let mut s = daynight();
+            s.day_start = bad.into();
+            assert!(desired(&s, at_s(12, 0, 0), 0).is_none(), "{bad:?}");
+            assert!(next_change_secs(&s, at_s(12, 0, 0), 0).is_none(), "{bad:?}");
+            assert!(next_switch(&s, at_s(12, 0, 0), 0).is_none(), "{bad:?}");
+            assert!(parse_hhmm(bad).is_none(), "{bad:?}");
+        }
+        let mut s = daynight();
+        s.night_start = String::new();
+        assert!(desired(&s, at_s(12, 0, 0), 0).is_none());
+    }
+
+    #[test]
+    fn library_position_finds_stored_paths_only() {
+        use std::path::Path;
+        let lib = [Some(Path::new("/a.mp4")), None, Some(Path::new("/b.mp4"))];
+        assert_eq!(library_position(lib, Path::new("/b.mp4")), Some(2));
+        // A wallpaper that left the library must NOT fall back to slot 0.
+        assert_eq!(library_position(lib, Path::new("/gone.mp4")), None);
+    }
+
+    #[test]
+    fn next_switch_hint_text() {
+        let t = NaiveTime::from_hms_opt(17, 16, 40).unwrap();
+        assert_eq!(
+            next_switch_hint(t, "海屿你"),
+            "Next switch at 17:16: 海屿你"
+        );
     }
 }
