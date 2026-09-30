@@ -54,6 +54,69 @@ const TRANSPARENT_PNG: [u8; 68] = [
     0xae, 0x42, 0x60, 0x82,
 ];
 
+/// Side of the solid key-colour PNG. Small, but not 1x1: some wallpaper
+/// pipelines refuse degenerate images, and DDE scales it to the screen anyway.
+const KEY_PNG_SIDE: u32 = 64;
+
+/// An opaque RGBA PNG of one colour, hand-encoded (stored deflate, no extra
+/// dependency: the PNG must be *lossless* so the key survives byte for byte).
+fn solid_png(side: u32, rgb: [u8; 3]) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    }
+    // Filter byte 0 + `side` RGBA pixels per row.
+    let mut raw = Vec::new();
+    for _ in 0..side {
+        raw.extend_from_slice(&[0]);
+        for _ in 0..side {
+            raw.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 0xff]);
+        }
+    }
+    // zlib: header, stored blocks (<= 65535 bytes each), Adler-32.
+    let mut z = vec![0x78, 0x01];
+    let mut blocks = raw.chunks(65535).peekable();
+    while let Some(c) = blocks.next() {
+        z.push(u8::from(blocks.peek().is_none()));
+        z.extend_from_slice(&(c.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(c.len() as u16)).to_le_bytes());
+        z.extend_from_slice(c);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&side.to_be_bytes());
+    ihdr.extend_from_slice(&side.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &z);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
 /// (dest, object path, interface) for DDE's session Appearance service.
 /// Deepin 25 first, then the legacy pre-25 names.
 const SERVICES: [(&str, &str, &str); 2] = [
@@ -85,6 +148,22 @@ pub enum Mode {
     /// see `caja_mirror`. Icons stay visible and every click still reaches
     /// Caja.
     CajaMirror,
+    /// Deepin, opt-in (`dde_mode = "mirror"`): the same trick as
+    /// [`Mode::CajaMirror`] against dde-shell's 32-bit desktop window, with the
+    /// DDE wallpaper set to the key colour over DBus. Experimental.
+    DdeMirror,
+}
+
+impl Mode {
+    /// Which desktop's icons the mirror copies in this mode, if it is a mirror
+    /// mode at all.
+    pub fn mirror_desktop(self) -> Option<super::caja_mirror::Desktop> {
+        match self {
+            Mode::CajaMirror => Some(super::caja_mirror::Desktop::Caja),
+            Mode::DdeMirror => Some(super::caja_mirror::Desktop::Dde),
+            _ => None,
+        }
+    }
 }
 
 /// The user's original DDE wallpaper per monitor, persisted so a crash or a
@@ -113,6 +192,19 @@ fn transparent_uri() -> Option<String> {
     let path = dir.join("dde-transparent.png");
     if std::fs::read(&path).ok().as_deref() != Some(&TRANSPARENT_PNG[..]) {
         std::fs::write(&path, TRANSPARENT_PNG).ok()?;
+    }
+    Some(format!("file://{}", path.display()))
+}
+
+/// Write the solid key-colour PNG beside the transparent one and return its
+/// file:// URI.
+fn key_uri() -> Option<String> {
+    let dir = state_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("dde-key.png");
+    let png = solid_png(KEY_PNG_SIDE, super::caja_mirror::KEY);
+    if std::fs::read(&path).ok().as_deref() != Some(&png[..]) {
+        std::fs::write(&path, &png).ok()?;
     }
     Some(format!("file://{}", path.display()))
 }
@@ -171,29 +263,78 @@ fn set_background(monitor: &str, uri: &str) -> bool {
 /// Persist the original wallpapers. Never overwrites an existing file: a
 /// leftover from a crashed run holds the true original, and the "current"
 /// wallpaper now may already be our transparent one.
-fn save_original(monitors: &[String], transparent: &str) {
+///
+/// `ours` are the URIs Fresco itself installs (transparent / key PNG): a
+/// monitor currently showing one of those is not the user's wallpaper.
+/// Returns true when a state file exists afterwards, i.e. the real wallpaper is
+/// on disk and [`restore`] can put it back.
+fn save_original(monitors: &[String], ours: &[&str]) -> bool {
     let path = saved_path();
     if path.exists() {
-        return;
+        return true;
     }
     let mut saved = SavedWallpapers::default();
     for m in monitors {
         if let Some(uri) = get_background(m) {
-            if uri != transparent {
+            if !ours.contains(&uri.as_str()) {
                 saved.monitors.insert(m.clone(), uri);
             }
         }
     }
     if saved.monitors.is_empty() {
-        return;
+        return false;
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
     match serde_json::to_vec_pretty(&saved).map(|b| std::fs::write(&path, b)) {
-        Ok(Ok(())) => log::info!("DDE: saved original wallpaper(s) to {}", path.display()),
-        _ => log::warn!("DDE: could not persist original wallpaper state"),
+        Ok(Ok(())) => {
+            log::info!("DDE: saved original wallpaper(s) to {}", path.display());
+            true
+        }
+        _ => {
+            log::warn!("DDE: could not persist original wallpaper state");
+            false
+        }
     }
+}
+
+/// Set every monitor's DDE wallpaper to the solid key-colour PNG for the icon
+/// mirror ([`super::caja_mirror::Desktop::Dde`]). The user's real wallpaper is
+/// saved first and [`restore`] puts it back.
+///
+/// A state file left by the transparent mode or a crashed run is kept as is:
+/// it already holds the real wallpaper (`save_original` never records our own
+/// PNGs and never overwrites), so whatever DDE shows *now* (transparent PNG,
+/// key PNG, or the real one) is irrelevant. When nothing can be saved we
+/// refuse to touch the wallpaper at all, since it could not be given back.
+///
+/// Returns the key PNG's URI, for the attach diagnostics.
+pub(super) fn apply_key_background(monitors: &[String]) -> Option<String> {
+    let (Some(key), Some(transparent)) = (key_uri(), transparent_uri()) else {
+        log::warn!("DDE: cannot write the key-colour PNG to the state dir");
+        return None;
+    };
+    if monitors.is_empty() || !save_original(monitors, &[&key, &transparent]) {
+        log::warn!(
+            "DDE: could not read the current wallpaper, so it could not be restored; \
+             leaving it alone"
+        );
+        return None;
+    }
+    for m in monitors {
+        if !set_background(m, &key) {
+            log::warn!("DDE: SetMonitorBackground failed on {m}");
+            restore();
+            return None;
+        }
+    }
+    let readback = monitors.first().and_then(|m| get_background(m));
+    log::info!(
+        "DDE: key-colour wallpaper {key} set; DDE reports {readback:?} (matches: {})",
+        readback.as_deref() == Some(key.as_str())
+    );
+    Some(key)
 }
 
 /// The strategy chosen for this rebuild, before we try to enact it.
@@ -203,6 +344,8 @@ pub enum Strategy {
     Transparent,
     /// Raise our windows above dde-shell's desktop (icons may be hidden).
     Restack,
+    /// Restack, then copy dde-shell's icons over the video (experimental).
+    Mirror,
 }
 
 impl Strategy {
@@ -212,7 +355,7 @@ impl Strategy {
     fn window_kind(self) -> WindowKind {
         match self {
             Strategy::Transparent => WindowKind::Desktop,
-            Strategy::Restack => WindowKind::DdeRaised,
+            Strategy::Restack | Strategy::Mirror => WindowKind::DdeRaised,
         }
     }
 }
@@ -223,6 +366,7 @@ fn parse_mode(s: &str) -> Option<DdeMode> {
         "auto" => Some(DdeMode::Auto),
         "transparent" | "dbus" => Some(DdeMode::Transparent),
         "restack" => Some(DdeMode::Restack),
+        "mirror" => Some(DdeMode::Mirror),
         _ => None,
     }
 }
@@ -230,18 +374,16 @@ fn parse_mode(s: &str) -> Option<DdeMode> {
 /// The effective preference: `FRESCO_DDE_MODE` env var wins over config.
 fn effective_pref(config_pref: DdeMode) -> DdeMode {
     match std::env::var("FRESCO_DDE_MODE") {
-        Ok(v) => {
-            match parse_mode(&v) {
-                Some(m) => {
-                    log::info!("DDE: FRESCO_DDE_MODE={v} overrides config (mode {m:?})");
-                    m
-                }
-                None => {
-                    log::warn!("DDE: ignoring invalid FRESCO_DDE_MODE={v:?} (want auto|transparent|restack)");
-                    config_pref
-                }
+        Ok(v) => match parse_mode(&v) {
+            Some(m) => {
+                log::info!("DDE: FRESCO_DDE_MODE={v} overrides config (mode {m:?})");
+                m
             }
-        }
+            None => {
+                log::warn!("DDE: ignoring invalid FRESCO_DDE_MODE={v:?} (want auto|transparent|restack|mirror)");
+                config_pref
+            }
+        },
         Err(_) => config_pref,
     }
 }
@@ -257,6 +399,15 @@ fn select_strategy(pref: DdeMode, desktop_window_found: bool) -> Strategy {
     match pref {
         DdeMode::Transparent => Strategy::Transparent,
         DdeMode::Restack => Strategy::Restack,
+        // The mirror needs dde-shell's window to copy from; without it there is
+        // nothing to mirror and the plain transparency path is the right one.
+        DdeMode::Mirror => {
+            if desktop_window_found {
+                Strategy::Mirror
+            } else {
+                Strategy::Transparent
+            }
+        }
         DdeMode::Auto => {
             if desktop_window_found {
                 Strategy::Restack
@@ -343,6 +494,31 @@ pub fn apply<C: Connection>(
     let strategy = select_strategy(pref, depth.is_some());
     log::info!("DDE: preference {pref:?}, chosen strategy {strategy:?}");
 
+    if strategy == Strategy::Mirror {
+        // The background is NOT touched here: `apply` runs on every rebuild,
+        // and the daemon (`sync_caja_mirror`) sets the key-colour wallpaper
+        // once, when it starts the mirror. That is also where any failure
+        // (no Composite/Damage, attach fails, the key cannot be set) turns
+        // into a restore + Restack, with no retry.
+        if !restack_above_dde_desktop(conn, windows) {
+            log::warn!("DDE: raise failed; wallpaper may be covered");
+            return Mode::Inactive;
+        }
+        return if has_mirror_extensions(conn) {
+            log::warn!(
+                "DDE: experimental icon mirror on (dde_mode = \"mirror\"): desktop icons are \
+                 copied over the wallpaper; set dde_mode = \"auto\" to turn it off"
+            );
+            Mode::DdeMirror
+        } else {
+            log::warn!(
+                "DDE: the X server has no Composite/Damage; icon mirror unavailable, \
+                 using restack"
+            );
+            Mode::Restack
+        };
+    }
+
     if strategy == Strategy::Restack {
         // Transparency is not in play: if a previous run left the user's
         // desktop on our transparent PNG, put their real wallpaper back.
@@ -362,7 +538,7 @@ pub fn apply<C: Connection>(
 
     // Primary: DBus transparency.
     if let Some(transparent) = transparent_uri() {
-        save_original(monitors, &transparent);
+        save_original(monitors, &[&transparent]);
         let mut ok = !monitors.is_empty();
         for m in monitors {
             if !set_background(m, &transparent) {
@@ -391,6 +567,21 @@ pub fn apply<C: Connection>(
     }
 }
 
+/// Whether the server has the extensions the icon mirror is built on.
+fn has_mirror_extensions<C: Connection>(conn: &C) -> bool {
+    [
+        x11rb::protocol::composite::X11_EXTENSION_NAME,
+        x11rb::protocol::damage::X11_EXTENSION_NAME,
+    ]
+    .iter()
+    .all(|name| {
+        x11rb::connection::RequestConnection::extension_information(conn, name)
+            .ok()
+            .flatten()
+            .is_some()
+    })
+}
+
 /// MATE (issue #18): raise the wallpaper above Caja's desktop window and push
 /// that window down. Deepin's DBus transparency has no MATE counterpart.
 ///
@@ -409,18 +600,7 @@ fn apply_mate<C: Connection>(conn: &C, atoms: &Atoms, root: Window, windows: &[W
         log::warn!("MATE: raise failed; wallpaper may be covered by Caja's desktop");
         return Mode::Inactive;
     }
-    let mirrorable = [
-        x11rb::protocol::composite::X11_EXTENSION_NAME,
-        x11rb::protocol::damage::X11_EXTENSION_NAME,
-    ]
-    .iter()
-    .all(|name| {
-        x11rb::connection::RequestConnection::extension_information(conn, name)
-            .ok()
-            .flatten()
-            .is_some()
-    });
-    if mirrorable {
+    if has_mirror_extensions(conn) {
         Mode::CajaMirror
     } else {
         log::warn!(
@@ -826,6 +1006,14 @@ fn find_dde_desktop_window<C: Connection>(conn: &C, atoms: &Atoms, root: Window)
         .next()
 }
 
+/// Whether `value` (a WM_CLASS) is the desktop window of `desktop`.
+pub(super) fn wm_class_is_desktop(desktop: super::caja_mirror::Desktop, value: &[u8]) -> bool {
+    match desktop {
+        super::caja_mirror::Desktop::Caja => wm_class_is_caja_desktop(value),
+        super::caja_mirror::Desktop::Dde => wm_class_is_dde_desktop(value),
+    }
+}
+
 /// Caja's desktop window on MATE. Read off a Linux Mint 22 MATE desktop: the
 /// property is `"desktop_window\0Caja\0"`. Matched part by part, exactly —
 /// Caja's ordinary file-manager windows share the class but never the
@@ -838,7 +1026,7 @@ pub(super) fn wm_class_is_caja_desktop(value: &[u8]) -> bool {
 }
 
 /// WM_CLASS is two NUL-terminated strings: instance, class.
-fn wm_class_is_dde_desktop(value: &[u8]) -> bool {
+pub(super) fn wm_class_is_dde_desktop(value: &[u8]) -> bool {
     // Measured on Deepin 25: the instance is one slash-joined token, so the
     // whole property reads "dde-shell/desktop\0org.deepin.dde-shell\0" — per
     // part equality never matches. Substring matching covers that, the older
@@ -1072,6 +1260,50 @@ mod tests {
         assert!(!dde_above_in_stack(&[10, 20], &[], &[10]));
         assert!(!dde_above_in_stack(&[10, 20], &[20], &[]));
         assert!(!dde_above_in_stack(&[10, 20], &[99], &[10]));
+    }
+
+    #[test]
+    fn mirror_mode_parsing_and_selection() {
+        assert_eq!(parse_mode("mirror"), Some(DdeMode::Mirror));
+        assert_eq!(parse_mode(" Mirror\n"), Some(DdeMode::Mirror));
+        // Opt-in only: Auto never picks the mirror.
+        assert_eq!(select_strategy(DdeMode::Auto, true), Strategy::Restack);
+        assert_eq!(select_strategy(DdeMode::Mirror, true), Strategy::Mirror);
+        // No dde-shell window to copy from: plain transparency.
+        assert_eq!(
+            select_strategy(DdeMode::Mirror, false),
+            Strategy::Transparent
+        );
+        assert_eq!(Strategy::Mirror.window_kind(), WindowKind::DdeRaised);
+    }
+
+    #[test]
+    fn env_override_selects_mirror() {
+        // Only this test touches FRESCO_DDE_MODE.
+        std::env::set_var("FRESCO_DDE_MODE", "mirror");
+        assert_eq!(effective_pref(DdeMode::Auto), DdeMode::Mirror);
+        std::env::set_var("FRESCO_DDE_MODE", "bogus");
+        assert_eq!(effective_pref(DdeMode::Restack), DdeMode::Restack);
+        std::env::remove_var("FRESCO_DDE_MODE");
+        assert_eq!(effective_pref(DdeMode::Mirror), DdeMode::Mirror);
+    }
+
+    #[test]
+    fn mirror_modes_map_to_desktops() {
+        use super::super::caja_mirror::Desktop;
+        assert_eq!(Mode::CajaMirror.mirror_desktop(), Some(Desktop::Caja));
+        assert_eq!(Mode::DdeMirror.mirror_desktop(), Some(Desktop::Dde));
+        assert_eq!(Mode::Restack.mirror_desktop(), None);
+    }
+
+    #[test]
+    fn key_png_decodes_to_the_key_colour() {
+        let png = solid_png(KEY_PNG_SIDE, super::super::caja_mirror::KEY);
+        let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(img.dimensions(), (KEY_PNG_SIDE, KEY_PNG_SIDE));
+        assert!(img.pixels().all(|p| p.0 == [1, 1, 1, 255]));
     }
 
     #[test]

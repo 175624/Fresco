@@ -124,7 +124,9 @@ extended-description = """\
 Fresco sets videos, GIFs, images, slideshows, and video playlists as your \
 desktop wallpaper. Pick media in a simple app, click Set, close the app — \
 the wallpaper keeps playing and restores on login. Hardware-accelerated \
-decoding keeps CPU usage near zero without degrading quality."""
+decoding keeps CPU usage near zero without degrading quality.
+
+一个好用、稳定的动态壁纸播放与管理软件。支持视频、GIF、图片和幻灯片壁纸，硬件加速播放，壁纸库分类管理。"""
 assets = [
     ["target/release/fresco", "usr/bin/", "755"],
     ["target/release/frescod", "usr/bin/", "755"],

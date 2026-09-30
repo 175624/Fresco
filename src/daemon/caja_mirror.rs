@@ -58,6 +58,20 @@
 //! and the X server undoes the redirect, the damage object and the child
 //! windows by itself — Caja renders normally again. Only the key-colour
 //! background is left, and [`restore_background`] runs at the next start.
+//!
+//! # Deepin (issue #33), experimental
+//!
+//! The same mirror also runs against Deepin 25's dde-shell desktop window
+//! ([`Desktop::Dde`], opt-in via `dde_mode = "mirror"`). Three things differ:
+//!
+//! * the window is 32-bit ARGB, not the screen's 24-bit, so the icon windows
+//!   are created with that window's visual (a `CopyArea` needs source and
+//!   destination of one depth) and the key test ignores alpha;
+//! * the key colour is a solid PNG applied with DDE's Appearance DBus service
+//!   (`dde::apply_key_background`), and DDE's wallpaper cache may re-encode or
+//!   rescale it, so a channel within [`DDE_TOLERANCE`] of the key counts;
+//! * KWin, not Marco, is the window manager — whether it honours lowering the
+//!   DDE window after a click is only knowable on real hardware.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -65,7 +79,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use x11rb::connection::{Connection, RequestConnection};
@@ -82,7 +96,34 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, NONE};
 /// anti-aliased edges it leaves on icons and labels read as a shadow.
 pub const KEY_HEX: &str = "#010101";
 /// [`KEY_HEX`] as bytes.
-const KEY: [u8; 3] = [1, 1, 1];
+pub(super) const KEY: [u8; 3] = [1, 1, 1];
+/// Per-channel slack when matching the key on Deepin, where the wallpaper goes
+/// through DDE's image cache and may come back re-encoded or scaled.
+const DDE_TOLERANCE: u8 = 2;
+
+/// Whose desktop window is being mirrored. Chooses the window matcher, how the
+/// key-colour background is set, and how strictly a pixel counts as the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Desktop {
+    /// MATE: Caja's 24-bit desktop window, background via gsettings.
+    Caja,
+    /// Deepin: dde-shell's 32-bit ARGB desktop window, background via DBus.
+    Dde,
+}
+
+impl Desktop {
+    fn label(self) -> &'static str {
+        match self {
+            Desktop::Caja => "MATE",
+            Desktop::Dde => "DDE",
+        }
+    }
+
+    /// Whether `wm_class` (the raw WM_CLASS property) is this desktop's window.
+    fn matches(self, wm_class: &[u8]) -> bool {
+        super::dde::wm_class_is_desktop(self, wm_class)
+    }
+}
 
 /// Rows read per `GetImage`, so a full refresh of a 4K desktop is a series of
 /// modest replies rather than one 33 MB one.
@@ -124,12 +165,13 @@ pub struct Mirror {
     wake: Window,
     failed: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    desktop: Desktop,
 }
 
 impl Mirror {
     /// Start the thread. Fails when it cannot connect or when the server lacks
     /// Composite, Damage or XFixes — the caller then keeps the restack mode.
-    pub fn start() -> Result<Mirror> {
+    pub fn start(desktop: Desktop) -> Result<Mirror> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<Window, String>>();
         let failed = Arc::new(AtomicBool::new(false));
@@ -137,8 +179,8 @@ impl Mirror {
         let thread = std::thread::Builder::new()
             .name("caja-mirror".into())
             .spawn(move || {
-                if let Err(e) = run(rx, &ready_tx) {
-                    log::warn!("MATE: icon mirror stopped: {e:#}");
+                if let Err(e) = run(desktop, rx, &ready_tx) {
+                    log::warn!("{}: icon mirror stopped: {e:#}", desktop.label());
                     thread_failed.store(true, Ordering::SeqCst);
                     let _ = ready_tx.send(Err(format!("{e:#}")));
                 }
@@ -154,7 +196,13 @@ impl Mirror {
             wake,
             failed,
             thread: Some(thread),
+            desktop,
         })
+    }
+
+    /// Which desktop this mirror was started for.
+    pub fn desktop(&self) -> Desktop {
+        self.desktop
     }
 
     /// Hand the thread the current wallpaper windows. Children on windows that
@@ -194,6 +242,19 @@ struct Caja {
     damage: damage::Damage,
     /// Where the window's origin is on the root, and its size.
     rect: Rectangle,
+    /// Diagnostics: when the second, later pixel sample is due (Deepin only —
+    /// the DBus wallpaper change lands a moment after we attach).
+    late_sample: Option<Instant>,
+}
+
+/// How icon windows are created when the mirrored window is not the screen's
+/// depth: same depth and visual as the source, since `CopyArea` needs both
+/// drawables to match. `None` in [`State`] means "copy from the parent".
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ChildFmt {
+    depth: u8,
+    visual: Visualid,
+    colormap: Colormap,
 }
 
 /// One icon window, a child of one wallpaper window.
@@ -207,6 +268,7 @@ struct Child {
 }
 
 struct State {
+    desktop: Desktop,
     conn: RustConnection,
     root: Window,
     root_depth: u8,
@@ -215,9 +277,12 @@ struct State {
     msb_first: bool,
     caja: Option<Caja>,
     children: Vec<Child>,
+    /// The wallpaper windows the daemon last asked us to cover.
+    parents: Vec<Parent>,
+    child_fmt: Option<ChildFmt>,
 }
 
-fn run(rx: Receiver<Cmd>, ready: &Sender<Result<Window, String>>) -> Result<()> {
+fn run(desktop: Desktop, rx: Receiver<Cmd>, ready: &Sender<Result<Window, String>>) -> Result<()> {
     let (conn, screen_num) = x11rb::connect(None).context("connecting to X11")?;
     let screen = conn.setup().roots[screen_num].clone();
     for name in [
@@ -261,6 +326,7 @@ fn run(rx: Receiver<Cmd>, ready: &Sender<Result<Window, String>>) -> Result<()> 
     let _ = ready.send(Ok(wake));
 
     let mut st = State {
+        desktop,
         conn,
         root: screen.root,
         root_depth: screen.root_depth,
@@ -269,6 +335,8 @@ fn run(rx: Receiver<Cmd>, ready: &Sender<Result<Window, String>>) -> Result<()> 
         msb_first,
         caja: None,
         children: Vec::new(),
+        parents: Vec::new(),
+        child_fmt: None,
     };
 
     loop {
@@ -287,8 +355,20 @@ fn run(rx: Receiver<Cmd>, ready: &Sender<Result<Window, String>>) -> Result<()> 
 
         let mut dirty: Option<Rectangle> = None;
         let mut restack = false;
-        let ev = st.conn.wait_for_event()?;
-        st.handle(ev, &mut dirty, &mut restack)?;
+        // While a late diagnostic sample is pending, poll instead of blocking
+        // so it fires on time even if Caja/DDE stays quiet.
+        let first = if st.caja.as_ref().is_some_and(|c| c.late_sample.is_some()) {
+            let ev = st.conn.poll_for_event()?;
+            if ev.is_none() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            ev
+        } else {
+            Some(st.conn.wait_for_event()?)
+        };
+        if let Some(ev) = first {
+            st.handle(ev, &mut dirty, &mut restack)?;
+        }
         while let Some(ev) = st.conn.poll_for_event()? {
             st.handle(ev, &mut dirty, &mut restack)?;
         }
@@ -298,6 +378,7 @@ fn run(rx: Receiver<Cmd>, ready: &Sender<Result<Window, String>>) -> Result<()> 
         if restack {
             st.raise_children()?;
         }
+        st.late_diagnostics();
     }
 }
 
@@ -312,7 +393,7 @@ impl State {
         let Some(geom) = conn.get_geometry(window)?.reply().ok() else {
             return Ok(());
         };
-        if geom.depth != self.root_depth {
+        if self.desktop == Desktop::Caja && geom.depth != self.root_depth {
             bail!(
                 "Caja's desktop window is {}-bit on a {}-bit screen; it cannot be copied \
                  onto the wallpaper",
@@ -320,6 +401,7 @@ impl State {
                 self.root_depth
             );
         }
+        let visual = conn.get_window_attributes(window)?.reply()?.visual;
         let bpp = conn
             .setup()
             .pixmap_formats
@@ -336,6 +418,24 @@ impl State {
         else {
             return Ok(());
         };
+        // Deepin's 32-bit window: the icon windows must share its depth and
+        // visual. A 24-bit one (older DDE) copies from the parent as usual.
+        let fmt = if geom.depth == self.root_depth {
+            None
+        } else {
+            let colormap = conn.generate_id()?;
+            conn.create_colormap(ColormapAlloc::NONE, colormap, self.root, visual)?;
+            Some(ChildFmt {
+                depth: geom.depth,
+                visual,
+                colormap,
+            })
+        };
+        if fmt.map(|f| (f.depth, f.visual)) != self.child_fmt.map(|f| (f.depth, f.visual)) {
+            self.drop_children();
+        }
+        self.child_fmt = fmt;
+        let conn = &self.conn;
         conn.change_window_attributes(
             window,
             &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
@@ -359,9 +459,137 @@ impl State {
                 width: geom.width,
                 height: geom.height,
             },
+            late_sample: (self.desktop == Desktop::Dde).then(|| Instant::now() + LATE_SAMPLE),
         });
-        log::info!("MATE: mirroring Caja's desktop icons over the wallpaper");
+        log::info!(
+            "{}: mirroring the desktop icons over the wallpaper",
+            self.desktop.label()
+        );
+        if self.desktop == Desktop::Dde {
+            // Children exist only once the source's depth is known.
+            self.sync_children()?;
+            self.log_diagnostics("attach", window, &geom, visual);
+        }
         Ok(())
+    }
+
+    /// One info line per sample, so a remote tester's frescod.log says what
+    /// DDE's window really looks like: id, depth, visual class, geometry, the
+    /// alpha range and how much of it already reads as the key colour.
+    fn log_diagnostics(
+        &self,
+        when: &str,
+        window: Window,
+        geom: &GetGeometryReply,
+        visual: Visualid,
+    ) {
+        let class = self
+            .conn
+            .setup()
+            .roots
+            .iter()
+            .flat_map(|r| r.allowed_depths.iter())
+            .flat_map(|d| d.visuals.iter())
+            .find(|v| v.visual_id == visual)
+            .map(|v| format!("{:?}", v.class))
+            .unwrap_or_else(|| "unknown".into());
+        let sample = self.sample_pixmap();
+        match sample {
+            Some(s) => log::info!(
+                "DDE mirror diagnostics ({when}): window {window:#x} depth {} visual {visual:#x} \
+                 class {class} geometry {}x{}{:+}{:+}; sampled {} px: alpha min {} max {}, \
+                 key-colour fraction {:.3}",
+                geom.depth,
+                geom.width,
+                geom.height,
+                geom.x,
+                geom.y,
+                s.count,
+                s.alpha_min,
+                s.alpha_max,
+                s.key_fraction
+            ),
+            None => log::info!(
+                "DDE mirror diagnostics ({when}): window {window:#x} depth {} visual {visual:#x} \
+                 class {class} geometry {}x{}{:+}{:+}; the window's pixels could not be read",
+                geom.depth,
+                geom.width,
+                geom.height,
+                geom.x,
+                geom.y
+            ),
+        }
+    }
+
+    /// The second diagnostic line, a few seconds after attach: by then DDE has
+    /// repainted with the key-colour wallpaper, so the key fraction says
+    /// whether the background change reached the window (and survived its
+    /// image cache).
+    fn late_diagnostics(&mut self) {
+        let due = match &self.caja {
+            Some(c) => c.late_sample.is_some_and(|t| Instant::now() >= t),
+            None => false,
+        };
+        if !due {
+            return;
+        }
+        let Some(caja) = &mut self.caja else { return };
+        caja.late_sample = None;
+        let window = caja.window;
+        let Some(geom) = self
+            .conn
+            .get_geometry(window)
+            .ok()
+            .and_then(|c| c.reply().ok())
+        else {
+            return;
+        };
+        let visual = self
+            .conn
+            .get_window_attributes(window)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|a| a.visual)
+            .unwrap_or(0);
+        self.log_diagnostics("after repaint", window, &geom, visual);
+    }
+
+    /// Sample the redirected window: 16 evenly spaced rows, every 4th pixel.
+    fn sample_pixmap(&self) -> Option<Sample> {
+        let caja = self.caja.as_ref()?;
+        let (w, h) = (caja.rect.width, caja.rect.height);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let mut s = Sample {
+            count: 0,
+            alpha_min: 255,
+            alpha_max: 0,
+            key_fraction: 0.0,
+        };
+        let mut keys = 0u32;
+        for i in 0..16u32 {
+            let y = (u32::from(h) * i / 16).min(u32::from(h) - 1) as i16;
+            let img = self
+                .conn
+                .get_image(ImageFormat::Z_PIXMAP, caja.pixmap, 0, y, w, 1, !0)
+                .ok()?
+                .reply()
+                .ok()?;
+            for px in img.data.chunks_exact(4).step_by(4) {
+                let a = if self.msb_first { px[0] } else { px[3] };
+                s.alpha_min = s.alpha_min.min(a);
+                s.alpha_max = s.alpha_max.max(a);
+                s.count += 1;
+                if is_key(px, self.msb_first, self.desktop) {
+                    keys += 1;
+                }
+            }
+        }
+        if s.count > 0 {
+            s.key_fraction = keys as f32 / s.count as f32;
+        }
+        Some(s)
     }
 
     fn find_caja(&self) -> Option<Window> {
@@ -371,7 +599,7 @@ impl State {
                 .get_property(false, w, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
                 .ok()
                 .and_then(|c| c.reply().ok())
-                .is_some_and(|p| super::dde::wm_class_is_caja_desktop(&p.value))
+                .is_some_and(|p| self.desktop.matches(&p.value))
         })
     }
 
@@ -396,12 +624,34 @@ impl State {
                 caja.window,
                 &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
             )?;
-            log::debug!("MATE: Caja came up over the wallpaper; lowered it");
+            log::debug!(
+                "{}: the desktop came up over the wallpaper; lowered it",
+                self.desktop.label()
+            );
         }
         Ok(())
     }
 
+    fn drop_children(&mut self) {
+        for c in self.children.drain(..) {
+            let _ = self.conn.destroy_window(c.window);
+            let _ = self.conn.free_gc(c.gc);
+        }
+    }
+
     fn set_parents(&mut self, parents: Vec<Parent>) -> Result<()> {
+        self.parents = parents;
+        self.sync_children()
+    }
+
+    /// Bring the icon windows in line with `self.parents`. On Deepin nothing is
+    /// created before the source window is attached, because the children need
+    /// its depth and visual.
+    fn sync_children(&mut self) -> Result<()> {
+        if self.desktop == Desktop::Dde && self.caja.is_none() {
+            return Ok(());
+        }
+        let parents = self.parents.clone();
         // Drop children of windows that are gone. Destroying a parent already
         // took its child with it, so a BadWindow here is expected and ignored.
         let mut kept = Vec::new();
@@ -437,8 +687,21 @@ impl State {
     fn create_child(&self, p: Parent) -> Result<Child> {
         let conn = &self.conn;
         let window = conn.generate_id()?;
+        // No background: the server must not clear it to anything before the
+        // first copy lands.
+        let mut aux =
+            CreateWindowAux::new().event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY);
+        let (depth, visual) = match self.child_fmt {
+            Some(f) => {
+                // A window whose depth differs from its parent's must name its
+                // own colormap and border pixel, or CreateWindow is BadMatch.
+                aux = aux.colormap(f.colormap).border_pixel(0);
+                (f.depth, f.visual)
+            }
+            None => (COPY_DEPTH_FROM_PARENT, 0),
+        };
         conn.create_window(
-            COPY_DEPTH_FROM_PARENT,
+            depth,
             window,
             p.window,
             0,
@@ -447,10 +710,8 @@ impl State {
             p.height,
             0,
             WindowClass::INPUT_OUTPUT,
-            0,
-            // No background: the server must not clear it to anything before
-            // the first copy lands.
-            &CreateWindowAux::new().event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
+            visual,
+            &aux,
         )?;
         // Clicks fall through to Caja; nothing is visible until the first copy.
         conn.shape_rectangles(
@@ -563,7 +824,10 @@ impl State {
             }
             Event::DestroyNotify(e) => {
                 if self.caja.as_ref().is_some_and(|c| c.window == e.window) {
-                    log::info!("MATE: Caja's desktop window went away; waiting for it to return");
+                    log::info!(
+                        "{}: the desktop window went away; waiting for it to return",
+                        self.desktop.label()
+                    );
                     self.caja = None;
                     for c in &mut self.children {
                         c.mask.iter_mut().for_each(|m| *m = false);
@@ -597,6 +861,7 @@ impl State {
             return Ok(());
         };
         let conn = &self.conn;
+        let desktop = self.desktop;
         for c in &mut self.children {
             let Some(part) = intersect(area, c.parent.rect()) else {
                 continue;
@@ -630,7 +895,7 @@ impl State {
                     let line = img.data.get(dy * stride..(dy + 1) * stride).unwrap_or(&[]);
                     for (dx, px) in line.chunks_exact(4).enumerate() {
                         if let Some(m) = c.mask.get_mut(py * pw + px0 + dx) {
-                            *m = !is_key(px, self.msb_first);
+                            *m = !is_key(px, self.msb_first, desktop);
                         }
                     }
                 }
@@ -663,14 +928,37 @@ impl State {
     }
 }
 
+/// Diagnostic summary of a pixel sample.
+struct Sample {
+    count: u32,
+    alpha_min: u8,
+    alpha_max: u8,
+    key_fraction: f32,
+}
+
+/// How long after attaching the second diagnostic sample is taken.
+const LATE_SAMPLE: Duration = Duration::from_secs(3);
+
 /// Whether a 32-bit ZPixmap pixel is the key colour, for either byte order.
-fn is_key(px: &[u8], msb_first: bool) -> bool {
+///
+/// Caja: the three colour bytes must equal the key exactly (the pad byte is
+/// ignored). Deepin: alpha is ignored and each channel may be off by
+/// [`DDE_TOLERANCE`] — which also means near-black (0..=3) counts as key there,
+/// so a pure-black label shadow on Deepin is dropped; the icons themselves and
+/// their white labels are unaffected.
+fn is_key(px: &[u8], msb_first: bool, desktop: Desktop) -> bool {
     let rgb = if msb_first {
         [px[1], px[2], px[3]]
     } else {
         [px[2], px[1], px[0]]
     };
-    rgb == KEY
+    match desktop {
+        Desktop::Caja => rgb == KEY,
+        Desktop::Dde => rgb
+            .iter()
+            .zip(KEY)
+            .all(|(&c, k)| c.abs_diff(k) <= DDE_TOLERANCE),
+    }
 }
 
 /// The visible pixels of a `width × height` mask as Shape rectangles: one per
@@ -792,9 +1080,35 @@ pub fn key_active() -> bool {
     KEY_ACTIVE.load(Ordering::SeqCst)
 }
 
+/// Switch `desktop`'s background to the key colour, saving the user's own
+/// first. False when the background cannot be driven (or restored) at all.
+/// `monitors` are the connector names, used by Deepin's per-monitor service.
+pub fn apply_key(desktop: Desktop, monitors: &[String]) -> bool {
+    match desktop {
+        Desktop::Caja => apply_key_mate(),
+        Desktop::Dde => {
+            if super::dde::apply_key_background(monitors).is_none() {
+                return false;
+            }
+            KEY_ACTIVE.store(true, Ordering::SeqCst);
+            true
+        }
+    }
+}
+
+/// Undo [`apply_key`] for `desktop`. Idempotent; a no-op when nothing was saved.
+pub fn restore_key_background(desktop: Desktop) {
+    match desktop {
+        Desktop::Caja => restore_background(),
+        Desktop::Dde => {
+            KEY_ACTIVE.store(false, Ordering::SeqCst);
+            super::dde::restore();
+        }
+    }
+}
+
 /// Save the user's MATE background once and switch Caja to the key colour.
-/// False when the MATE background settings cannot be driven at all.
-pub fn apply_key() -> bool {
+fn apply_key_mate() -> bool {
     let sf = bg_state_file();
     if !sf.exists() {
         let mut saved = String::new();
@@ -866,14 +1180,47 @@ mod tests {
 
     #[test]
     fn the_key_is_matched_in_either_byte_order() {
+        let c = Desktop::Caja;
         // LSB-first ZPixmap is B, G, R, pad; MSB-first is pad, R, G, B.
-        assert!(is_key(&[1, 1, 1, 0], false));
-        assert!(is_key(&[0, 1, 1, 1], true));
-        assert!(!is_key(&[1, 1, 2, 0], false));
+        assert!(is_key(&[1, 1, 1, 0], false, c));
+        assert!(is_key(&[0, 1, 1, 1], true, c));
+        assert!(!is_key(&[1, 1, 2, 0], false, c));
         // Pure black is the label shadow, not the key: it must stay visible.
-        assert!(!is_key(&[0, 0, 0, 0], false));
+        assert!(!is_key(&[0, 0, 0, 0], false, c));
+        // Caja ignores the pad byte only, exactly as before.
+        assert!(is_key(&[1, 1, 1, 255], false, c));
         assert_eq!(KEY_HEX, "#010101");
         assert_eq!(BG_KEYS[2].1, "'#010101'");
+    }
+
+    #[test]
+    fn deepin_key_ignores_alpha_and_tolerates_reencoding() {
+        let d = Desktop::Dde;
+        // LSB-first B, G, R, A: any alpha.
+        for a in [0u8, 128, 255] {
+            assert!(is_key(&[1, 1, 1, a], false, d));
+            assert!(is_key(&[a, 1, 1, 1], true, d));
+        }
+        // Off by up to 2 per channel is still the key; 3 away is not.
+        assert!(is_key(&[3, 3, 3, 255], false, d));
+        assert!(is_key(&[0, 2, 1, 255], false, d));
+        assert!(!is_key(&[4, 1, 1, 255], false, d));
+        assert!(!is_key(&[1, 1, 4, 255], false, d));
+        // Real icon and wallpaper pixels are far from the key.
+        assert!(!is_key(&[200, 180, 40, 255], false, d));
+        // The exact-match flavour stays strict on the same inputs.
+        assert!(!is_key(&[3, 3, 3, 255], false, Desktop::Caja));
+    }
+
+    #[test]
+    fn desktop_flavours_match_only_their_own_window() {
+        let dde = b"dde-shell/desktop\0org.deepin.dde-shell\0";
+        let caja = b"desktop_window\0Caja\0";
+        assert!(Desktop::Dde.matches(dde));
+        assert!(!Desktop::Dde.matches(caja));
+        assert!(Desktop::Caja.matches(caja));
+        assert!(!Desktop::Caja.matches(dde));
+        assert!(!Desktop::Dde.matches(b"dde-shell/dock\0org.deepin.dde-shell\0"));
     }
 
     #[test]
