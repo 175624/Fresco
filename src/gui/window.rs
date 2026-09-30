@@ -8,6 +8,7 @@ use gtk4::{FileChooserAction, GestureClick, PolicyType, ResponseType};
 use libadwaita::{self as adw, prelude::*};
 
 use super::theme;
+use super::window_state;
 use super::{
     daemon_ctl,
     library::{self, load_entries, save_entries, LibraryEntry},
@@ -187,6 +188,41 @@ impl AppState {
 
 // ─── Main window ─────────────────────────────────────────────────────────────
 
+/// Logical size of the largest connected monitor, if the display can be asked.
+fn largest_monitor_size() -> Option<(i32, i32)> {
+    let monitors = gtk4::gdk::Display::default()?.monitors();
+    (0..monitors.n_items())
+        .filter_map(|i| monitors.item(i)?.downcast::<gtk4::gdk::Monitor>().ok())
+        .map(|m| {
+            let g = m.geometry();
+            (g.width(), g.height())
+        })
+        .max_by_key(|(w, h)| i64::from(*w) * i64::from(*h))
+}
+
+/// Persist the main window's size and maximized flag.
+///
+/// Reads `default_width/height` (the size the user left it at) rather than the
+/// allocation. The size is checked against the monitor the window is actually
+/// on so a window that ballooned past the screen (#31) is never written back.
+fn remember_window_state(window: &adw::ApplicationWindow) {
+    let monitor = window.surface().and_then(|surface| {
+        let m = gtk4::gdk::Display::default()?.monitor_at_surface(&surface)?;
+        let g = m.geometry();
+        Some((g.width(), g.height()))
+    });
+    let next = window_state::next_state(
+        &window_state::load(),
+        window.default_width(),
+        window.default_height(),
+        window.is_maximized(),
+        monitor,
+    );
+    if let Err(e) = window_state::save(&next) {
+        log::debug!("could not save window size: {e:#}");
+    }
+}
+
 fn build_ui(app: &adw::Application) {
     // The app id makes us D-Bus-unique: launching fresco again re-activates
     // this process. Present the existing window instead of building a
@@ -198,8 +234,15 @@ fn build_ui(app: &adw::Application) {
 
     let window = adw::ApplicationWindow::new(app);
     window.set_title(Some("Fresco"));
-    window.set_default_size(880, 660);
-    window.set_size_request(420, 480);
+    // Reopen at the size the user left it. Size and maximized only: GTK4 has
+    // no way to place a toplevel, so position cannot be restored.
+    let saved_window = window_state::load();
+    let (init_w, init_h) = window_state::restore_size(&saved_window, largest_monitor_size());
+    window.set_default_size(init_w, init_h);
+    if saved_window.maximized {
+        window.maximize();
+    }
+    window.set_size_request(window_state::MIN_SIZE.0, window_state::MIN_SIZE.1);
     window.set_icon_name(Some(APP_ID));
 
     // Ctrl+Q quits. `GApplication` has no built-in "quit" action, so register
@@ -207,7 +250,12 @@ fn build_ui(app: &adw::Application) {
     let quit_action = gio::SimpleAction::new("quit", None);
     {
         let app = app.clone();
-        quit_action.connect_activate(move |_, _| app.quit());
+        let window = window.clone();
+        quit_action.connect_activate(move |_, _| {
+            // Ctrl+Q ends the app without a close-request on the window.
+            remember_window_state(&window);
+            app.quit();
+        });
     }
     app.add_action(&quit_action);
     app.set_accels_for_action("app.quit", &["<primary>q"]);
@@ -313,6 +361,24 @@ fn build_ui(app: &adw::Application) {
             window.set_content(Some(&outer));
         }
         None => window.set_content(Some(&toast)),
+    }
+    window.connect_close_request(|win| {
+        remember_window_state(win);
+        gtk4::glib::Propagation::Proceed
+    });
+    // Other quit paths (the post-update relaunch calls `app.quit()` too). By
+    // shutdown GTK may already have unrealized the window, and then
+    // `is_maximized()` would read false; only trust a window that still has
+    // its surface.
+    {
+        let weak = window.downgrade();
+        app.connect_shutdown(move |_| {
+            if let Some(win) = weak.upgrade() {
+                if win.surface().is_some() {
+                    remember_window_state(&win);
+                }
+            }
+        });
     }
     window.present();
 
@@ -1101,7 +1167,13 @@ fn apply_layout_bucket(
     // Footer inset comes from the .footer-bar / .compact-layout CSS padding.
 }
 
-/// Header menu: appearance (theme mode + accent) and behavior switches.
+/// Header menu: a root page of navigation rows and actions, with the
+/// settings-like sections (appearance, language, behavior, help) on second-level
+/// pages.
+///
+/// The pages are children of one `gtk4::Stack` inside the one popover. Not a
+/// nested popover or a `GtkDropDown` — a second popup surface is what leaked the
+/// X11 seat grab in issue #5 (see `build_language_row`).
 fn build_menu_popover(
     window: &adw::ApplicationWindow,
     state: Rc<RefCell<AppState>>,
@@ -1111,6 +1183,108 @@ fn build_menu_popover(
     let popover = gtk4::Popover::new();
     popover.add_css_class("fresco-menu");
 
+    let stack = gtk4::Stack::new();
+    stack.set_transition_type(gtk4::StackTransitionType::SlideLeftRight);
+    stack.set_transition_duration(160);
+    // Height follows the visible page instead of the tallest one, so the short
+    // pages do not leave the popover as tall as the language list.
+    stack.set_vhomogeneous(false);
+
+    let theme_sub = gtk4::Label::new(Some(theme_mode_label(state.borrow().config.theme_mode)));
+    let lang_sub = gtk4::Label::new(Some(state.borrow().config.language.display_name()));
+
+    let appearance_nav = nav_row(t!("Appearance"), Some(&theme_sub), &stack, "appearance");
+    let language_nav = nav_row(t!("Language"), Some(&lang_sub), &stack, "language");
+    let behavior_nav = nav_row(t!("Behavior"), None, &stack, "behavior");
+    let help_nav = nav_row(t!("Help & feedback"), None, &stack, "help");
+
+    stack.add_named(
+        &build_menu_root(
+            window,
+            &state,
+            &popover,
+            [&appearance_nav, &language_nav, &behavior_nav, &help_nav],
+        ),
+        Some(MENU_ROOT),
+    );
+    stack.add_named(
+        &menu_page(
+            t!("Appearance"),
+            &stack,
+            &appearance_nav,
+            &build_appearance_page(&state, theme_sub),
+        ),
+        Some("appearance"),
+    );
+    stack.add_named(
+        &menu_page(
+            t!("Language"),
+            &stack,
+            &language_nav,
+            &build_language_row(state.clone(), lang_sub),
+        ),
+        Some("language"),
+    );
+    stack.add_named(
+        &menu_page(
+            t!("Behavior"),
+            &stack,
+            &behavior_nav,
+            &build_behavior_page(&state),
+        ),
+        Some("behavior"),
+    );
+    stack.add_named(
+        &menu_page(
+            t!("Help & feedback"),
+            &stack,
+            &help_nav,
+            &build_help_page(window, &state, &popover),
+        ),
+        Some("help"),
+    );
+
+    // Always reopen on the root page, not wherever it was last left; the
+    // reset is instant so it never animates a page change on an unmapped popup.
+    {
+        let stack = stack.clone();
+        popover.connect_closed(move |_| {
+            stack.set_visible_child_full(MENU_ROOT, gtk4::StackTransitionType::None);
+        });
+    }
+    // Escape / Alt+Left step back out of a sub-page instead of closing the
+    // whole menu. Capture phase, so it runs before the popover's own Escape.
+    {
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let stack = stack.clone();
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            let on_subpage = stack.visible_child_name().as_deref() != Some(MENU_ROOT);
+            let back = key == gtk4::gdk::Key::Escape
+                || (key == gtk4::gdk::Key::Left
+                    && mods.contains(gtk4::gdk::ModifierType::ALT_MASK));
+            if on_subpage && back {
+                stack.set_visible_child_name(MENU_ROOT);
+                stack.child_focus(gtk4::DirectionType::TabForward);
+                gtk4::glib::Propagation::Stop
+            } else {
+                gtk4::glib::Propagation::Proceed
+            }
+        });
+        popover.add_controller(keys);
+    }
+
+    // The menu can grow taller than the space under its button, but a popover
+    // taller than that does not clip — on Wayland it fails to map at all, and
+    // the button appears simply dead. That is display-dependent, so it
+    // survives testing: the same menu that fits a 1080p external monitor at
+    // scale 1 does not fit a fractionally scaled laptop panel, whose *logical*
+    // height is several hundred units shorter.
+    //
+    // Scrolling the column instead of letting it size itself makes the failure
+    // impossible: `propagate_natural_height` keeps the popover exactly as tall
+    // as its content while that fits, and `max_content_height` caps it below
+    // any plausible logical screen height, after which it scrolls.
     let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     popover_box.set_margin_top(6);
     popover_box.set_margin_bottom(6);
@@ -1118,9 +1292,89 @@ fn build_menu_popover(
     popover_box.set_margin_end(6);
     // Compact menu column: wide enough for the longest switch row, no wider.
     popover_box.set_width_request(300);
+    popover_box.append(&stack);
 
-    // ── Appearance ──
-    popover_box.append(&overline(t!("Appearance")));
+    let scroller = gtk4::ScrolledWindow::new();
+    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroller.set_propagate_natural_height(true);
+    scroller.set_propagate_natural_width(true);
+    scroller.set_max_content_height(560);
+    scroller.set_child(Some(&popover_box));
+
+    popover.set_child(Some(&scroller));
+    popover
+}
+
+/// Root page: the four section rows, then the actions.
+fn build_menu_root(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<AppState>>,
+    popover: &gtk4::Popover,
+    nav: [&gtk4::Button; 4],
+) -> gtk4::Box {
+    let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    for row in nav {
+        popover_box.append(row);
+    }
+
+    // Separator margins come from the .fresco-menu CSS.
+    popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+    let advanced_btn = menu_item_opening_window(t!("Advanced…"), popover, {
+        let state_adv = state.clone();
+        let win_adv = window.clone();
+        move || show_advanced_dialog(&win_adv, state_adv.clone())
+    });
+    advanced_btn.set_tooltip_text(Some(t!(
+        "Video quality, day/night schedule, and widgets such as the clock, lyrics and visualizer"
+    )));
+    popover_box.append(&advanced_btn);
+
+    let browse_btn = menu_item_opening_window(t!("Browse wallpapers…"), popover, {
+        let state_b = state.clone();
+        let win_b = window.clone();
+        move || super::gallery::show_gallery_window(&win_b, state_b.clone())
+    });
+    browse_btn.set_tooltip_text(Some(t!(
+        "Curated, licensed wallpapers you can add in two clicks"
+    )));
+    popover_box.append(&browse_btn);
+
+    let url_btn = menu_item_opening_window(t!("Add from URL…"), popover, {
+        let state_url = state.clone();
+        let win_url = window.clone();
+        move || show_add_from_url_dialog(&win_url, state_url.clone())
+    });
+    url_btn.set_tooltip_text(Some(t!(
+        "Download a video or image from a link and add it to your library"
+    )));
+    popover_box.append(&url_btn);
+
+    let folders_btn = menu_item_opening_window(t!("Manage folders…"), popover, {
+        let state_f = state.clone();
+        let win_f = window.clone();
+        move || show_collections_dialog(&win_f, state_f.clone())
+    });
+    folders_btn.set_tooltip_text(Some(t!("Group your wallpapers into folders")));
+    popover_box.append(&folders_btn);
+
+    // Closes the menu like the rest: an update *is* available often enough that
+    // the result dialog would otherwise open underneath it, and the "you're up
+    // to date" toast is raised on the main window, which the menu overlaps.
+    let update_btn = menu_item_opening_window(t!("Check for updates"), popover, {
+        let state_upd = state.clone();
+        let win_upd = window.clone();
+        move || super::updates::check_for_updates(&win_upd, state_upd.clone(), true)
+    });
+    update_btn.set_tooltip_text(Some(t!("Look for a newer version of Fresco")));
+    popover_box.append(&update_btn);
+    popover_box
+}
+
+/// Appearance page: theme mode + accent. `subtitle` is the root row's live
+/// value label.
+fn build_appearance_page(state: &Rc<RefCell<AppState>>, subtitle: gtk4::Label) -> gtk4::Box {
+    let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
 
     let seg = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     seg.add_css_class("linked");
@@ -1142,6 +1396,7 @@ fn build_menu_popover(
         (&b_dark, ThemeMode::Dark),
     ] {
         let state2 = state.clone();
+        let subtitle = subtitle.clone();
         btn.connect_toggled(move |b| {
             if !b.is_active() {
                 return;
@@ -1153,6 +1408,7 @@ fn build_menu_popover(
                 s.config.accent
             };
             theme::set_mode(mode);
+            subtitle.set_text(theme_mode_label(mode));
             // Derive dark/light from the chosen mode, not is_dark() — the latter
             // is stale right after set_mode, so the palette wouldn't switch.
             theme::apply(accent, theme::resolve_dark(mode));
@@ -1208,15 +1464,12 @@ fn build_menu_popover(
         dot_btns.borrow_mut().push((acc, b));
     }
     popover_box.append(&dot_row);
+    popover_box
+}
 
-    popover_box.append(&overline(t!("Language")));
-    popover_box.append(&build_language_row(state.clone()));
-
-    // Separator margins come from the .fresco-menu CSS.
-    popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-
-    // ── Behavior ──
-    popover_box.append(&overline(t!("Behavior")));
+/// Behavior page: the on/off switches.
+fn build_behavior_page(state: &Rc<RefCell<AppState>>) -> gtk4::Box {
+    let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     popover_box.append(&switch_row(
         t!("Restore on login"),
         state.borrow().config.autostart,
@@ -1322,64 +1575,30 @@ fn build_menu_popover(
         t!("Lets the Fresco browser extension show your wallpaper on new tabs. Local-only (127.0.0.1)."),
     ));
     popover_box.append(&bridge_row);
+    popover_box
+}
 
-    popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-
-    let advanced_btn = menu_item_opening_window(t!("Advanced…"), &popover, {
-        let state_adv = state.clone();
-        let win_adv = window.clone();
-        move || show_advanced_dialog(&win_adv, state_adv.clone())
-    });
-    popover_box.append(&advanced_btn);
-
-    let browse_btn = menu_item_opening_window(t!("Browse wallpapers…"), &popover, {
-        let state_b = state.clone();
-        let win_b = window.clone();
-        move || super::gallery::show_gallery_window(&win_b, state_b.clone())
-    });
-    popover_box.append(&browse_btn);
-
-    let url_btn = menu_item_opening_window(t!("Add from URL…"), &popover, {
-        let state_url = state.clone();
-        let win_url = window.clone();
-        move || show_add_from_url_dialog(&win_url, state_url.clone())
-    });
-    popover_box.append(&url_btn);
-
-    let folders_btn = menu_item_opening_window(t!("Manage folders…"), &popover, {
-        let state_f = state.clone();
-        let win_f = window.clone();
-        move || show_collections_dialog(&win_f, state_f.clone())
-    });
-    popover_box.append(&folders_btn);
-
-    // Closes the menu like the rest: an update *is* available often enough that
-    // the result dialog would otherwise open underneath it, and the "you're up
-    // to date" toast is raised on the main window, which the menu overlaps.
-    let update_btn = menu_item_opening_window(t!("Check for updates"), &popover, {
-        let state_upd = state.clone();
-        let win_upd = window.clone();
-        move || super::updates::check_for_updates(&win_upd, state_upd.clone(), true)
-    });
-    popover_box.append(&update_btn);
-
+/// Help & feedback page.
+fn build_help_page(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<AppState>>,
+    popover: &gtk4::Popover,
+) -> gtk4::Box {
+    let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     // ── Help & feedback ──
     // A user-initiated path: the feedback dialog otherwise auto-prompts only once
     // (after a week), so without this a user can neither send feedback nor reach
     // support. "Send feedback" is the anonymous one-way rating (→ dashboard);
     // "Message the maintainer" is the anonymous two-way thread; "Report a
     // problem" opens the issue tracker, which is public and needs an account.
-    popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-    popover_box.append(&overline(t!("Help & feedback")));
-
-    let tour_btn = menu_item_opening_window(t!("What can Fresco do?"), &popover, {
+    let tour_btn = menu_item_opening_window(t!("What can Fresco do?"), popover, {
         let state_t = state.clone();
         let win_t = window.clone();
         move || show_tour_dialog(&win_t, state_t.clone())
     });
     popover_box.append(&tour_btn);
 
-    let feedback_btn = menu_item_opening_window(t!("Send feedback…"), &popover, {
+    let feedback_btn = menu_item_opening_window(t!("Send feedback…"), popover, {
         let state_fb = state.clone();
         let win_fb = window.clone();
         move || show_feedback_dialog(&win_fb, state_fb.clone())
@@ -1394,7 +1613,7 @@ fn build_menu_popover(
         } else {
             t!("Message the maintainer…")
         },
-        &popover,
+        popover,
         {
             let state_s = state.clone();
             let win_s = window.clone();
@@ -1408,7 +1627,7 @@ fn build_menu_popover(
 
     // The browser is someone else's toplevel, but it is a toplevel all the
     // same — it would come up behind a menu we left mapped.
-    let help_btn = menu_item_opening_window(t!("Report a problem…"), &popover, || {
+    let help_btn = menu_item_opening_window(t!("Report a problem…"), popover, || {
         let _ = std::process::Command::new("xdg-open")
             .arg(ISSUES_URL)
             .spawn();
@@ -1416,32 +1635,12 @@ fn build_menu_popover(
     help_btn.set_tooltip_text(Some(t!("Opens the Fresco issue tracker in your browser")));
     popover_box.append(&help_btn);
 
-    let about_btn = menu_item_opening_window(t!("About"), &popover, {
+    let about_btn = menu_item_opening_window(t!("About"), popover, {
         let win_about = window.clone();
         move || show_about_dialog(&win_about)
     });
     popover_box.append(&about_btn);
-
-    // The menu is ~25 rows tall and grows every time a setting is added, but a
-    // popover taller than the space under its button does not clip — on
-    // Wayland it fails to map at all, and the button appears simply dead. That
-    // is display-dependent, so it survives testing: the same menu that fits a
-    // 1080p external monitor at scale 1 does not fit a fractionally scaled
-    // laptop panel, whose *logical* height is several hundred units shorter.
-    //
-    // Scrolling the column instead of letting it size itself makes the failure
-    // impossible: `propagate_natural_height` keeps the popover exactly as tall
-    // as its content while that fits, and `max_content_height` caps it below
-    // any plausible logical screen height, after which it scrolls.
-    let scroller = gtk4::ScrolledWindow::new();
-    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-    scroller.set_propagate_natural_height(true);
-    scroller.set_propagate_natural_width(true);
-    scroller.set_max_content_height(560);
-    scroller.set_child(Some(&popover_box));
-
-    popover.set_child(Some(&scroller));
-    popover
+    popover_box
 }
 
 // ─── Library scope, sorting and sectioning ────────────────────────────────────
@@ -7362,6 +7561,87 @@ fn menu_item(label: &str) -> gtk4::Button {
     btn
 }
 
+/// Page id of the header menu's root page (see `build_menu_popover`).
+const MENU_ROOT: &str = "root";
+
+/// Dim trailing text for the Appearance row: what the mode is now.
+fn theme_mode_label(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::System => t!("System"),
+        ThemeMode::Light => t!("Light"),
+        ThemeMode::Dark => t!("Dark"),
+    }
+}
+
+/// A menu row that opens a second-level page: label, an optional live
+/// subtitle (the current value) and a chevron. Switching is a stack swap inside
+/// the same popover — no second popup surface, see `build_language_row`.
+fn nav_row(
+    label: &str,
+    subtitle: Option<&gtk4::Label>,
+    stack: &gtk4::Stack,
+    page: &'static str,
+) -> gtk4::Button {
+    let btn = gtk4::Button::new();
+    btn.add_css_class("flat");
+    btn.add_css_class("menu-item");
+    btn.set_halign(gtk4::Align::Fill);
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let lbl = gtk4::Label::new(Some(label));
+    lbl.set_xalign(0.0);
+    lbl.set_hexpand(true);
+    row.append(&lbl);
+    if let Some(sub) = subtitle {
+        sub.add_css_class("dim");
+        row.append(sub);
+    }
+    row.append(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    btn.set_child(Some(&row));
+    let stack = stack.clone();
+    btn.connect_clicked(move |_| {
+        stack.set_visible_child_name(page);
+        // Keyboard users land on the page's first control (its back button),
+        // not on a row that has just slid out of view.
+        if let Some(child) = stack.visible_child() {
+            child.child_focus(gtk4::DirectionType::TabForward);
+        }
+    });
+    btn
+}
+
+/// A second-level menu page: back button + bold title, then `content` as-is.
+/// `opener` is the root row that leads here; going back re-focuses it.
+fn menu_page(
+    title: &str,
+    stack: &gtk4::Stack,
+    opener: &gtk4::Button,
+    content: &impl IsA<gtk4::Widget>,
+) -> gtk4::Box {
+    let page = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    let back = gtk4::Button::from_icon_name("go-previous-symbolic");
+    back.add_css_class("flat");
+    back.set_tooltip_text(Some(t!("Back")));
+    {
+        let stack = stack.clone();
+        let opener = opener.clone();
+        back.connect_clicked(move |_| {
+            stack.set_visible_child_name(MENU_ROOT);
+            opener.grab_focus();
+        });
+    }
+    let heading = gtk4::Label::new(Some(title));
+    heading.add_css_class("heading");
+    heading.set_xalign(0.0);
+    heading.set_hexpand(true);
+    header.append(&back);
+    header.append(&heading);
+    page.append(&header);
+    page.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    page.append(content);
+    page
+}
+
 /// A menu item that opens a window, closing the menu on the way.
 ///
 /// The popdown is the load-bearing part. A `GtkPopover` is a native surface of
@@ -7431,7 +7711,7 @@ fn switch_row<F: Fn(bool) + 'static>(label: &str, active: bool, on_toggle: F) ->
 /// widget in the window; a toast that names the requirement is more honest than
 /// a partial retranslation, and matches how GNOME's own language switch
 /// behaves.
-fn build_language_row(state: Rc<RefCell<AppState>>) -> gtk4::Box {
+fn build_language_row(state: Rc<RefCell<AppState>>, subtitle: gtk4::Label) -> gtk4::Box {
     use crate::i18n::Language;
 
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
@@ -7459,6 +7739,7 @@ fn build_language_row(state: Rc<RefCell<AppState>>) -> gtk4::Box {
         {
             let state2 = state.clone();
             let checks = checks.clone();
+            let subtitle = subtitle.clone();
             btn.connect_clicked(move |_| {
                 {
                     let mut s = state2.borrow_mut();
@@ -7471,6 +7752,7 @@ fn build_language_row(state: Rc<RefCell<AppState>>) -> gtk4::Box {
                 for (l, img) in checks.borrow().iter() {
                     img.set_visible(*l == lang);
                 }
+                subtitle.set_text(lang.display_name());
                 show_toast(&state2, t!("Restart Fresco to apply the new language"));
             });
         }
@@ -9490,6 +9772,13 @@ fn show_notification_modal(window: &adw::ApplicationWindow, notif: &crate::supab
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn menu_subtitle_names_each_theme_mode() {
+        assert_eq!(theme_mode_label(ThemeMode::System), "System");
+        assert_eq!(theme_mode_label(ThemeMode::Light), "Light");
+        assert_eq!(theme_mode_label(ThemeMode::Dark), "Dark");
+    }
+
     use super::*;
     use std::path::PathBuf;
 

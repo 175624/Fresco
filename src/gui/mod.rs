@@ -9,5 +9,6 @@ mod theme;
 mod transition_preview;
 mod updates;
 mod window;
+mod window_state;
 
 pub use window::FrescoApplication;
