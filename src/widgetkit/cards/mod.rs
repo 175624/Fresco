@@ -37,16 +37,20 @@
 //! affordance that lies, and someone *will* click it. Progress bars stay
 //! because a progress bar is data; the knob on one is a marker, not a handle.
 
+pub mod battery;
 pub mod clock;
 pub mod disc;
+pub mod greeting;
 pub mod lock;
 pub mod media;
 pub mod nos;
 pub mod nowplaying;
 pub mod visualizer;
 
+pub use battery::BatteryData;
 pub use clock::{ClockData, ClockVariant};
 pub use disc::DiscData;
+pub use greeting::{GreetingData, GreetingLayout};
 pub use media::{MediaData, MediaLayer, PlayState};
 pub use nowplaying::NowPlayingData;
 pub use visualizer::{VisualizerData, VisualizerVariant};

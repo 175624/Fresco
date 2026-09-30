@@ -162,6 +162,7 @@ pub mod cards;
 pub mod color;
 pub mod dotmatrix;
 pub mod geom;
+pub mod lockscene;
 pub mod paint;
 pub mod surface;
 pub mod text;
@@ -171,11 +172,15 @@ pub mod typo;
 pub use blur::blur_alpha;
 pub use canvas::{scale_for_output, Canvas, MAX_CANVAS_AREA, MAX_CANVAS_PX, REFERENCE_HEIGHT};
 pub use cards::{
-    ClockData, ClockVariant, DiscData, MediaData, MediaLayer, NowPlayingData, PlayState,
-    VisualizerData, VisualizerVariant,
+    BatteryData, ClockData, ClockVariant, DiscData, GreetingData, GreetingLayout, MediaData,
+    MediaLayer, NowPlayingData, PlayState, VisualizerData, VisualizerVariant,
 };
 pub use color::{linear_to_srgb, srgb_to_linear, Color};
 pub use geom::{HAlign, Point, Rect, Size, Stack, VAlign};
+pub use lockscene::{
+    cosmic_greeter_zone, prompt_zone, LockArrangement, LockSceneData, LockSceneSpec, LockSlot,
+    Placement,
+};
 pub use paint::{sample_stops, Fill, Stop};
 pub use surface::{BarPaint, BarStyle, ScrimSpec, ScrimZone, SpectrumStyle, WidgetSize};
 pub use text::{FontStack, FontSystem, TextAlign, TextMetrics, TextRun};

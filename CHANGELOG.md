@@ -19,6 +19,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   restarts Cinnamon's background daemon, which puts Cinnamon's wallpaper
   back underneath the video. Cinnamon 6.6 and older have no layer-shell and
   keep the static frame.
+- **Fresco can now show your wallpaper and widgets on the real lock screen**
+  (opt-in, off by default; see [docs/LOCKSCREEN.md](docs/LOCKSCREEN.md)).
+  COSMIC 1.9+ and KDE Plasma 6 get live video and the full widget layer;
+  Sway, Hyprland, niri, river, labwc and Wayfire get it through the new
+  `fresco lock` command wrapping swaylock-plugin, and X11 window managers
+  through xsecurelock. MATE and Xfce can pick Fresco as their screensaver
+  theme for the same wallpaper, but that pairing is still experimental — the
+  widget layer doesn't reach every `mate-screensaver` version. GNOME,
+  Cinnamon and Deepin show a still frame only, since none of them expose a
+  way to draw widgets onto their lock screens yet.
+- **A new `fresco lock` command locks your session through your desktop's
+  own locker.** It's what the lock-screen feature above binds to a key or an
+  idle daemon on Sway, Hyprland, and X11, but it works standalone too, and
+  it always ends in a locked session — falling back through
+  `swaylock`/`hyprlock`/`gtklock` or `xsecurelock`/`i3lock`, and finally
+  `loginctl lock-session`, if Fresco's own daemon or host adapter can't lock
+  it directly.
 
 ### Changed
 - **A newly added wallpaper joins the library only when you click "Set as
@@ -32,6 +49,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the Wayland renderer started fine but then kept dying, the report carried
   no exit status, only `cause=spawn_ok`. It now gets the same content-free
   `exit=… sig=…` fingerprint that startup failures already had.
+- **COSMIC's own lock screen now shows a still frame of your Fresco
+  wallpaper instead of the stock image.** This applies whether or not the
+  new lock-screen feature above is turned on: Fresco keeps `cosmic-bg`'s
+  configuration pointed at a still frame of your current wallpaper, the same
+  way it already does for GNOME and Cinnamon, and restores your original
+  background when Fresco stops.
+
+### Removed
+- **Flatpak packaging is gone.** The Flatpak manifest and Flathub submission
+  notes are removed from the repo; Fresco ships as a `.deb`, through the AUR,
+  `install.sh` and the Spark Store. Existing Flatpak installs keep running.
 
 ### Fixed
 - **Live wallpapers now start on older GPUs that lack an OpenGL 3.0 core
@@ -61,6 +89,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `picture-uri` also collapsed per-monitor wallpapers into one. Fresco now
   backs up and restores those two keys exactly, and leaves `picture-uri`
   alone. Older Cinnamon, GNOME and MATE are unchanged.
+- **"Pause on battery" no longer pauses desktops that have a wireless mouse
+  or keyboard reporting its own battery.** The check read any power supply
+  reporting "Discharging" as the machine running on battery, which included
+  Bluetooth/USB peripherals exposing the same sysfs files a laptop battery
+  does. The daemon now ignores peripheral batteries and only looks at the
+  system's own.
 
 ## [1.1.44] — Unreleased
 

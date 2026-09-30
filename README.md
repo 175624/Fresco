@@ -88,6 +88,7 @@ The wallpaper keeps playing after the window closes and comes back automatically
 - **Multi-monitor** — a different wallpaper per display, with synced playback for the same video across monitors
 - **Day & night schedules** — swap wallpapers on a timer, arbitrary time slots, or sunrise/sunset
 - **Desktop widgets** — synced song lyrics, a themed clock, an audio visualiser, and a turning album-art disc, drawn into the wallpaper itself so nothing floats over your windows; all off by default (see [FAQ](#can-i-show-song-lyrics-on-my-linux-desktop))
+- **Lock screen** — show your wallpaper and widgets (clock, greeting, now playing, battery, and more) on your real lock screen instead of the stock one — live video and widgets on COSMIC 1.9+ and KDE Plasma 6, wallpaper-and-widgets via `fresco lock` on Sway/Hyprland/niri and X11, a still frame elsewhere. Off by default, and Fresco never sees your password — see [docs/LOCKSCREEN.md](docs/LOCKSCREEN.md)
 - **Batch management** — select several wallpapers at once and remove them in one step
 - **Built-in catalog** — browse curated, properly licensed wallpapers in-app
 - **Command palette** — Ctrl+K to set any wallpaper or reach any feature from the keyboard
@@ -271,7 +272,7 @@ skips those sessions, but Chromium's own reporting stays inconsistent enough
 that Firefox is the browser to use for this.
 
 Spotify's native Linux client has returned `Position: 0` and never emitted a
-seek since 2018, across native, Flatpak and snap builds. Fresco detects that
+seek since 2018, across native and snap builds. Fresco detects that
 behaviorally — three spaced-out zero readings while playing — and free-runs the
 lyric clock from the track change instead, which drifts if you skip around.
 Spotify in a browser has no such problem.

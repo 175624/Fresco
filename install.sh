@@ -283,6 +283,214 @@ if [[ "$SESSION" == "wayland" ]] && ! renderer_ok; then
  
 MPVPAPER_PATCH_EOF
   (cd "$BUILD_DIR/mpvpaper" && git apply --verbose "$MPVPAPER_PATCH") || { echo "mpvpaper EGL fallback patch failed to apply against $MPVPAPER_VERSION"; exit 1; }
+
+  # Opt-in lock-screen wallpaper (cosmic-comp's session-lock-layer extension):
+  # embedded inline for the same reason as the EGL patch above (this script
+  # runs standalone via curl | bash, with no repo checkout to read a patch
+  # file from) -- keep in sync with
+  # packaging/mpvpaper/0002-cosmic-session-lock-show-on-lock.patch and
+  # scripts/build-mpvpaper.sh.
+  MPVPAPER_SHOW_ON_LOCK_PATCH="$BUILD_DIR/show-on-lock.patch"
+  cat > "$MPVPAPER_SHOW_ON_LOCK_PATCH" <<'MPVPAPER_SHOW_ON_LOCK_PATCH_EOF'
+--- a/meson.build
++++ b/meson.build
+@@ -13,15 +13,21 @@ scanner=find_program('wayland-scanner')
+ scanner_private_code=generator(scanner,output: '@BASENAME@-protocol.c',arguments: ['private-code','@INPUT@','@OUTPUT@'])
+ scanner_client_header=generator(scanner,output: '@BASENAME@-client-protocol.h',arguments: ['client-header','@INPUT@','@OUTPUT@'])
+
++# cosmic-session-lock-layer-v1: optional, only used when MPVPAPER_SHOW_ON_LOCK
++# is set and the compositor advertises cosmic_session_lock_layer_manager_v1
++# (currently cosmic-comp). Generated unconditionally like the other vendored
++# protocols; binding it at runtime is what stays optional.
+ protocols_src=[
+   scanner_private_code.process('proto/wlr-layer-shell-unstable-v1.xml'),
+   scanner_private_code.process('proto/wlr-foreign-toplevel-management-unstable-v1.xml'),
++  scanner_private_code.process('proto/cosmic-session-lock-layer-v1.xml'),
+   scanner_private_code.process(wl_protocols.get_variable('pkgdatadir')+'/stable/xdg-shell/xdg-shell.xml')
+ ]
+
+ protocols_headers=[
+   scanner_client_header.process('proto/wlr-layer-shell-unstable-v1.xml'),
+-  scanner_client_header.process('proto/wlr-foreign-toplevel-management-unstable-v1.xml')
++  scanner_client_header.process('proto/wlr-foreign-toplevel-management-unstable-v1.xml'),
++  scanner_client_header.process('proto/cosmic-session-lock-layer-v1.xml')
+ ]
+
+ lib_protocols=static_library('protocols',protocols_src+protocols_headers,dependencies: wl_client)
+diff --git a/proto/cosmic-session-lock-layer-v1.xml b/proto/cosmic-session-lock-layer-v1.xml
+new file mode 100644
+index 0000000..a320457
+--- /dev/null
++++ b/proto/cosmic-session-lock-layer-v1.xml
+@@ -0,0 +1,65 @@
++<protocol name="cosmic_session_lock_v1">
++  <copyright>
++    Copyright © 2026 System76
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <description summary="Show layer surfaces in locked session.">
++    Normally, `ext-session-lock-v1` hides all other surfaces. This protocol allows
++    a client to indicate that a layer surface should also be shown when the session
++    is locked.
++  </description>
++
++  <interface name="cosmic_session_lock_layer_manager_v1" version="1">
++    <request name="set_show_on_lock" since="1">
++      <description
++        summary="Show layer on lock."
++      >
++      Show on lock is double buffered, see wl_surface.commit.
++      </description>
++      <arg
++        name="layer"
++        type="object"
++        interface="zwlr_layer_surface_v1"
++        summary="the layer surface"
++      />
++    </request>
++
++    <request name="unset_show_on_lock" since="1">
++      <description
++        summary="Do not show layer on lock."
++      >
++      Show on lock is double buffered, see wl_surface.commit.
++      </description>
++      <arg
++        name="layer"
++        type="object"
++        interface="zwlr_layer_surface_v1"
++        summary="the layer surface"
++      />
++    </request>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the global">
++      </description>
++    </request>
++  </interface>
++</protocol>
+diff --git a/src/main.c b/src/main.c
+index 34549c8..3c6bd84 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -14,6 +14,7 @@
+
+ #include "wlr-layer-shell-unstable-v1-client-protocol.h"
+ #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
++#include "cosmic-session-lock-layer-v1-client-protocol.h"
+ #include <wayland-client.h>
+ #include <wayland-egl.h>
+
+@@ -71,6 +72,15 @@ static EGLDisplay *egl_display;
+ static EGLContext *egl_context;
+ static bool egl_is_gles;
+
++// Opt-in lock-screen wallpaper (cosmic-comp and compatible compositors only).
++// show_on_lock_requested is read once from MPVPAPER_SHOW_ON_LOCK at startup;
++// session_lock_layer_manager is only non-NULL when the compositor actually
++// advertises cosmic_session_lock_layer_manager_v1. Both gate the
++// set_show_on_lock() call in create_layer_surface() — when either is
++// false/NULL, behavior is identical to unpatched mpvpaper.
++static bool show_on_lock_requested;
++static struct cosmic_session_lock_layer_manager_v1 *session_lock_layer_manager;
++
+ static mpv_handle *mpv;
+ static mpv_render_context *mpv_glcontext;
+ static int wakeup_fd;
+@@ -134,6 +144,12 @@ static void exit_cleanup() {
+     if (egl_display)
+         eglTerminate(egl_display);
+
++    // Best-effort, like the EGL/mpv teardown above: the process is about to
++    // exit either way, but send the destructor request while the display
++    // connection is still open rather than relying solely on disconnect.
++    if (session_lock_layer_manager)
++        cosmic_session_lock_layer_manager_v1_destroy(session_lock_layer_manager);
++
+     if (wakeup_fd >= 0)
+         close(wakeup_fd);
+ }
+@@ -1004,6 +1020,18 @@ static void create_layer_surface(struct display_output *output) {
+     );
+     zwlr_layer_surface_v1_set_exclusive_zone(output->layer_surface, -1);
+     zwlr_layer_surface_v1_add_listener(output->layer_surface, &layer_surface_listener, output);
++
++    // Ask the compositor to keep drawing this output's layer surface while
++    // the session is locked (cosmic-comp's session_lock_layer extension; see
++    // cosmic_session_lock_layer_manager_v1 in handle_global()). Must happen
++    // before the first wl_surface_commit below: show-on-lock is double
++    // buffered on that commit, same as the anchor/exclusive-zone state just
++    // set above. A no-op — same as unpatched mpvpaper — unless the user opted
++    // in AND the compositor advertised the manager.
++    if (show_on_lock_requested && session_lock_layer_manager) {
++        cosmic_session_lock_layer_manager_v1_set_show_on_lock(session_lock_layer_manager, output->layer_surface);
++    }
++
+     wl_surface_commit(output->surface);
+ }
+
+@@ -1119,6 +1147,12 @@ static void handle_global(void *data, struct wl_registry *registry, uint32_t nam
+
+     } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
+         state->layer_shell = wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, 1);
++    } else if (show_on_lock_requested && strcmp(interface, cosmic_session_lock_layer_manager_v1_interface.name) == 0) {
++        // Only bind when actually requested: an unused binding on compositors
++        // that don't support (or don't need) show-on-lock is harmless, but
++        // skipping it keeps the "opt-in changes nothing when off" guarantee
++        // obvious from this handler alone, without reading create_layer_surface().
++        session_lock_layer_manager = wl_registry_bind(registry, name, &cosmic_session_lock_layer_manager_v1_interface, 1);
+     }
+     if (halt_info.auto_pause > 1 || halt_info.auto_stop > 1) {
+         if (strcmp(interface, zwlr_foreign_toplevel_manager_v1_interface.name) == 0) {
+@@ -1450,6 +1484,12 @@ int main(int argc, char **argv) {
+
+     check_paper_processes();
+
++    // Opt-in, read once before the registry is even created: see the
++    // show_on_lock_requested declaration near the top of this file for what
++    // it gates. Anything other than unset/empty/"0" enables it (e.g. "1").
++    const char *show_on_lock_env = getenv("MPVPAPER_SHOW_ON_LOCK");
++    show_on_lock_requested = show_on_lock_env && *show_on_lock_env && strcmp(show_on_lock_env, "0") != 0;
++
+     struct wl_state state = {0};
+     wl_list_init(&state.outputs);
+     wl_list_init(&state.toplevel_handles);
+@@ -1498,6 +1538,14 @@ int main(int argc, char **argv) {
+         cflp_error("Missing a required Wayland interface");
+         return EXIT_FAILURE;
+     }
++    if (show_on_lock_requested && !session_lock_layer_manager) {
++        // cflp_* helpers (cflogprinter.c) all print to stdout regardless of
++        // name (cflp_error/cflp_warning included) — this diagnostic is
++        // required on stderr, so write it directly instead.
++        fprintf(stderr, "mpvpaper: MPVPAPER_SHOW_ON_LOCK was requested, but this compositor does not "
++                         "advertise cosmic_session_lock_layer_manager_v1 - the wallpaper will not be "
++                         "shown on the lock screen\n");
++    }
+
+     // Check outputs
+     wl_display_roundtrip(state.display);
+MPVPAPER_SHOW_ON_LOCK_PATCH_EOF
+  (cd "$BUILD_DIR/mpvpaper" && git apply --verbose "$MPVPAPER_SHOW_ON_LOCK_PATCH") || { echo "mpvpaper show-on-lock patch failed to apply against $MPVPAPER_VERSION"; exit 1; }
   (cd "$BUILD_DIR/mpvpaper" && meson setup build >/dev/null && meson compile -C build >/dev/null)
   sudo install -m 755 "$BUILD_DIR/mpvpaper/build/mpvpaper" /usr/lib/fresco/mpvpaper
   rm -rf "$BUILD_DIR"

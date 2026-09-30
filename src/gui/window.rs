@@ -320,6 +320,10 @@ fn build_ui(app: &adw::Application) {
     if std::env::var("FRESCO_OPEN_GALLERY").ok().as_deref() == Some("1") {
         super::gallery::show_gallery_window(&window, state.clone());
     }
+    // As above, for the Lock Screen page (docs/plan-lock-screen.md §6).
+    if std::env::var("FRESCO_OPEN_LOCKSCREEN").ok().as_deref() == Some("1") {
+        super::lockscreen::show_lockscreen_window(&window, state.clone());
+    }
 
     // Deep link used by the daemon's feedback-reminder notification: clicking
     // "Send feedback" runs `fresco --feedback`, which lands here (directly for
@@ -1331,6 +1335,16 @@ fn build_menu_popover(
         move || show_advanced_dialog(&win_adv, state_adv.clone())
     });
     popover_box.append(&advanced_btn);
+
+    // docs/plan-lock-screen.md §6: Fresco's wallpaper + widgets on the real
+    // lock screen. Page + preview window live in `super::lockscreen`; this is
+    // only the navigation entry.
+    let lockscreen_btn = menu_item_opening_window(t!("Lock Screen…"), &popover, {
+        let state_lock = state.clone();
+        let win_lock = window.clone();
+        move || super::lockscreen::show_lockscreen_window(&win_lock, state_lock.clone())
+    });
+    popover_box.append(&lockscreen_btn);
 
     let browse_btn = menu_item_opening_window(t!("Browse wallpapers…"), &popover, {
         let state_b = state.clone();
@@ -7974,6 +7988,13 @@ fn show_command_palette(
         add_cmd(
             t!("Advanced settings"),
             Rc::new(move || show_advanced_dialog(&w, s.clone())),
+        );
+    }
+    {
+        let (w, s) = (window.clone(), state.clone());
+        add_cmd(
+            t!("Lock Screen settings"),
+            Rc::new(move || super::lockscreen::show_lockscreen_window(&w, s.clone())),
         );
     }
     {

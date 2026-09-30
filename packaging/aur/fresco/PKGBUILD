@@ -31,6 +31,11 @@ optdepends=(
   'libpulse: system-audio capture fallback for the audio visualiser (parec)'
   'ffmpeg: rotated thumbnails and library media metadata (ffprobe)'
   'xdg-utils: opening help and tutorial links in your browser'
+  # Lock-screen aesthetics (docs/plan-lock-screen.md): each host's own locker,
+  # needed by exactly one of them, so none of these are hard dependencies.
+  'xsecurelock: X11 lock screen with the live wallpaper and widgets (fresco lock)'
+  'swaylock-plugin: wlroots lock screen with the live wallpaper and widgets (fresco lock)'
+  'qt6-multimedia: video playback in the KDE Plasma lock-screen wallpaper'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')  # pin per release: curl -L <source-url> | sha256sum
@@ -66,4 +71,33 @@ package() {
   install -Dm644 "data/io.github.dibbayajyotiroy.Fresco.metainfo.xml" \
     "$pkgdir/usr/share/metainfo/io.github.dibbayajyotiroy.Fresco.metainfo.xml"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # Lock-screen aesthetics: the X11 saver module (needs xsecurelock; see
+  # src/daemon/lock/hosts/x11.rs) and its MATE/Xfce screensaver-theme entry.
+  install -Dm755 "data/saver_fresco" "$pkgdir/usr/lib/fresco/saver_fresco"
+  install -Dm644 "data/screensavers/fresco.desktop" \
+    "$pkgdir/usr/share/applications/screensavers/fresco.desktop"
+
+  # KDE Plasma 6 lock-screen wallpaper plugin (packaging/kde/README.md is the
+  # verified contract). Installed twice: the real Plasma system path (so it
+  # works with no extra step), and a second, Fresco-owned copy under
+  # usr/share/fresco/ that KdeHost::setup() (src/daemon/lock/hosts/kde.rs)
+  # copies from into ~/.local/share/plasma/wallpapers/ if the system path is
+  # ever missing.
+  _kde_plugin="io.github.dibbayajyotiroy.fresco.lockscreen"
+  for _kde_dest in \
+    "usr/share/plasma/wallpapers/$_kde_plugin" \
+    "usr/share/fresco/kde/$_kde_plugin"
+  do
+    install -Dm644 "packaging/kde/$_kde_plugin/metadata.json" \
+      "$pkgdir/$_kde_dest/metadata.json"
+    install -Dm644 "packaging/kde/$_kde_plugin/contents/config/main.xml" \
+      "$pkgdir/$_kde_dest/contents/config/main.xml"
+    install -Dm644 "packaging/kde/$_kde_plugin/contents/ui/main.qml" \
+      "$pkgdir/$_kde_dest/contents/ui/main.qml"
+    install -Dm644 "packaging/kde/$_kde_plugin/contents/ui/VideoLayer.qml" \
+      "$pkgdir/$_kde_dest/contents/ui/VideoLayer.qml"
+    install -Dm644 "packaging/kde/$_kde_plugin/contents/ui/config.qml" \
+      "$pkgdir/$_kde_dest/contents/ui/config.qml"
+  done
 }

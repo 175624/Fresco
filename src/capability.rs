@@ -181,14 +181,53 @@ fn is_gnome(desktop: Option<&str>) -> bool {
 /// Probe the live Wayland registry for `zwlr_layer_shell_v1` — no external tools.
 /// `Some(true/false)` when we could talk to the compositor; `None` only if we
 /// couldn't connect at all, leaving the decision to the desktop-name heuristic.
-#[cfg(feature = "daemon")]
 fn probe_layer_shell() -> Option<bool> {
+    probe_wayland_globals().map(|g| g.layer_shell)
+}
+
+/// Which lock-related Wayland globals this compositor advertises, as probed
+/// by [`probe_wayland_globals`] in a single registry roundtrip.
+///
+/// `bool` fields, not `Option`: a successful roundtrip that simply never
+/// sees a given global IS the answer "not present" — it is
+/// [`probe_wayland_globals`]'s own `Option<WaylandGlobals>` return type that
+/// carries "couldn't even connect" (`None`), same contract the private
+/// `probe_layer_shell` already had before this struct existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WaylandGlobals {
+    /// `zwlr_layer_shell_v1` — live wallpaper backend (see [`Capability`]).
+    pub layer_shell: bool,
+    /// `ext_session_lock_manager_v1` — lets a client implement a real
+    /// session locker (swaylock-plugin, and Fresco's own wave-2b wlroots
+    /// lock host); see `daemon::lock::hosts::HostKind::Wlroots`.
+    pub session_lock_manager: bool,
+    /// `cosmic_session_lock_layer_manager_v1` — cosmic-comp's opt-in
+    /// show-on-lock flag for a layer-shell surface; see
+    /// `daemon::lock::hosts::HostKind::Cosmic`.
+    pub cosmic_lock_layer_manager: bool,
+}
+
+/// Probe the live Wayland registry for every lock-related global Fresco cares
+/// about, in one roundtrip — no external tools, and no new dependency on a
+/// protocol-bindings crate for the two globals besides `zwlr_layer_shell_v1`:
+/// telling whether a global is *advertised at all* only ever needs its
+/// interface *name* (`wl_registry::Event::Global`'s `interface: String`), so
+/// there is nothing here `wayland-client` (already a dependency) cannot do on
+/// its own — `wayland-protocols`/`cosmic-protocols`'s lock-layer extension
+/// would only earn their keep once something actually *binds* one of these
+/// globals to create an object from it, which is wave 2/2b's job, not this
+/// probe's.
+///
+/// `None` only if no Wayland connection could be made at all — same contract
+/// the private `probe_layer_shell` (now built on this) always had.
+#[cfg(feature = "daemon")]
+pub fn probe_wayland_globals() -> Option<WaylandGlobals> {
     use wayland_client::protocol::wl_registry;
     use wayland_client::{Connection, Dispatch, QueueHandle};
 
     #[derive(Default)]
     struct Probe {
-        found: bool,
+        globals: WaylandGlobals,
     }
     impl Dispatch<wl_registry::WlRegistry, ()> for Probe {
         fn event(
@@ -200,8 +239,13 @@ fn probe_layer_shell() -> Option<bool> {
             _: &QueueHandle<Self>,
         ) {
             if let wl_registry::Event::Global { interface, .. } = event {
-                if interface == "zwlr_layer_shell_v1" {
-                    state.found = true;
+                match interface.as_str() {
+                    "zwlr_layer_shell_v1" => state.globals.layer_shell = true,
+                    "ext_session_lock_manager_v1" => state.globals.session_lock_manager = true,
+                    "cosmic_session_lock_layer_manager_v1" => {
+                        state.globals.cosmic_lock_layer_manager = true
+                    }
+                    _ => {}
                 }
             }
         }
@@ -213,12 +257,12 @@ fn probe_layer_shell() -> Option<bool> {
     let _registry = conn.display().get_registry(&qh, ());
     let mut probe = Probe::default();
     queue.roundtrip(&mut probe).ok()?;
-    Some(probe.found)
+    Some(probe.globals)
 }
 
-/// GUI-only builds don't link `wayland-client`; fall back to the name heuristic.
+/// GUI-only builds don't link `wayland-client`; fall back to "couldn't connect".
 #[cfg(not(feature = "daemon"))]
-fn probe_layer_shell() -> Option<bool> {
+pub fn probe_wayland_globals() -> Option<WaylandGlobals> {
     None
 }
 

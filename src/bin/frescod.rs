@@ -4,6 +4,10 @@
 //!   frescod              run the daemon (reads ~/.config/fresco/config.toml)
 //!   frescod --once FILE  render one file on every monitor until Ctrl-C (spike)
 //!   frescod --check      print hardware/decode diagnostics and exit
+//!   frescod --saver      X11 lock-screen saver module; run by a screensaver
+//!                        host (xsecurelock's XSECURELOCK_SAVER, or a
+//!                        mate-screensaver/xfce4-screensaver theme), never by
+//!                        a person — see `daemon::saver` for the full contract
 
 use std::path::PathBuf;
 
@@ -18,6 +22,16 @@ fn main() {
         Some("--check") => {
             fresco::daemon::check();
             return;
+        }
+        Some("--saver") => {
+            // Own exit-code contract (see `daemon::saver`'s doc comment), not
+            // the shared `Result` handling below — mirrors `--check` above in
+            // sidestepping it. Any further argv entries are ignored rather
+            // than rejected: xsecurelock invokes a saver with `-root`
+            // (`saver_child.c`, verified from its source) for XScreenSaver
+            // "hack" compatibility, which this binary has no use for and
+            // must not choke on.
+            std::process::exit(fresco::daemon::saver::run());
         }
         Some("--once") => match args.get(2) {
             Some(file) => fresco::daemon::run_once(PathBuf::from(file)),

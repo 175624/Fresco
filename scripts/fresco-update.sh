@@ -9,7 +9,7 @@
 #   0 = updated successfully
 #   1 = generic failure (network/download/install error)
 #   2 = already up to date (no-op, not an error)
-#   3 = unsupported install (Flatpak, or no apt-get) — caller should route to
+#   3 = unsupported install (no apt-get) — caller should route to
 #       the manual-install fallback UI instead of retrying.
 set -euo pipefail
 
@@ -34,12 +34,7 @@ case "$ORIGIN" in
   *) echo "fresco-update: unknown origin '$ORIGIN'" >&2; exit 1 ;;
 esac
 
-# Unsupported installs first: a Flatpak sandbox can't apt-install, and a
-# non-Debian system has no apt-get to install with.
-if [ -e "/.flatpak-info" ]; then
-  echo "fresco-update: running inside Flatpak; not supported" >&2
-  exit 3
-fi
+# Unsupported installs first: a non-Debian system has no apt-get to install with.
 if ! command -v apt-get >/dev/null 2>&1; then
   echo "fresco-update: apt-get not found; not supported" >&2
   exit 3
