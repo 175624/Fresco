@@ -1706,8 +1706,8 @@ impl Daemon {
         let Some(want) = self.sched.due(&self.config) else {
             return;
         };
+        // `due` already warned about (and filtered out) path-less wallpapers.
         let Some(path) = want.effective_path().map(|p| p.to_path_buf()) else {
-            log::warn!("schedule: the scheduled wallpaper has no usable file path; not switching");
             return;
         };
         log::info!(
@@ -2124,6 +2124,9 @@ struct SchedState {
     /// Manual-Apply hold: the user's explicit choice wins until the schedule's
     /// desired slot CHANGES (next boundary), then scheduling resumes.
     hold: Option<PathBuf>,
+    /// The path-less-slot warning was already logged for the current slot
+    /// (ticks run every 2 s; warn once, not ~43k times a day).
+    warned_no_path: bool,
 }
 
 impl SchedState {
@@ -2151,10 +2154,18 @@ impl SchedState {
     fn due_for(&mut self, config: &Config, want: Wallpaper) -> Option<Wallpaper> {
         let Some(path) = want.effective_path().map(|p| p.to_path_buf()) else {
             // Level-triggered and silent-by-default is how a schedule that
-            // "never switches" hid in the field: say why, once per tick.
-            log::warn!("schedule: the scheduled wallpaper has no usable file path; not switching");
+            // "never switches" hid in the field: say why, once per slot.
+            if !self.warned_no_path {
+                self.warned_no_path = true;
+                log::warn!(
+                    "schedule: the scheduled wallpaper has no usable file path; not switching"
+                );
+            } else {
+                log::debug!("schedule: scheduled wallpaper still has no usable file path");
+            }
             return None;
         };
+        self.warned_no_path = false; // a slot with a path re-arms the warning
         if self.hold.as_deref() == Some(path.as_path()) {
             return None; // user's manual choice holds this slot
         }
@@ -5255,6 +5266,7 @@ mod sched_clock_jump_tests {
         let mut st = SchedState {
             applied: None,
             hold: Some(PathBuf::from("/day.mp4")),
+            warned_no_path: false,
         };
         assert!(st.due_for(&cfg, want_at(&s, 12, 0)).is_none());
         assert!(st.hold.is_some());
@@ -5270,6 +5282,7 @@ mod sched_clock_jump_tests {
         let mut st = SchedState {
             applied: Some(PathBuf::from("/night.mp4")),
             hold: None,
+            warned_no_path: false,
         };
         let got = st.due_for(&cfg, want_at(&s, 9, 0)).unwrap();
         assert_eq!(got.effective_path().unwrap().to_str(), Some("/day.mp4"));
@@ -5280,5 +5293,18 @@ mod sched_clock_jump_tests {
         let cfg = cfg_showing("/day.mp4");
         let mut st = SchedState::default();
         assert!(st.due_for(&cfg, Wallpaper::default()).is_none());
+    }
+
+    #[test]
+    fn pathless_slot_warns_once_until_a_slot_with_a_path() {
+        let cfg = cfg_showing("/day.mp4");
+        let mut st = SchedState::default();
+        assert!(!st.warned_no_path);
+        assert!(st.due_for(&cfg, Wallpaper::default()).is_none());
+        assert!(st.warned_no_path); // first tick took the warn path
+        assert!(st.due_for(&cfg, Wallpaper::default()).is_none());
+        assert!(st.warned_no_path); // later ticks stay quiet (flag unchanged)
+        st.due_for(&cfg, wp("/day.mp4"));
+        assert!(!st.warned_no_path); // re-armed by a slot with a path
     }
 }
