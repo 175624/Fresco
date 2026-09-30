@@ -317,7 +317,9 @@ fn hwdec_logged(rotated: bool) -> String {
 /// How Fresco deals with Deepin DDE's covering desktop window (issue #2).
 /// `Auto` probes the desktop window's visual depth and picks for itself;
 /// `Transparent` forces the DBus transparent-wallpaper strategy; `Restack`
-/// forces stacking our windows above DDE's desktop (icons may be hidden).
+/// forces stacking our windows above DDE's desktop (icons may be hidden);
+/// `Mirror` (experimental, opt-in) does the same and then copies DDE's icons
+/// onto the wallpaper so they stay visible (`daemon::caja_mirror`).
 /// The `FRESCO_DDE_MODE` env var overrides this key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -326,6 +328,7 @@ pub enum DdeMode {
     Auto,
     Transparent,
     Restack,
+    Mirror,
 }
 
 /// Light/dark preference. `System` follows the desktop's color scheme.
@@ -1871,6 +1874,18 @@ mod tests {
         assert_eq!(cfg.dde_icon_peek_secs, 0);
         let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.dde_icon_peek_secs, 0);
+    }
+
+    /// The Deepin icon-mirror opt-in round-trips as the string "mirror", and a
+    /// config without the key keeps the default (Auto = restack on dde-shell).
+    #[test]
+    fn dde_mode_mirror_round_trips() {
+        let cfg: Config = toml::from_str("dde_mode = \"mirror\"").unwrap();
+        assert_eq!(cfg.dde_mode, DdeMode::Mirror);
+        assert!(toml::to_string(&cfg)
+            .unwrap()
+            .contains("dde_mode = \"mirror\""));
+        assert_eq!(Config::default().dde_mode, DdeMode::Auto);
     }
 
     #[test]

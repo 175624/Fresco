@@ -5369,6 +5369,7 @@ fn show_advanced_dialog(window: &adw::ApplicationWindow, state: Rc<RefCell<AppSt
     add_lyrics_group(&page, state.clone());
     add_clock_group(&page, state.clone());
     add_visualizer_group(&page, state.clone());
+    add_deepin_group(&page, state.clone());
     add_disc_group(&page, state);
     dialog.add(&page);
     dialog.present();
@@ -6864,6 +6865,60 @@ fn disc_spin_row(
     widget_spin_row(title, subtitle, range, value, move |v| {
         edit_disc(&state, |d| edit(d, v));
     })
+}
+
+/// "Deepin desktop" preferences group (issue #33): the opt-in for the
+/// experimental icon mirror, which keeps DDE's desktop icons visible above the
+/// live wallpaper. Shown on Deepin only. Off writes `Auto`, not `Restack`, so
+/// turning it off hands the choice back to the daemon's default rather than
+/// pinning a strategy the user never picked.
+fn add_deepin_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>) {
+    if !crate::capability::is_deepin_dde() {
+        return;
+    }
+    let group = adw::PreferencesGroup::new();
+    group.set_title(t!("Deepin desktop"));
+
+    let row = adw::ActionRow::new();
+    row.set_title(t!("Show desktop icons over the video (experimental)"));
+    row.set_subtitle(t!(
+        "Keeps your icons visible and clickable above the live wallpaper. Turn this off if icons flicker or look wrong."
+    ));
+    let switch = gtk4::Switch::new();
+    switch.set_valign(gtk4::Align::Center);
+    switch.set_active(state.borrow().config.dde_mode == crate::config::DdeMode::Mirror);
+    row.add_suffix(&switch);
+    row.set_activatable_widget(Some(&switch));
+    {
+        let state = state.clone();
+        switch.connect_active_notify(move |sw| {
+            let config = {
+                let mut s = state.borrow_mut();
+                s.config.dde_mode = if sw.is_active() {
+                    crate::config::DdeMode::Mirror
+                } else {
+                    crate::config::DdeMode::Auto
+                };
+                s.config.save().ok();
+                s.config.clone()
+            };
+            let state = state.clone();
+            daemon_ctl::apply_async(&config, move |outcome| {
+                if outcome.superseded {
+                    return;
+                }
+                if let Err(e) = outcome.result {
+                    log::error!("failed to apply the Deepin icon setting: {e}");
+                    show_toast(
+                        &state,
+                        t!("Couldn’t start the wallpaper. Run frescod --check"),
+                    );
+                }
+            });
+        });
+    }
+    group.add(&row);
+    page.add(&group);
 }
 
 /// "Album art" preferences group (WIDGETS_ROADMAP W2 GUI). Built exactly like

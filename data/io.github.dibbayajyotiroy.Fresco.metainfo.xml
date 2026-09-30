@@ -9,8 +9,9 @@
        notes below stay English, which AppStream handles by falling back
        per-element. -->
   <name>Fresco</name>
+  <name xml:lang="zh_CN">Fresco 动态壁纸</name>
   <summary>Set videos and images as live wallpapers</summary>
-  <summary xml:lang="zh_CN">将视频和图片设为动态壁纸</summary>
+  <summary xml:lang="zh_CN">一个好用、稳定的动态壁纸播放与管理软件</summary>
   <summary xml:lang="ru">Живые обои из видео и изображений</summary>
 
   <metadata_license>CC0-1.0</metadata_license>
