@@ -13,6 +13,11 @@ pub struct Monitor {
     pub y: i16,
     pub width: u16,
     pub height: u16,
+    /// HiDPI scale in thousandths (`1000` = 1.0). Always `1000` on X11 (RandR
+    /// has no per-monitor scale, and the COSMIC greeter never runs there). On
+    /// Wayland it is filled in by `daemon::wayland_outputs` from wlr-output-management
+    /// or `wl_output`.
+    pub scale_milli: u16,
 }
 
 impl Monitor {
@@ -36,6 +41,7 @@ pub fn list_monitors<C: Connection>(conn: &C, root: Window) -> Result<Vec<Monito
             y: mon.y,
             width: mon.width,
             height: mon.height,
+            scale_milli: 1000,
         });
     }
     // Fallback: if RandR reports nothing, use the root window geometry.
@@ -47,6 +53,7 @@ pub fn list_monitors<C: Connection>(conn: &C, root: Window) -> Result<Vec<Monito
             y: 0,
             width: geo.width,
             height: geo.height,
+            scale_milli: 1000,
         });
     }
     Ok(out)

@@ -4,7 +4,82 @@ All notable changes to Fresco are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.45] — Unreleased
+## [1.1.46] — Unreleased
+
+### Added
+- **Experimental "Show desktop icons over the video" on deepin** (issue
+  #33). Under Advanced → Deepin desktop (or `dde_mode = "mirror"`, or
+  `FRESCO_DDE_MODE=mirror`), Fresco copies deepin's desktop icons and shows
+  them above the live wallpaper. If anything in that setup fails it falls
+  back to the current behaviour, and your own wallpaper is restored when
+  you stop.
+- **A Chinese store name and tagline** (Fresco 动态壁纸 / 一个好用、稳定的动态壁纸播放与管理软件),
+  so Fresco turns up when you search for 动态壁纸 (issue #33).
+- **The day/night section shows the next switch time** and highlights
+  invalid times (issue #32).
+- **Fresco can now show your wallpaper and widgets on the real lock screen**
+  (opt-in, off by default; see [docs/LOCKSCREEN.md](docs/LOCKSCREEN.md)).
+  COSMIC 1.9+ and KDE Plasma 6 get live video and the full widget layer;
+  Sway, Hyprland, niri, river, labwc and Wayfire get it through the new
+  `fresco lock` command wrapping swaylock-plugin, and X11 window managers
+  through xsecurelock. MATE and Xfce can pick Fresco as their screensaver
+  theme for the same wallpaper, but that pairing is still experimental — the
+  widget layer doesn't reach every `mate-screensaver` version. GNOME,
+  Cinnamon and Deepin show a still frame only, since none of them expose a
+  way to draw widgets onto their lock screens yet.
+- **A new `fresco lock` command locks your session through your desktop's
+  own locker.** It's what the lock-screen feature above binds to a key or an
+  idle daemon on Sway, Hyprland, and X11, but it works standalone too, and
+  it always ends in a locked session — falling back through
+  `swaylock`/`hyprlock`/`gtklock` or `xsecurelock`/`i3lock`, and finally
+  `loginctl lock-session`, if Fresco's own daemon or host adapter can't lock
+  it directly.
+
+### Changed
+- **The main menu is split into pages** (Appearance, Language, Behavior,
+  Help & feedback), each with a back button, and the function rows have
+  explanatory tooltips (issue #30).
+- **The window reopens at the size, and maximized state, you left it in**,
+  never larger than the screen (issue #30).
+- **Errors from the day/night schedule are now shown** instead of failing
+  silently (issue #32). The schedule only runs while Fresco's background
+  service is running; when it is down, a notice with a Start button appears
+  in the Day/Night section and in the main window. Stopping the wallpaper
+  while a schedule is active now says the schedule is paused.
+- **COSMIC's own lock screen now shows a still frame of your Fresco
+  wallpaper instead of the stock image.** This applies whether or not the
+  new lock-screen feature above is turned on: Fresco keeps `cosmic-bg`'s
+  configuration pointed at a still frame of your current wallpaper, the same
+  way it already does for GNOME and Cinnamon, and restores your original
+  background when Fresco stops.
+
+### Removed
+- **Flatpak packaging is gone.** The Flatpak manifest and Flathub submission
+  notes are removed from the repo; Fresco ships as a `.deb`, through the AUR,
+  `install.sh` and the Spark Store. Existing Flatpak installs keep running.
+
+### Fixed
+- **Picking a slideshow transition (Ken Burns, Zoom, …) in the editor no
+  longer makes the window grow** (issue #31). The window could grow past the
+  screen until the desktop became unusable, on every desktop, not only
+  deepin. The preview now has a fixed size and loads scaled-down images.
+- **Adding a large folder as individual wallpapers no longer leaves thin,
+  broken cards for minutes** (issue #31). Cards keep their full size while
+  loading and can't be clicked until they are ready, so a click can no
+  longer favourite a card instead of setting the wallpaper. They fill in one
+  by one, with an "Importing N of M" progress row and a Cancel button.
+  Still images are now thumbnailed inside Fresco, which is much faster and
+  no longer starts ffmpeg for every image.
+- **A wallpaper removed from the library no longer silently replaces your
+  saved day/night pick** (issue #32).
+- **"Pause on battery" no longer pauses desktops that have a wireless mouse
+  or keyboard reporting its own battery.** The check read any power supply
+  reporting "Discharging" as the machine running on battery, which included
+  Bluetooth/USB peripherals exposing the same sysfs files a laptop battery
+  does. The daemon now ignores peripheral batteries and only looks at the
+  system's own.
+
+## [1.1.45] — 2026-09-28
 
 ### Added
 - **Search now matches folder names too** (issue #26). Typing a folder's

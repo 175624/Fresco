@@ -43,9 +43,20 @@ TARGET="${CARGO_TARGET_DIR:-$ROOT/target}/release"
 # ship a renderer that regresses to the pre-fix black-screen behavior.
 PATCH="$ROOT/packaging/mpvpaper/0001-egl-context-gl-compat-and-gles-fallback.patch"
 
+# Opt-in lock-screen wallpaper support (see packaging/mpvpaper/ for the full
+# rationale). Adds a MPVPAPER_SHOW_ON_LOCK env var that, when set, binds
+# cosmic-comp's cosmic_session_lock_layer_manager_v1 global and asks it to
+# keep showing each output's layer surface while the session is locked. Also
+# not optional to apply: unlike the EGL patch this is a no-op unless Fresco's
+# daemon sets the env var, but skipping the patch would silently break the
+# feature for every compositor rather than just failing loudly.
+PATCH2="$ROOT/packaging/mpvpaper/0002-cosmic-session-lock-show-on-lock.patch"
+
 command -v meson >/dev/null 2>&1 || { echo "meson is required"; exit 1; }
 command -v ninja >/dev/null 2>&1 || { echo "ninja is required"; exit 1; }
+command -v wayland-scanner >/dev/null 2>&1 || { echo "wayland-scanner is required"; exit 1; }
 [[ -f "$PATCH" ]] || { echo "missing mpvpaper EGL fallback patch: $PATCH"; exit 1; }
+[[ -f "$PATCH2" ]] || { echo "missing mpvpaper show-on-lock patch: $PATCH2"; exit 1; }
 
 mkdir -p "$TARGET"
 BUILD_DIR="$(mktemp -d)"
@@ -56,6 +67,7 @@ cd "$BUILD_DIR"
 git clone --depth 1 --branch "$VERSION" https://github.com/GhostNaN/mpvpaper.git mpvpaper
 cd mpvpaper
 git apply --verbose "$PATCH" || { echo "mpvpaper EGL fallback patch failed to apply against $VERSION — fix the patch before shipping"; exit 1; }
+git apply --verbose "$PATCH2" || { echo "mpvpaper show-on-lock patch failed to apply against $VERSION — fix the patch before shipping"; exit 1; }
 meson setup build
 meson compile -C build
 cp build/mpvpaper "$TARGET/mpvpaper"

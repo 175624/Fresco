@@ -1,0 +1,13 @@
+#!/bin/sh
+# xsecurelock saver module: draws Fresco's wallpaper into the window
+# xsecurelock hands it via $XSCREENSAVER_WINDOW. Installed to
+# /usr/lib/fresco/saver_fresco (see packaging/debian, packaging/aur/*/PKGBUILD,
+# install.sh) and pointed at by X11Host::lock() as XSECURELOCK_SAVER — see
+# src/daemon/lock/hosts/x11.rs and src/daemon/saver.rs for the full contract.
+#
+# xsecurelock execs its saver with one argument, `-root` (for XScreenSaver
+# "hack" compatibility — see saver_child.c in xsecurelock's own source).
+# "$@" forwards it through, but frescod's own `--saver` dispatch never looks
+# past that flag, so it's a harmless no-op there — this saver reads
+# everything it needs ($XSCREENSAVER_WINDOW) from the environment instead.
+exec frescod --saver "$@"

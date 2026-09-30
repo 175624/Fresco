@@ -443,6 +443,10 @@ storage of your own.
 - **Description in Chinese** — *"如无特殊情况，应用详情应当是中文"*, and no emoji or
   unusual symbols. The zh_CN text now in
   `data/io.github.dibbayajyotiroy.Fresco.metainfo.xml` is the obvious source.
+  Use the tagline **一个好用、稳定的动态壁纸播放与管理软件** as the short description
+  and the store name **Fresco 动态壁纸** (the zh_CN `Name` in the `.desktop` and
+  metainfo files), so a search for 动态壁纸 finds the app. Keep whatever name you
+  submit fixed afterwards — updates are matched on it.
 - **Tags** — apps requiring system services must tick **必须安装到主机**. Fresco ships
   a daemon (`frescod`) and writes an autostart entry, so this applies. Getting it
   wrong is a common rejection cause.
@@ -524,10 +528,10 @@ converts a `.deb` into a linglong package and generates the `linglong.yaml`
 Tooling: `sudo apt install linglong-builder linglong-box linglong-bin`, then
 `ll-builder build`. ⚠️ **Big caveat:** linglong is a *sandboxed* container format
 (`ll-box`), so it will hit the exact same class of problems documented in
-[`FLATHUB.md`](FLATHUB.md) — wlr-layer-shell access, a daemon that must outlive the
+the sandbox problems Flatpak hit (wlr-layer-shell access, a daemon that must outlive the
 GUI, `--filesystem=host:ro`-equivalent access to arbitrary user media, and writing an
 autostart entry. Do **not** treat linglong as a mechanical repackage; budget it as
-its own project, and only after Flatpak's sandbox story is settled.
+its own project, and only after its sandbox story is settled.
 
 ### 8c. GitCode — optional, step 4
 

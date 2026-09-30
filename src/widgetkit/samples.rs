@@ -15,10 +15,11 @@
 //! would be somebody's machine, not a build artifact. The test prints every
 //! path it writes.
 
-use super::cards::{clock, disc, media, nowplaying, visualizer};
+use super::cards::{battery, clock, disc, greeting, media, nowplaying, visualizer};
+use super::lockscene;
 use super::*;
 use crate::artwork::DiscCfg;
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 fn out_dir() -> std::path::PathBuf {
     std::env::var_os("FRESCO_WIDGETKIT_SAMPLE_DIR")
@@ -791,6 +792,309 @@ fn peek_lock() -> Result<()> {
                 c.save_png(&path)?;
                 println!("{}", path.display());
             }
+        }
+    }
+    Ok(())
+}
+
+// -- the lock scene ----------------------------------------------------------
+//
+// `render_every_widget_over_both_hostile_backdrops` pins an exact file count,
+// so the lock scene's much larger matrix (five arrangements, three sizes, two
+// backdrops, two themes, plus the COSMIC-panel and compose_still cases) goes
+// through the same `#[ignore]`d "peek" convention `peek_lock`/`peek_media`/
+// `peek_nos` already use above, rather than growing that count.
+
+/// A Canvas sized to `output` device pixels at `out_scale`, degrading the
+/// *rendering* density (never the layout, which stays keyed to
+/// `output / out_scale` regardless — see `lockscene`'s module docs on units)
+/// when `output` alone would exceed [`MAX_CANVAS_AREA`] — exactly
+/// [`lockscene::compose_still`]'s own fallback, reused here so a sample at
+/// 3440x1440 (4.95 MP, over the 4 MP per-widget cap this toolkit holds every
+/// *widget* to) still renders instead of failing the sample generator.
+fn scene_canvas(output: Size, out_scale: f32) -> Result<Canvas> {
+    let scale = if out_scale.is_finite() && out_scale > 0.0 {
+        out_scale
+    } else {
+        1.0
+    };
+    let logical = Size::new((output.w / scale).max(1.0), (output.h / scale).max(1.0));
+    let mut render_scale = scale;
+    loop {
+        match Canvas::for_logical(logical, render_scale) {
+            Ok(c) => return Ok(c),
+            Err(_) if render_scale > 0.1 => render_scale *= 0.5,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// [`lockscene::compose_still`] returns a [`crate::artwork::Bgra`] rather than
+/// a [`Canvas`] (a still composite is meant for a host to hand to its own
+/// image pipeline, not to keep rasterising into) so it has no `save_png` of
+/// its own; this un-premultiplies it back to straight RGBA for the PNG
+/// encoder, the exact inverse of [`Color::to_premul_rgba8`].
+fn save_bgra_png(bgra: &crate::artwork::Bgra, path: &std::path::Path) -> Result<()> {
+    let mut img = image::RgbaImage::new(bgra.w, bgra.h);
+    for (i, px) in bgra.data.chunks_exact(4).enumerate() {
+        let c = Color::from_premul_rgba8([px[2], px[1], px[0], px[3]]);
+        img.put_pixel(
+            i as u32 % bgra.w,
+            i as u32 / bgra.w,
+            image::Rgba([
+                (c.r * 255.0).round() as u8,
+                (c.g * 255.0).round() as u8,
+                (c.b * 255.0).round() as u8,
+                (c.a * 255.0).round() as u8,
+            ]),
+        );
+    }
+    img.save(path)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+const LOCK_ARRANGEMENTS: [LockArrangement; 5] = [
+    LockArrangement::Classic,
+    LockArrangement::Minimal,
+    LockArrangement::Glass,
+    LockArrangement::BigType,
+    LockArrangement::Terminal,
+];
+
+fn lock_clock_variant(a: LockArrangement) -> ClockVariant {
+    // Terminal "pairs with the NOS clock" (spec); everywhere else gets the
+    // Lock variant's card-less, date-over-time treatment — see
+    // `cards::lock`'s module docs for why that one has no card at all.
+    if a == LockArrangement::Terminal {
+        ClockVariant::Nos
+    } else {
+        ClockVariant::Lock
+    }
+}
+
+/// The now-playing card for a lock scene. Lyrics are **off by default** — a
+/// real lock screen shows the track, not the words, unless the user opted
+/// in — so `with_lyrics` is `false` in every sample except the one dedicated
+/// to proving that opt-in case still composes correctly, and `NowPlayingData`
+/// already collapses the whole lyric block (and its divider) to nothing when
+/// `lyric` is empty (spec §9.2), so there is no empty band to leave behind.
+fn lock_scene_media<'a>(
+    art: &'a image::RgbaImage,
+    icon: &'a image::RgbaImage,
+    with_lyrics: bool,
+) -> nowplaying::NowPlayingData<'a> {
+    nowplaying::NowPlayingData {
+        lyric: if with_lyrics {
+            "I see a ship in the harbour"
+        } else {
+            ""
+        },
+        next_lyric: if with_lyrics {
+            "I can and shall obey"
+        } else {
+            ""
+        },
+        ..sample_now(art, icon)
+    }
+}
+
+fn lock_scene_data<'a>(
+    arrangement: LockArrangement,
+    theme: Theme,
+    avatar: &'a image::RgbaImage,
+    art: &'a image::RgbaImage,
+    with_lyrics: bool,
+) -> LockSceneData<'a> {
+    // `compose`/`render_slot` size the Clock, Greeting and Battery slots
+    // themselves from the arrangement and the output (see lockscene.rs's
+    // "suggested sizes" section) and overwrite whatever is set here, so these
+    // three are just reasonable stand-ins for a caller inspecting the data
+    // directly or measuring it outside `compose`.
+    LockSceneData {
+        clock: clock::ClockData {
+            time: "9:41",
+            widest_time: "00:00",
+            weekday: "Tuesday",
+            date: "15 September",
+            secondary: "9h 27m left today",
+            font_size: 64.0,
+            variant: lock_clock_variant(arrangement),
+            accent_follow: false,
+            day_fraction: 0.62,
+        },
+        greeting: Some(greeting::GreetingData {
+            text: "Good evening, Roy",
+            avatar: Some(avatar),
+            text_size: 20.0,
+        }),
+        media: Some(lock_scene_media(art, avatar, with_lyrics)),
+        battery: Some(battery::BatteryData {
+            percent: 64,
+            charging: false,
+            full: false,
+            size: 0.0,
+        }),
+        theme,
+    }
+}
+
+const LOCK_ALL_SLOTS: [LockSlot; 4] = [
+    LockSlot::Clock,
+    LockSlot::Greeting,
+    LockSlot::Media,
+    LockSlot::Battery,
+];
+
+/// Every arrangement, at the three sizes the spec names by name (a standard
+/// 1080p desktop, a phone-proportioned portrait panel, an ultrawide), over
+/// both hostile backdrops, in both themes — the full cross product a person
+/// actually has to eyeball to sign off on this module's geometry.
+#[test]
+#[ignore]
+fn peek_lockscene() -> Result<()> {
+    let mut fonts = FontStack::system();
+    let dir = out_dir();
+    std::fs::create_dir_all(&dir)?;
+    let avatar = cover(96, 96, Color::rgb8(0x6E, 0x4A, 0xD8));
+    let art = photo_cover(420, 300);
+
+    let sizes: [(f32, f32, &str); 3] = [
+        (1920.0, 1080.0, "1920x1080"),
+        (1080.0, 1920.0, "1080x1920"),
+        (3440.0, 1440.0, "3440x1440"),
+    ];
+
+    for (mode, theme_name) in [(Mode::Dark, "dark"), (Mode::Light, "light")] {
+        let theme = Theme::for_accent(mode, crate::config::Accent::Blue);
+        for arrangement in LOCK_ARRANGEMENTS {
+            let tag = format!("{arrangement:?}").to_lowercase();
+            for &(w, h, size_name) in &sizes {
+                for kind in [Backdrop::Hostile, Backdrop::Night] {
+                    let spec = LockSceneSpec {
+                        arrangement,
+                        output: Size::new(w, h),
+                        scale: 1.0,
+                        slots: LOCK_ALL_SLOTS.to_vec(),
+                        reserved: Vec::new(),
+                    };
+                    let data = lock_scene_data(arrangement, theme, &avatar, &art, false);
+                    let mut c = scene_canvas(spec.output, spec.scale)?;
+                    backdrop(&mut c, kind);
+                    lockscene::compose(&mut c, &mut fonts, &spec, &data);
+                    let path = dir.join(format!(
+                        "peek-lockscene-{tag}-{size_name}-{theme_name}-{}.png",
+                        kind.name()
+                    ));
+                    c.save_png(&path)?;
+                    eprintln!("widgetkit sample: {}", path.display());
+                }
+            }
+        }
+    }
+
+    // Lyrics are opt-in on the lock screen (spec review) — every sample above
+    // is the default, lyric-less card. This is the one dedicated exception,
+    // named so it reads as the opt-in case rather than as an inconsistency.
+    {
+        let theme = Theme::for_accent(Mode::Dark, crate::config::Accent::Blue);
+        let spec = LockSceneSpec {
+            arrangement: LockArrangement::Classic,
+            output: Size::new(1920.0, 1080.0),
+            scale: 1.0,
+            slots: LOCK_ALL_SLOTS.to_vec(),
+            reserved: Vec::new(),
+        };
+        let data = lock_scene_data(LockArrangement::Classic, theme, &avatar, &art, true);
+        let mut c = scene_canvas(spec.output, spec.scale)?;
+        backdrop(&mut c, Backdrop::Hostile);
+        lockscene::compose(&mut c, &mut fonts, &spec, &data);
+        let path = dir.join("peek-lockscene-classic-1920x1080-dark-hostile-with-lyrics.png");
+        c.save_png(&path)?;
+        eprintln!("widgetkit sample: {}", path.display());
+    }
+    Ok(())
+}
+
+/// One [`lockscene::compose_still`] sample: a synthetic photo-like gradient
+/// background, blurred and dimmed exactly as a still-frame host would ask for
+/// (blur 0.4, dim 0.25) — the one case in this module where the wallpaper
+/// itself, not just the widgets, is this code's problem.
+#[test]
+#[ignore]
+fn peek_lockscene_still() -> Result<()> {
+    let mut fonts = FontStack::system();
+    let dir = out_dir();
+    std::fs::create_dir_all(&dir)?;
+    let avatar = cover(96, 96, Color::rgb8(0x6E, 0x4A, 0xD8));
+    let art = photo_cover(420, 300);
+    let theme = Theme::for_accent(Mode::Dark, crate::config::Accent::Coral);
+    let bg = photo_cover(960, 540);
+
+    let spec = LockSceneSpec {
+        arrangement: LockArrangement::Classic,
+        output: Size::new(1920.0, 1080.0),
+        scale: 1.0,
+        slots: LOCK_ALL_SLOTS.to_vec(),
+        reserved: Vec::new(),
+    };
+    let data = lock_scene_data(spec.arrangement, theme, &avatar, &art, false);
+    let bgra = lockscene::compose_still(&mut fonts, &bg, &spec, &data, 0.4, 0.25);
+    let path = dir.join("peek-lockscene-still-classic-1920x1080-dark.png");
+    save_bgra_png(&bgra, &path)?;
+    eprintln!("widgetkit sample: {}", path.display());
+    Ok(())
+}
+
+/// One COSMIC-greeter-style sample per arrangement, at the two size/scale
+/// pairs the coordinator asked for: the reserved panel is drawn as a faint
+/// outline *in the sample only* — [`lockscene::compose`] itself never draws
+/// the regions it was told to avoid, only what it placed — so the layout
+/// around it can actually be judged by eye.
+#[test]
+#[ignore]
+fn peek_lockscene_cosmic() -> Result<()> {
+    let mut fonts = FontStack::system();
+    let dir = out_dir();
+    std::fs::create_dir_all(&dir)?;
+    let avatar = cover(96, 96, Color::rgb8(0x6E, 0x4A, 0xD8));
+    let art = photo_cover(420, 300);
+    let theme = Theme::for_accent(Mode::Dark, crate::config::Accent::Teal);
+
+    for &(w, h, scale, size_name) in &[
+        (1920.0_f32, 1080.0_f32, 1.0_f32, "1920x1080@1x"),
+        (2560.0, 1600.0, 1.5, "2560x1600@1.5x"),
+        (1080.0, 1920.0, 1.0, "1080x1920@1x"),
+    ] {
+        for arrangement in LOCK_ARRANGEMENTS {
+            let tag = format!("{arrangement:?}").to_lowercase();
+            let output = Size::new(w, h);
+            let reserved = lockscene::cosmic_greeter_zone(output, scale);
+            let spec = LockSceneSpec {
+                arrangement,
+                output,
+                scale,
+                slots: LOCK_ALL_SLOTS.to_vec(),
+                reserved: vec![reserved],
+            };
+            let data = lock_scene_data(arrangement, theme, &avatar, &art, false);
+            let mut c = scene_canvas(output, scale)?;
+            backdrop(&mut c, Backdrop::Night);
+            lockscene::compose(&mut c, &mut fonts, &spec, &data);
+            let logical = Rect::new(
+                reserved.x / scale,
+                reserved.y / scale,
+                reserved.w / scale,
+                reserved.h / scale,
+            );
+            c.hairline(
+                logical,
+                0.0,
+                Color::rgb8(0xFF, 0x5A, 0x8C).with_alpha(0.85),
+                2.0,
+            );
+            let path = dir.join(format!("peek-lockscene-cosmic-{tag}-{size_name}.png"));
+            c.save_png(&path)?;
+            eprintln!("widgetkit sample: {}", path.display());
         }
     }
     Ok(())

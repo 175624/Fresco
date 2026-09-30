@@ -32,7 +32,7 @@ What the dialog actually asks about is the **detail**:
 | You choose | What Fresco sends |
 | --- | --- |
 | **Accept all** | The headcount, plus your distro, desktop, session type, rendering backend, monitor count, install source, which features you use, error kinds, your city and region, and the exact time of each check-in. |
-| **Decline optional** | The headcount only: a random install id, your country, the app version, and whether you installed the `.deb` or the Flatpak. Your check-in is stored as a **date**, not a time. |
+| **Decline optional** | The headcount only: a random install id, your country, the app version, and which package channel you installed from (for example the `.deb`). Your check-in is stored as a **date**, not a time. |
 
 Both answers can be changed at any time in **Settings → Share anonymous usage
 statistics**. Section 6 explains how to send nothing at all, and section 8 covers messaging the maintainer, which is separate from all of this.
@@ -74,7 +74,7 @@ are sent under both answers; the rest is what "accept all" adds.
 | Install id — **always** | `9f3c1e7a-…` | Random, generated on first run, stored in `install-id` next to your config. Never derived from hardware, MAC address, hostname, or username. |
 | Country — **always** | `IN` | See section 5. |
 | App version — **always** | `1.1.37` | Compiled in. |
-| Channel — **always** | `deb` / `flatpak` | Detected at runtime from how Fresco is packaged. |
+| Channel — **always** | `deb` | Detected at runtime from how Fresco is packaged. |
 | Distro | `Ubuntu 24.04.1 LTS` | `PRETTY_NAME` from `/etc/os-release`. |
 | Desktop | `COSMIC` | `XDG_CURRENT_DESKTOP`. |
 | Session | `wayland` | `XDG_SESSION_TYPE`. |
@@ -97,7 +97,7 @@ fifty times.
 ## 4. "Decline optional" in full
 
 One request a day, containing four things: the random install id, your country,
-the app version, and whether you installed the `.deb` or the Flatpak.
+the app version, and which package channel you installed from (for example the `.deb`).
 
 It carries **no distro, no desktop, no session type, no rendering backend, no
 monitor count, no install source, no feature usage, no error reports, and no IP

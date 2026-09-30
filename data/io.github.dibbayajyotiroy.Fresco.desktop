@@ -1,11 +1,12 @@
 [Desktop Entry]
 Type=Application
 Name=Fresco
+Name[zh_CN]=Fresco 动态壁纸
 GenericName=Live Wallpaper
 GenericName[zh_CN]=动态壁纸
 GenericName[ru]=Живые обои
 Comment=Set video, GIF, and image wallpapers with hardware-accelerated playback
-Comment[zh_CN]=将视频、GIF 和图片设为壁纸，硬件加速播放
+Comment[zh_CN]=一个好用、稳定的动态壁纸播放与管理软件，支持视频、GIF 和图片，硬件加速播放
 Comment[ru]=Установка видео, GIF и изображений в качестве обоев с аппаратным ускорением
 Exec=fresco %F
 Icon=io.github.dibbayajyotiroy.Fresco

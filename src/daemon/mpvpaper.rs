@@ -533,12 +533,25 @@ impl WaylandPlayer {
     /// `file` is the initial media (for a slideshow, the first image — later ones
     /// arrive via `loadfile replace`); the caller resolves it so folder-based
     /// slideshows work too.
+    ///
+    /// `show_on_lock` sets `MPVPAPER_SHOW_ON_LOCK` on the child's environment —
+    /// see `packaging/mpvpaper/0002-cosmic-session-lock-show-on-lock.patch`'s
+    /// header for the protocol this opts into. Always set explicitly (`"1"` or
+    /// `"0"`), never merely omitted when off: `Command::spawn` otherwise
+    /// inherits whatever this daemon's own process environment happens to
+    /// carry, and a caller must be able to turn the flag off with certainty,
+    /// not just "probably, unless something upstream set it". Unpatched
+    /// mpvpaper ignores the variable either way (`getenv()`, gated behind an
+    /// `if`, per the patch), so passing `true` on a compositor or mpvpaper
+    /// build that doesn't understand it costs nothing beyond one inert
+    /// environment variable.
     pub fn spawn(
         connector: &str,
         wallpaper: &Wallpaper,
         scaling: Scaling,
         power_saving: PowerSaving,
         file: &Path,
+        show_on_lock: bool,
     ) -> Result<WaylandPlayer> {
         let dir = crate::ipc::socket_dir();
         std::fs::create_dir_all(&dir).ok();
@@ -568,6 +581,7 @@ impl WaylandPlayer {
             .arg(&opts)
             .arg(connector)
             .arg(file)
+            .env("MPVPAPER_SHOW_ON_LOCK", if show_on_lock { "1" } else { "0" })
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -724,6 +738,14 @@ impl WaylandPlayer {
 
     pub fn set_gamma(&self, gamma: i32) {
         self.set("gamma", json!(gamma));
+    }
+
+    /// Adjust mpv's `brightness` property (-100..=100, mpv's own documented
+    /// range). Used for the lock screen's `dim` (`daemon::lock::engine`'s
+    /// `Desktop` target — see `docs/plan-lock-screen.md` §3.1) via
+    /// `-round(dim * 100)`; nothing on the live desktop uses this today.
+    pub fn set_brightness(&self, brightness: i32) {
+        self.set("brightness", json!(brightness));
     }
 
     /// Defocus the video by `sigma` logical pixels; `0.0` clears the filter.
@@ -985,7 +1007,13 @@ fn sanitize(connector: &str) -> String {
 
 /// Build the space-separated mpv option string passed to `mpvpaper -o`. Mirrors
 /// the options the X11 `Player` sets (minus `wid`/`vo`, which mpvpaper owns).
-fn build_mpv_opts(
+///
+/// `pub(crate)`, not `pub`: the wlroots lock host
+/// (`daemon::lock::hosts::wlroots`) reuses this so the background mpvpaper it
+/// hands to swaylock-plugin per output gets the exact same options — hwdec,
+/// scaling, loop/mute, rotation — the desktop wallpaper already uses, rather
+/// than a second, driftable copy of this logic. No behaviour change here.
+pub(crate) fn build_mpv_opts(
     w: &Wallpaper,
     scaling: Scaling,
     power_saving: PowerSaving,
@@ -1084,14 +1112,21 @@ fn build_mpv_opts_with_hwdec(
 
 /// Minimal client for mpv's JSON IPC (`--input-ipc-server`). Reconnects on
 /// failure; matches replies by `request_id` so async events are ignored.
-struct MpvIpc {
+///
+/// `pub(super)`, not private: `daemon::lock::engine` connects one of these per
+/// socket for the `hosts::LockTargets::Sockets` target (a wlroots/X11 host's
+/// out-of-process renderer, once wave 2b lands) — the exact same
+/// connect/retry/command shape a Fresco-spawned mpv already needs, so it is
+/// reused rather than re-implemented against a bare `UnixStream` a second
+/// time.
+pub(super) struct MpvIpc {
     path: PathBuf,
     stream: Option<UnixStream>,
     next_id: i64,
 }
 
 impl MpvIpc {
-    fn new(path: PathBuf) -> MpvIpc {
+    pub(super) fn new(path: PathBuf) -> MpvIpc {
         MpvIpc {
             path,
             stream: None,
@@ -1100,7 +1135,7 @@ impl MpvIpc {
     }
 
     /// Connect, retrying every 100ms up to `attempts` times.
-    fn connect_retry(&mut self, attempts: u32) -> Result<()> {
+    pub(super) fn connect_retry(&mut self, attempts: u32) -> Result<()> {
         for _ in 0..attempts {
             if let Ok(s) = UnixStream::connect(&self.path) {
                 let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
@@ -1117,7 +1152,7 @@ impl MpvIpc {
     }
 
     /// Send `["cmd", arg, ...]` and return the reply matching our request_id.
-    fn command(&mut self, args: &[Value]) -> Result<Value> {
+    pub(super) fn command(&mut self, args: &[Value]) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let req = json!({ "command": args, "request_id": id });
@@ -1167,17 +1202,60 @@ impl MpvIpc {
     }
 
     /// Fire-and-forget property set.
-    fn set(&mut self, name: &str, value: Value) {
+    pub(super) fn set(&mut self, name: &str, value: Value) {
         let _ = self.command(&[json!("set_property"), json!(name), value]);
     }
 
     /// Read a property as a string (numbers/bools stringified); None on error.
-    fn get(&mut self, name: &str) -> Option<String> {
+    #[cfg_attr(not(test), allow(dead_code))] // only the tests exercise `get` directly today
+    pub(super) fn get(&mut self, name: &str) -> Option<String> {
         let v = self.command(&[json!("get_property"), json!(name)]).ok()?;
         match v.get("data")? {
             Value::String(s) => Some(s.clone()),
             other => Some(other.to_string()),
         }
+    }
+
+    /// Place a raw BGRA bitmap on the OSD layer at `(x, y)`. Mirrors
+    /// [`WaylandPlayer::overlay_add`] exactly (same command, same argument
+    /// order) — see that method's doc comment for the `stride`/premultiplied
+    /// contract the caller must uphold.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn overlay_add(
+        &mut self,
+        id: u32,
+        x: i32,
+        y: i32,
+        path: &str,
+        w: u32,
+        h: u32,
+        stride: u32,
+    ) {
+        let _ = self.command(&[
+            json!("overlay-add"),
+            json!(id),
+            json!(x),
+            json!(y),
+            json!(path),
+            json!(0),
+            json!("bgra"),
+            json!(w),
+            json!(h),
+            json!(stride),
+        ]);
+    }
+
+    /// Remove a bitmap overlay previously added with [`MpvIpc::overlay_add`].
+    pub(super) fn overlay_remove(&mut self, id: u32) {
+        let _ = self.command(&[json!("overlay-remove"), json!(id)]);
+    }
+
+    /// Whether the last connection attempt is currently up. `daemon::lock::engine`
+    /// uses this to time out a socket that never appears (`hosts::LockTargets::Sockets`'
+    /// "retry until it appears, ≤5s" rule) without needing `command`'s own
+    /// blocking retry-and-sleep on every failed push.
+    pub(super) fn is_connected(&self) -> bool {
+        self.stream.is_some()
     }
 }
 
@@ -1602,7 +1680,8 @@ exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet
                 &wp,
                 Scaling::Balanced,
                 PowerSaving::Full,
-                &std::env::temp_dir().join("fresco-none.mp4")
+                &std::env::temp_dir().join("fresco-none.mp4"),
+                false,
             )
             .is_err(),
             "spawn must fail gracefully when the backend binary is missing (T8)"
@@ -1626,6 +1705,7 @@ exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet
             Scaling::Balanced,
             PowerSaving::Full,
             &std::env::temp_dir().join("fresco-none.mp4"),
+            false,
         ) else {
             panic!("a renderer that exits at once is a spawn failure");
         };
@@ -1680,6 +1760,7 @@ exec mpv --idle=yes --vo=null --ao=null --no-config --no-terminal --really-quiet
             Scaling::Balanced,
             PowerSaving::Full,
             &std::env::temp_dir().join("fresco-none.mp4"),
+            false,
         )
         .expect("spawn the fake mpvpaper backend");
         assert!(

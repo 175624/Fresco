@@ -49,7 +49,6 @@ body:
       label: Install method
       options:
         - .deb / install.sh
-        - Flatpak
         - Built from source
         - Other
     validations:

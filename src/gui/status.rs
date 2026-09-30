@@ -1,7 +1,7 @@
 //! Live "now playing" status pill + pause/resume toggle, backed by
 //! `ipc::request(&Request::Status)`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -23,6 +23,105 @@ thread_local! {
 /// read of state `poll_once` already fetched in the background.
 pub(crate) fn cached_monitors() -> Vec<MonitorInfo> {
     LAST_MONITORS.with(|m| m.borrow().clone())
+}
+
+/// Callback that shows/hides the service notice from a reachability result.
+type NoticeHook = Rc<dyn Fn(bool)>;
+
+thread_local! {
+    /// Updates the "service not running" notice from a reachability result.
+    /// Set once by `build_service_notice`; the status poll and
+    /// `refresh_service_notice` feed it.
+    static NOTICE_HOOK: RefCell<Option<NoticeHook>> = const { RefCell::new(None) };
+}
+
+fn notify_reachable(reachable: bool) {
+    let hook = NOTICE_HOOK.with(|h| h.borrow().clone());
+    if let Some(hook) = hook {
+        hook(reachable);
+    }
+}
+
+/// Ask whether the daemon is alive without blocking the GTK thread
+/// (`daemon_alive` is a blocking IPC round trip); `done` runs on the GTK
+/// thread with the answer.
+pub(crate) fn probe_daemon(done: impl FnOnce(bool) + 'static) {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(ipc::daemon_alive());
+    });
+    glib::spawn_future_local(async move {
+        if let Ok(alive) = rx.recv().await {
+            done(alive);
+        }
+    });
+}
+
+/// Re-evaluate the main-window notice now (after the schedule was edited or
+/// the service was started) instead of waiting for the next status poll.
+pub(crate) fn refresh_service_notice() {
+    probe_daemon(notify_reachable);
+}
+
+/// Compact dismissible "service not running" notice for the main window.
+/// `schedule_active` says whether a schedule is enabled and not paused (the
+/// only case where a dead daemon silently breaks something); `start` runs the
+/// Start button's action. Deliberately no auto-start: the user may have
+/// pressed Stop on purpose. Not an `adw::Banner` (needs libadwaita 1.3).
+pub(crate) fn build_service_notice(
+    schedule_active: Rc<dyn Fn() -> bool>,
+    start: Rc<dyn Fn()>,
+) -> gtk4::Widget {
+    let revealer = gtk4::Revealer::new();
+    revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    row.add_css_class("capability-banner");
+    row.set_margin_start(12);
+    row.set_margin_end(12);
+    row.set_margin_top(10);
+    let icon = gtk4::Image::from_icon_name("dialog-warning-symbolic");
+    icon.set_valign(gtk4::Align::Center);
+    let label = gtk4::Label::new(Some(t!(
+        "Fresco's background service isn't running, so the schedule can't switch wallpapers."
+    )));
+    label.set_wrap(true);
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    let start_btn = gtk4::Button::with_label(t!("Start"));
+    start_btn.set_valign(gtk4::Align::Center);
+    let dismiss = gtk4::Button::from_icon_name("window-close-symbolic");
+    dismiss.add_css_class("flat");
+    dismiss.set_valign(gtk4::Align::Center);
+    row.append(&icon);
+    row.append(&label);
+    row.append(&start_btn);
+    row.append(&dismiss);
+    revealer.set_child(Some(&row));
+
+    // Dismissal lasts until the daemon has been seen running again, so it
+    // does not nag every 4 s poll but does return after the next real outage.
+    let dismissed = Rc::new(Cell::new(false));
+    {
+        let dismissed = dismissed.clone();
+        let revealer = revealer.clone();
+        dismiss.connect_clicked(move |_| {
+            dismissed.set(true);
+            revealer.set_reveal_child(false);
+        });
+    }
+    start_btn.connect_clicked(move |_| start());
+    let hook: Rc<dyn Fn(bool)> = {
+        let revealer = revealer.clone();
+        Rc::new(move |reachable| {
+            if reachable {
+                dismissed.set(false);
+            }
+            revealer.set_reveal_child(!reachable && !dismissed.get() && schedule_active());
+        })
+    };
+    NOTICE_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+    revealer.upcast()
 }
 
 /// How often to poll the daemon while the window is open. A live status
@@ -138,6 +237,7 @@ fn poll_once(widgets: Rc<PillWidgets>) {
             Ok(crate::ipc::Response::Status(status)) => {
                 LAST_MONITORS.with(|m| *m.borrow_mut() = status.monitors_info.clone());
                 apply_status(&widgets, &status);
+                notify_reachable(status.running);
             }
             Ok(_) => {}
             Err(e) => {
@@ -145,6 +245,7 @@ fn poll_once(widgets: Rc<PillWidgets>) {
                 log::debug!("status poll: daemon unreachable: {e:#}");
                 LAST_MONITORS.with(|m| m.borrow_mut().clear());
                 apply_off(&widgets);
+                notify_reachable(false);
             }
         }
     });

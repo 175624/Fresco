@@ -1,6 +1,6 @@
 [package]
 name = "fresco"
-version = "1.1.45"
+version = "1.1.46"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Live wallpapers for Linux — video, GIF, image, slideshow, and playlist wallpapers with hardware-accelerated playback"
@@ -120,11 +120,24 @@ depends = "libgtk-4-1 (>= 4.6), libadwaita-1-0 (>= 1.1), libmpv2 | libmpv1, libw
 #     ffmpegthumbnailer unrotated) and `ffprobe` for library metadata (fields
 #     just stay empty). Both already degrade silently by design.
 recommends = "mesa-va-drivers, intel-media-va-driver, fonts-inter, gstreamer1.0-plugins-good, gstreamer1.0-libav, ffmpeg, pulseaudio-utils | pipewire-bin, xdg-utils, pkexec | policykit-1"
+# Suggests, not Recommends: each of these is needed by exactly one lock-screen
+# host, so installing it unconditionally would be a much stronger nudge than
+# "might be useful" warrants for most machines (docs/plan-lock-screen.md §4.3,
+# §4.5).
+#   * xsecurelock — the X11 lock-host (src/daemon/lock/hosts/x11.rs) shells
+#     out to it via `fresco lock`; without it that host degrades to
+#     LockSetupState::Unavailable rather than failing to install.
+#   * qml6-module-qtmultimedia — the KDE lock-screen wallpaper plugin's video
+#     layer (packaging/kde/README.md's "Optional runtime dependency"); the
+#     plugin already degrades to a still image without it.
+suggests = "xsecurelock, qml6-module-qtmultimedia"
 extended-description = """\
 Fresco sets videos, GIFs, images, slideshows, and video playlists as your \
 desktop wallpaper. Pick media in a simple app, click Set, close the app — \
 the wallpaper keeps playing and restores on login. Hardware-accelerated \
-decoding keeps CPU usage near zero without degrading quality."""
+decoding keeps CPU usage near zero without degrading quality.
+
+一个好用、稳定的动态壁纸播放与管理软件。支持视频、GIF、图片和幻灯片壁纸，硬件加速播放，壁纸库分类管理。"""
 assets = [
     ["target/release/fresco", "usr/bin/", "755"],
     ["target/release/frescod", "usr/bin/", "755"],
@@ -162,6 +175,31 @@ assets = [
     ["data/icons/bloom/io.github.dibbayajyotiroy.Fresco.svg", "usr/share/icons/bloom/apps/128/", "644"],
     ["data/icons/bloom/io.github.dibbayajyotiroy.Fresco.svg", "usr/share/icons/bloom/apps/256/", "644"],
     ["data/icons/bloom/io.github.dibbayajyotiroy.Fresco.svg", "usr/share/icons/bloom/apps/512/", "644"],
+    # Lock-screen aesthetics (docs/plan-lock-screen.md §4.3/§4.4): the X11
+    # saver module xsecurelock/mate-screensaver/xfce4-screensaver run, and the
+    # MATE/Xfce screensaver-theme .desktop entry that points at it. See
+    # src/daemon/saver.rs and src/daemon/lock/hosts/x11.rs.
+    ["data/saver_fresco", "usr/lib/fresco/saver_fresco", "755"],
+    ["data/screensavers/fresco.desktop", "usr/share/applications/screensavers/fresco.desktop", "644"],
+    # KDE Plasma 6 lock-screen wallpaper plugin (packaging/kde/README.md is the
+    # verified contract for these paths/keys). Installed twice:
+    #   1. The real Plasma system path — Plasma discovers it with no extra
+    #      step on install, by scanning plasma/wallpapers/*/metadata.json.
+    #   2. A second, Fresco-owned copy under usr/share/fresco/, which
+    #      KdeHost::setup() (src/daemon/lock/hosts/kde.rs) copies from into
+    #      ~/.local/share/plasma/wallpapers/ if the system path above is ever
+    #      missing (a non-standard install, or a Plasma reinstall that
+    #      cleared it) — independent of this exact packaging path succeeding.
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/metadata.json", "usr/share/plasma/wallpapers/io.github.dibbayajyotiroy.fresco.lockscreen/metadata.json", "644"],
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/config/main.xml", "usr/share/plasma/wallpapers/io.github.dibbayajyotiroy.fresco.lockscreen/contents/config/main.xml", "644"],
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/main.qml", "usr/share/plasma/wallpapers/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/main.qml", "644"],
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/VideoLayer.qml", "usr/share/plasma/wallpapers/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/VideoLayer.qml", "644"],
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/config.qml", "usr/share/plasma/wallpapers/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/config.qml", "644"],
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/metadata.json", "usr/share/fresco/kde/io.github.dibbayajyotiroy.fresco.lockscreen/metadata.json", "644"],
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/config/main.xml", "usr/share/fresco/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/config/main.xml", "644"],
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/main.qml", "usr/share/fresco/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/main.qml", "644"],
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/VideoLayer.qml", "usr/share/fresco/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/VideoLayer.qml", "644"],
+    ["packaging/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/config.qml", "usr/share/fresco/kde/io.github.dibbayajyotiroy.fresco.lockscreen/contents/ui/config.qml", "644"],
 ]
 # The postinst NEVER refreshes the icon cache or desktop database: the standard
 # hicolor-icon-theme and desktop-file-utils triggers own that (they fire when our

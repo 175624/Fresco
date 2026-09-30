@@ -3,6 +3,7 @@ pub mod artwork;
 #[cfg(feature = "daemon")]
 pub mod audio_capture;
 pub mod autostart;
+pub mod battery;
 pub mod capability;
 #[cfg(any(feature = "gui", feature = "daemon"))]
 pub mod catalog;
@@ -20,6 +21,7 @@ pub mod i18n;
 pub mod ipc;
 #[cfg(any(feature = "gui", feature = "daemon"))]
 pub mod linkresolve;
+pub mod lockscreen;
 pub mod lyrics;
 #[cfg(feature = "daemon")]
 pub mod lyrics_fetch;
@@ -33,6 +35,7 @@ pub mod support;
 pub mod telemetry;
 #[cfg(any(feature = "gui", feature = "daemon"))]
 pub mod update;
+pub mod userinfo;
 pub mod visualizer;
 #[cfg(feature = "daemon")]
 pub mod widgetkit;

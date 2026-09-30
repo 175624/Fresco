@@ -346,6 +346,9 @@ window.glass .background {{ background: transparent; }}
 /* Placeholder shown inside a card while (or if) no thumbnail exists. */
 .wp-placeholder {{ background-color: @thumb_mat; }}
 .wp-placeholder image {{ color: @dim_fg; }}
+/* Card whose import work (thumbnail / metadata) is still outstanding: same
+   size as a real card, glyph dimmed so it reads as loading, not empty. */
+.wp-card.wp-loading .wp-placeholder image {{ opacity: 0.45; }}
 
 /* ===== Status ===== */
 .status-pill {{ background-color: @card_bg_color; border: 1px solid @card_border; border-radius: 999px; padding: 2px 12px; color: @dim_fg; font-size: 12px; }}
@@ -469,6 +472,36 @@ label.error, label.error.dim {{ color: @destructive_color; }}
 
 /* ===== Misc ===== */
 .welcome-cta {{ min-height: 40px; border-radius: 11px; font-weight: 600; }}
+
+/* ===== Lock Screen page (src/gui/lockscreen.rs) =====
+   Preset gallery cards double as radio buttons (GtkToggleButton + set_group),
+   so the selected state is the button's own :checked pseudo-class rather than
+   a manually-toggled class. The gallery itself sits inside a bare
+   AdwPreferencesRow (see `.lock-preset-row` below) so it sorts above the
+   group's other rows. */
+.lock-preset-card {{ min-width: 150px; padding: 10px 12px; border-radius: 12px; background-image: none; background-color: @card_bg_color; border: 1px solid @card_border; box-shadow: none; transition: border-color 130ms cubic-bezier(0.4, 0, 0.2, 1), background-color 130ms cubic-bezier(0.4, 0, 0.2, 1); }}
+.lock-preset-card:hover {{ background-color: @card_hover; }}
+.lock-preset-card:checked {{ border: 2px solid @accent_bg_color; background-color: alpha(@accent_bg_color, 0.10); background-image: none; }}
+/* Normal weight: matches every other row title on this page (AdwActionRow's
+   own title is not bold) — the card's emphasis comes from full-strength
+   color and being the first line, not from boldness. */
+.lock-preset-title {{ font-weight: 400; }}
+/* Small + dimmed + explicitly normal-weight, so the description never reads
+   at the same visual weight as the title above it. */
+.lock-preset-blurb {{ font-size: 12px; font-weight: 400; opacity: 0.75; }}
+/* The wrapper row itself carries no data — it must not look or behave like
+   an interactive row (no hover/activation fill); the cards inside it already
+   supply every visual affordance. */
+row.lock-preset-row,
+row.lock-preset-row:hover,
+row.lock-preset-row:focus,
+row.lock-preset-row:active {{ background: none; background-image: none; box-shadow: none; }}
+/* Capability chips (Live video / Widgets) in the host status row. */
+.lock-chip {{ font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; border: 1px solid @card_border; }}
+.lock-chip-on {{ color: #3FB950; border-color: alpha(#3FB950, 0.4); }}
+.lock-chip-off {{ color: @dim_fg; }}
+/* \"Press any key to close\" hint over the full-screen preview. */
+.lock-preview-hint {{ font-size: 12px; padding: 6px 14px; border-radius: 999px; }}
 ",
         window_bg = p.window_bg,
         window_fg = p.window_fg,

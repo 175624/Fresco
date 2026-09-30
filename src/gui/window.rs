@@ -8,8 +8,9 @@ use gtk4::{FileChooserAction, GestureClick, PolicyType, ResponseType};
 use libadwaita::{self as adw, prelude::*};
 
 use super::theme;
+use super::window_state;
 use super::{
-    daemon_ctl,
+    daemon_ctl, import_queue,
     library::{self, load_entries, save_entries, LibraryEntry},
     status,
 };
@@ -187,6 +188,41 @@ impl AppState {
 
 // ─── Main window ─────────────────────────────────────────────────────────────
 
+/// Logical size of the largest connected monitor, if the display can be asked.
+fn largest_monitor_size() -> Option<(i32, i32)> {
+    let monitors = gtk4::gdk::Display::default()?.monitors();
+    (0..monitors.n_items())
+        .filter_map(|i| monitors.item(i)?.downcast::<gtk4::gdk::Monitor>().ok())
+        .map(|m| {
+            let g = m.geometry();
+            (g.width(), g.height())
+        })
+        .max_by_key(|(w, h)| i64::from(*w) * i64::from(*h))
+}
+
+/// Persist the main window's size and maximized flag.
+///
+/// Reads `default_width/height` (the size the user left it at) rather than the
+/// allocation. The size is checked against the monitor the window is actually
+/// on so a window that ballooned past the screen (#31) is never written back.
+fn remember_window_state(window: &adw::ApplicationWindow) {
+    let monitor = window.surface().and_then(|surface| {
+        let m = gtk4::gdk::Display::default()?.monitor_at_surface(&surface)?;
+        let g = m.geometry();
+        Some((g.width(), g.height()))
+    });
+    let next = window_state::next_state(
+        &window_state::load(),
+        window.default_width(),
+        window.default_height(),
+        window.is_maximized(),
+        monitor,
+    );
+    if let Err(e) = window_state::save(&next) {
+        log::debug!("could not save window size: {e:#}");
+    }
+}
+
 fn build_ui(app: &adw::Application) {
     // The app id makes us D-Bus-unique: launching fresco again re-activates
     // this process. Present the existing window instead of building a
@@ -198,8 +234,15 @@ fn build_ui(app: &adw::Application) {
 
     let window = adw::ApplicationWindow::new(app);
     window.set_title(Some("Fresco"));
-    window.set_default_size(880, 660);
-    window.set_size_request(420, 480);
+    // Reopen at the size the user left it. Size and maximized only: GTK4 has
+    // no way to place a toplevel, so position cannot be restored.
+    let saved_window = window_state::load();
+    let (init_w, init_h) = window_state::restore_size(&saved_window, largest_monitor_size());
+    window.set_default_size(init_w, init_h);
+    if saved_window.maximized {
+        window.maximize();
+    }
+    window.set_size_request(window_state::MIN_SIZE.0, window_state::MIN_SIZE.1);
     window.set_icon_name(Some(APP_ID));
 
     // Ctrl+Q quits. `GApplication` has no built-in "quit" action, so register
@@ -207,7 +250,12 @@ fn build_ui(app: &adw::Application) {
     let quit_action = gio::SimpleAction::new("quit", None);
     {
         let app = app.clone();
-        quit_action.connect_activate(move |_, _| app.quit());
+        let window = window.clone();
+        quit_action.connect_activate(move |_, _| {
+            // Ctrl+Q ends the app without a close-request on the window.
+            remember_window_state(&window);
+            app.quit();
+        });
     }
     app.add_action(&quit_action);
     app.set_accels_for_action("app.quit", &["<primary>q"]);
@@ -314,11 +362,33 @@ fn build_ui(app: &adw::Application) {
         }
         None => window.set_content(Some(&toast)),
     }
+    window.connect_close_request(|win| {
+        remember_window_state(win);
+        gtk4::glib::Propagation::Proceed
+    });
+    // Other quit paths (the post-update relaunch calls `app.quit()` too). By
+    // shutdown GTK may already have unrealized the window, and then
+    // `is_maximized()` would read false; only trust a window that still has
+    // its surface.
+    {
+        let weak = window.downgrade();
+        app.connect_shutdown(move |_| {
+            if let Some(win) = weak.upgrade() {
+                if win.surface().is_some() {
+                    remember_window_state(&win);
+                }
+            }
+        });
+    }
     window.present();
 
     // Headless UI-smoke hook: open the gallery immediately (tests/ci only).
     if std::env::var("FRESCO_OPEN_GALLERY").ok().as_deref() == Some("1") {
         super::gallery::show_gallery_window(&window, state.clone());
+    }
+    // As above, for the Lock Screen page (docs/plan-lock-screen.md §6).
+    if std::env::var("FRESCO_OPEN_LOCKSCREEN").ok().as_deref() == Some("1") {
+        super::lockscreen::show_lockscreen_window(&window, state.clone());
     }
 
     // Deep link used by the daemon's feedback-reminder notification: clicking
@@ -514,6 +584,7 @@ fn build_library_view(
     menu_btn.set_popover(Some(&build_menu_popover(window, state.clone())));
     header.pack_end(&menu_btn);
     root.append(&header);
+    root.append(&service_notice(&state));
 
     // ── "What's new" banner (shown once per version after an update) ──
     if let Some(banner) = super::updates::build_update_banner(window, state.clone()) {
@@ -567,6 +638,11 @@ fn build_library_view(
             app.set_accels_for_action("win.open-menu", &["<primary>comma"]);
         }
     }
+
+    // ── Import progress row (hidden until a folder/file import is running) ──
+    let import_slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    super::import_queue::install_progress_row(&import_slot);
+    root.append(&import_slot);
 
     // ── Scrollable content ──
     let scroll = gtk4::ScrolledWindow::new();
@@ -1101,7 +1177,13 @@ fn apply_layout_bucket(
     // Footer inset comes from the .footer-bar / .compact-layout CSS padding.
 }
 
-/// Header menu: appearance (theme mode + accent) and behavior switches.
+/// Header menu: a root page of navigation rows and actions, with the
+/// settings-like sections (appearance, language, behavior, help) on second-level
+/// pages.
+///
+/// The pages are children of one `gtk4::Stack` inside the one popover. Not a
+/// nested popover or a `GtkDropDown` — a second popup surface is what leaked the
+/// X11 seat grab in issue #5 (see `build_language_row`).
 fn build_menu_popover(
     window: &adw::ApplicationWindow,
     state: Rc<RefCell<AppState>>,
@@ -1111,6 +1193,108 @@ fn build_menu_popover(
     let popover = gtk4::Popover::new();
     popover.add_css_class("fresco-menu");
 
+    let stack = gtk4::Stack::new();
+    stack.set_transition_type(gtk4::StackTransitionType::SlideLeftRight);
+    stack.set_transition_duration(160);
+    // Height follows the visible page instead of the tallest one, so the short
+    // pages do not leave the popover as tall as the language list.
+    stack.set_vhomogeneous(false);
+
+    let theme_sub = gtk4::Label::new(Some(theme_mode_label(state.borrow().config.theme_mode)));
+    let lang_sub = gtk4::Label::new(Some(state.borrow().config.language.display_name()));
+
+    let appearance_nav = nav_row(t!("Appearance"), Some(&theme_sub), &stack, "appearance");
+    let language_nav = nav_row(t!("Language"), Some(&lang_sub), &stack, "language");
+    let behavior_nav = nav_row(t!("Behavior"), None, &stack, "behavior");
+    let help_nav = nav_row(t!("Help & feedback"), None, &stack, "help");
+
+    stack.add_named(
+        &build_menu_root(
+            window,
+            &state,
+            &popover,
+            [&appearance_nav, &language_nav, &behavior_nav, &help_nav],
+        ),
+        Some(MENU_ROOT),
+    );
+    stack.add_named(
+        &menu_page(
+            t!("Appearance"),
+            &stack,
+            &appearance_nav,
+            &build_appearance_page(&state, theme_sub),
+        ),
+        Some("appearance"),
+    );
+    stack.add_named(
+        &menu_page(
+            t!("Language"),
+            &stack,
+            &language_nav,
+            &build_language_row(state.clone(), lang_sub),
+        ),
+        Some("language"),
+    );
+    stack.add_named(
+        &menu_page(
+            t!("Behavior"),
+            &stack,
+            &behavior_nav,
+            &build_behavior_page(&state),
+        ),
+        Some("behavior"),
+    );
+    stack.add_named(
+        &menu_page(
+            t!("Help & feedback"),
+            &stack,
+            &help_nav,
+            &build_help_page(window, &state, &popover),
+        ),
+        Some("help"),
+    );
+
+    // Always reopen on the root page, not wherever it was last left; the
+    // reset is instant so it never animates a page change on an unmapped popup.
+    {
+        let stack = stack.clone();
+        popover.connect_closed(move |_| {
+            stack.set_visible_child_full(MENU_ROOT, gtk4::StackTransitionType::None);
+        });
+    }
+    // Escape / Alt+Left step back out of a sub-page instead of closing the
+    // whole menu. Capture phase, so it runs before the popover's own Escape.
+    {
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let stack = stack.clone();
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            let on_subpage = stack.visible_child_name().as_deref() != Some(MENU_ROOT);
+            let back = key == gtk4::gdk::Key::Escape
+                || (key == gtk4::gdk::Key::Left
+                    && mods.contains(gtk4::gdk::ModifierType::ALT_MASK));
+            if on_subpage && back {
+                stack.set_visible_child_name(MENU_ROOT);
+                stack.child_focus(gtk4::DirectionType::TabForward);
+                gtk4::glib::Propagation::Stop
+            } else {
+                gtk4::glib::Propagation::Proceed
+            }
+        });
+        popover.add_controller(keys);
+    }
+
+    // The menu can grow taller than the space under its button, but a popover
+    // taller than that does not clip — on Wayland it fails to map at all, and
+    // the button appears simply dead. That is display-dependent, so it
+    // survives testing: the same menu that fits a 1080p external monitor at
+    // scale 1 does not fit a fractionally scaled laptop panel, whose *logical*
+    // height is several hundred units shorter.
+    //
+    // Scrolling the column instead of letting it size itself makes the failure
+    // impossible: `propagate_natural_height` keeps the popover exactly as tall
+    // as its content while that fits, and `max_content_height` caps it below
+    // any plausible logical screen height, after which it scrolls.
     let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     popover_box.set_margin_top(6);
     popover_box.set_margin_bottom(6);
@@ -1118,9 +1302,100 @@ fn build_menu_popover(
     popover_box.set_margin_end(6);
     // Compact menu column: wide enough for the longest switch row, no wider.
     popover_box.set_width_request(300);
+    popover_box.append(&stack);
 
-    // ── Appearance ──
-    popover_box.append(&overline(t!("Appearance")));
+    let scroller = gtk4::ScrolledWindow::new();
+    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroller.set_propagate_natural_height(true);
+    scroller.set_propagate_natural_width(true);
+    scroller.set_max_content_height(560);
+    scroller.set_child(Some(&popover_box));
+
+    popover.set_child(Some(&scroller));
+    popover
+}
+
+/// Root page: the four section rows, then the actions.
+fn build_menu_root(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<AppState>>,
+    popover: &gtk4::Popover,
+    nav: [&gtk4::Button; 4],
+) -> gtk4::Box {
+    let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    for row in nav {
+        popover_box.append(row);
+    }
+
+    // Separator margins come from the .fresco-menu CSS.
+    popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+    let advanced_btn = menu_item_opening_window(t!("Advanced…"), popover, {
+        let state_adv = state.clone();
+        let win_adv = window.clone();
+        move || show_advanced_dialog(&win_adv, state_adv.clone())
+    });
+    advanced_btn.set_tooltip_text(Some(t!(
+        "Video quality, day/night schedule, and widgets such as the clock, lyrics and visualizer"
+    )));
+    popover_box.append(&advanced_btn);
+
+    // docs/plan-lock-screen.md §6: Fresco's wallpaper + widgets on the real
+    // lock screen. Page + preview window live in `super::lockscreen`; this is
+    // only the navigation entry.
+    let lockscreen_btn = menu_item_opening_window(t!("Lock Screen…"), popover, {
+        let state_lock = state.clone();
+        let win_lock = window.clone();
+        move || super::lockscreen::show_lockscreen_window(&win_lock, state_lock.clone())
+    });
+    lockscreen_btn.set_tooltip_text(Some(t!("Show Fresco on the lock screen")));
+    popover_box.append(&lockscreen_btn);
+
+    let browse_btn = menu_item_opening_window(t!("Browse wallpapers…"), popover, {
+        let state_b = state.clone();
+        let win_b = window.clone();
+        move || super::gallery::show_gallery_window(&win_b, state_b.clone())
+    });
+    browse_btn.set_tooltip_text(Some(t!(
+        "Curated, licensed wallpapers you can add in two clicks"
+    )));
+    popover_box.append(&browse_btn);
+
+    let url_btn = menu_item_opening_window(t!("Add from URL…"), popover, {
+        let state_url = state.clone();
+        let win_url = window.clone();
+        move || show_add_from_url_dialog(&win_url, state_url.clone())
+    });
+    url_btn.set_tooltip_text(Some(t!(
+        "Download a video or image from a link and add it to your library"
+    )));
+    popover_box.append(&url_btn);
+
+    let folders_btn = menu_item_opening_window(t!("Manage folders…"), popover, {
+        let state_f = state.clone();
+        let win_f = window.clone();
+        move || show_collections_dialog(&win_f, state_f.clone())
+    });
+    folders_btn.set_tooltip_text(Some(t!("Group your wallpapers into folders")));
+    popover_box.append(&folders_btn);
+
+    // Closes the menu like the rest: an update *is* available often enough that
+    // the result dialog would otherwise open underneath it, and the "you're up
+    // to date" toast is raised on the main window, which the menu overlaps.
+    let update_btn = menu_item_opening_window(t!("Check for updates"), popover, {
+        let state_upd = state.clone();
+        let win_upd = window.clone();
+        move || super::updates::check_for_updates(&win_upd, state_upd.clone(), true)
+    });
+    update_btn.set_tooltip_text(Some(t!("Look for a newer version of Fresco")));
+    popover_box.append(&update_btn);
+    popover_box
+}
+
+/// Appearance page: theme mode + accent. `subtitle` is the root row's live
+/// value label.
+fn build_appearance_page(state: &Rc<RefCell<AppState>>, subtitle: gtk4::Label) -> gtk4::Box {
+    let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
 
     let seg = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     seg.add_css_class("linked");
@@ -1142,6 +1417,7 @@ fn build_menu_popover(
         (&b_dark, ThemeMode::Dark),
     ] {
         let state2 = state.clone();
+        let subtitle = subtitle.clone();
         btn.connect_toggled(move |b| {
             if !b.is_active() {
                 return;
@@ -1153,6 +1429,7 @@ fn build_menu_popover(
                 s.config.accent
             };
             theme::set_mode(mode);
+            subtitle.set_text(theme_mode_label(mode));
             // Derive dark/light from the chosen mode, not is_dark() — the latter
             // is stale right after set_mode, so the palette wouldn't switch.
             theme::apply(accent, theme::resolve_dark(mode));
@@ -1208,15 +1485,12 @@ fn build_menu_popover(
         dot_btns.borrow_mut().push((acc, b));
     }
     popover_box.append(&dot_row);
+    popover_box
+}
 
-    popover_box.append(&overline(t!("Language")));
-    popover_box.append(&build_language_row(state.clone()));
-
-    // Separator margins come from the .fresco-menu CSS.
-    popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-
-    // ── Behavior ──
-    popover_box.append(&overline(t!("Behavior")));
+/// Behavior page: the on/off switches.
+fn build_behavior_page(state: &Rc<RefCell<AppState>>) -> gtk4::Box {
+    let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     popover_box.append(&switch_row(
         t!("Restore on login"),
         state.borrow().config.autostart,
@@ -1322,64 +1596,30 @@ fn build_menu_popover(
         t!("Lets the Fresco browser extension show your wallpaper on new tabs. Local-only (127.0.0.1)."),
     ));
     popover_box.append(&bridge_row);
+    popover_box
+}
 
-    popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-
-    let advanced_btn = menu_item_opening_window(t!("Advanced…"), &popover, {
-        let state_adv = state.clone();
-        let win_adv = window.clone();
-        move || show_advanced_dialog(&win_adv, state_adv.clone())
-    });
-    popover_box.append(&advanced_btn);
-
-    let browse_btn = menu_item_opening_window(t!("Browse wallpapers…"), &popover, {
-        let state_b = state.clone();
-        let win_b = window.clone();
-        move || super::gallery::show_gallery_window(&win_b, state_b.clone())
-    });
-    popover_box.append(&browse_btn);
-
-    let url_btn = menu_item_opening_window(t!("Add from URL…"), &popover, {
-        let state_url = state.clone();
-        let win_url = window.clone();
-        move || show_add_from_url_dialog(&win_url, state_url.clone())
-    });
-    popover_box.append(&url_btn);
-
-    let folders_btn = menu_item_opening_window(t!("Manage folders…"), &popover, {
-        let state_f = state.clone();
-        let win_f = window.clone();
-        move || show_collections_dialog(&win_f, state_f.clone())
-    });
-    popover_box.append(&folders_btn);
-
-    // Closes the menu like the rest: an update *is* available often enough that
-    // the result dialog would otherwise open underneath it, and the "you're up
-    // to date" toast is raised on the main window, which the menu overlaps.
-    let update_btn = menu_item_opening_window(t!("Check for updates"), &popover, {
-        let state_upd = state.clone();
-        let win_upd = window.clone();
-        move || super::updates::check_for_updates(&win_upd, state_upd.clone(), true)
-    });
-    popover_box.append(&update_btn);
-
+/// Help & feedback page.
+fn build_help_page(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<AppState>>,
+    popover: &gtk4::Popover,
+) -> gtk4::Box {
+    let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     // ── Help & feedback ──
     // A user-initiated path: the feedback dialog otherwise auto-prompts only once
     // (after a week), so without this a user can neither send feedback nor reach
     // support. "Send feedback" is the anonymous one-way rating (→ dashboard);
     // "Message the maintainer" is the anonymous two-way thread; "Report a
     // problem" opens the issue tracker, which is public and needs an account.
-    popover_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-    popover_box.append(&overline(t!("Help & feedback")));
-
-    let tour_btn = menu_item_opening_window(t!("What can Fresco do?"), &popover, {
+    let tour_btn = menu_item_opening_window(t!("What can Fresco do?"), popover, {
         let state_t = state.clone();
         let win_t = window.clone();
         move || show_tour_dialog(&win_t, state_t.clone())
     });
     popover_box.append(&tour_btn);
 
-    let feedback_btn = menu_item_opening_window(t!("Send feedback…"), &popover, {
+    let feedback_btn = menu_item_opening_window(t!("Send feedback…"), popover, {
         let state_fb = state.clone();
         let win_fb = window.clone();
         move || show_feedback_dialog(&win_fb, state_fb.clone())
@@ -1394,7 +1634,7 @@ fn build_menu_popover(
         } else {
             t!("Message the maintainer…")
         },
-        &popover,
+        popover,
         {
             let state_s = state.clone();
             let win_s = window.clone();
@@ -1408,7 +1648,7 @@ fn build_menu_popover(
 
     // The browser is someone else's toplevel, but it is a toplevel all the
     // same — it would come up behind a menu we left mapped.
-    let help_btn = menu_item_opening_window(t!("Report a problem…"), &popover, || {
+    let help_btn = menu_item_opening_window(t!("Report a problem…"), popover, || {
         let _ = std::process::Command::new("xdg-open")
             .arg(ISSUES_URL)
             .spawn();
@@ -1416,32 +1656,12 @@ fn build_menu_popover(
     help_btn.set_tooltip_text(Some(t!("Opens the Fresco issue tracker in your browser")));
     popover_box.append(&help_btn);
 
-    let about_btn = menu_item_opening_window(t!("About"), &popover, {
+    let about_btn = menu_item_opening_window(t!("About"), popover, {
         let win_about = window.clone();
         move || show_about_dialog(&win_about)
     });
     popover_box.append(&about_btn);
-
-    // The menu is ~25 rows tall and grows every time a setting is added, but a
-    // popover taller than the space under its button does not clip — on
-    // Wayland it fails to map at all, and the button appears simply dead. That
-    // is display-dependent, so it survives testing: the same menu that fits a
-    // 1080p external monitor at scale 1 does not fit a fractionally scaled
-    // laptop panel, whose *logical* height is several hundred units shorter.
-    //
-    // Scrolling the column instead of letting it size itself makes the failure
-    // impossible: `propagate_natural_height` keeps the popover exactly as tall
-    // as its content while that fits, and `max_content_height` caps it below
-    // any plausible logical screen height, after which it scrolls.
-    let scroller = gtk4::ScrolledWindow::new();
-    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-    scroller.set_propagate_natural_height(true);
-    scroller.set_propagate_natural_width(true);
-    scroller.set_max_content_height(560);
-    scroller.set_child(Some(&popover_box));
-
-    popover.set_child(Some(&scroller));
-    popover
+    popover_box
 }
 
 // ─── Library scope, sorting and sectioning ────────────────────────────────────
@@ -2068,7 +2288,11 @@ fn build_mini_card(
     {
         let state_c = state.clone();
         let stack_c = stack.clone();
+        let id = entry.id.clone();
         click.connect_released(move |_, n_press, _, _| {
+            if import_queue::is_pending(&id) {
+                return;
+            }
             if n_press == 1 {
                 apply_entry_by_idx(state_c.clone(), idx);
             } else if n_press == 2 {
@@ -2123,7 +2347,17 @@ fn build_library_card(
         overlay.add_css_class("active");
     }
     overlay.set_overflow(gtk4::Overflow::Hidden);
-    overlay.set_valign(gtk4::Align::Start);
+    // Fill the AspectFrame. (This used to be `Align::Start`, which shrinks the
+    // overlay to its measured child's height — for a card still showing the
+    // ~20px placeholder glyph that left a thin sliver at the top of the frame.)
+    overlay.set_valign(gtk4::Align::Fill);
+    // Import work outstanding: the card is inert until it finishes (checked at
+    // event time below, so it can come alive without a rebuild).
+    let pending = import_queue::is_pending(&entry.id);
+    if pending {
+        overlay.add_css_class("wp-loading");
+    }
+    let mut placeholder: Option<gtk4::Box> = None;
 
     let pic = gtk4::Picture::new();
     pic.set_can_shrink(true);
@@ -2144,7 +2378,9 @@ fn build_library_card(
         // No thumbnail (yet): mat + kind glyph as the base layer, with the
         // (transparent, empty) Picture stacked above it so the hover preview
         // can still render into it. Keeps the card from collapsing to 0-size.
-        overlay.set_child(Some(&thumb_placeholder(entry.kind)));
+        let ph = thumb_placeholder(entry.kind);
+        overlay.set_child(Some(&ph));
+        placeholder = Some(ph);
         pic.set_hexpand(true);
         pic.set_vexpand(true);
         overlay.add_overlay(&pic);
@@ -2176,12 +2412,20 @@ fn build_library_card(
             heart.add_css_class("wp-fav-glyph");
             meta_row.append(&heart);
         }
-        if let Some(line) = entry.meta_line() {
-            let meta = gtk4::Label::new(Some(&line));
+        let line = entry.meta_line();
+        // A pending card gets its (possibly empty, hidden) meta label up front
+        // so the import queue can fill it in place when the probe lands.
+        let meta_label = (line.is_some() || pending).then(|| {
+            let meta = gtk4::Label::new(line.as_deref());
             meta.add_css_class("wp-meta");
             meta.set_xalign(0.0);
             meta.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            meta.set_visible(line.is_some());
             meta_row.append(&meta);
+            meta
+        });
+        if let (true, Some(ph), Some(meta)) = (pending, &placeholder, &meta_label) {
+            import_queue::register_card(&entry.id, &overlay, &pic, ph, meta);
         }
         if meta_row.first_child().is_some() {
             scrim.append(&meta_row);
@@ -2344,7 +2588,12 @@ fn build_library_card(
     let motion = gtk4::EventControllerMotion::new();
     {
         let actions = actions.clone();
-        motion.connect_enter(move |_, _, _| actions.set_visible(true));
+        let id = entry.id.clone();
+        motion.connect_enter(move |_, _, _| {
+            if !import_queue::is_pending(&id) {
+                actions.set_visible(true);
+            }
+        });
     }
     {
         let actions = actions.clone();
@@ -2358,10 +2607,16 @@ fn build_library_card(
         let state_c = state.clone();
         let stack_c = stack.clone();
         let overlay_c = overlay.clone();
+        let id = entry.id.clone();
         click.connect_released(move |_, n_press, _, _| {
             // Inline rename editor is up on this card (#21) — don't let the
             // click fall through to apply/open underneath it.
             if overlay_c.has_css_class("renaming") {
+                return;
+            }
+            // Still importing: a half-built card must not act (it used to
+            // hit the favorite heart that overlapped its sliver).
+            if import_queue::is_pending(&id) {
                 return;
             }
             if n_press == 1 {
@@ -2380,8 +2635,9 @@ fn build_library_card(
         let state_c = state.clone();
         let stack_c = stack.clone();
         let overlay_c = overlay.clone();
+        let id = entry.id.clone();
         rclick.connect_pressed(move |_, _, x, y| {
-            if overlay_c.has_css_class("renaming") {
+            if overlay_c.has_css_class("renaming") || import_queue::is_pending(&id) {
                 return;
             }
             show_card_menu(
@@ -2400,7 +2656,9 @@ fn build_library_card(
     // Video/GIF cards play a muted, looping preview while hovered. Rotated
     // entries keep their static (rotated) thumbnail instead: GTK's MediaFile
     // can't rotate, and motion in the WRONG orientation reads as a bug.
-    if entry.rotation.unwrap_or(0).is_multiple_of(360) {
+    // A pending card stays inert; the queue's closing refresh rebuilds it with
+    // the preview attached.
+    if !pending && entry.rotation.unwrap_or(0).is_multiple_of(360) {
         if let Some(video) = preview_video_path(entry) {
             super::hover_preview::attach(&overlay, &pic, video);
         }
@@ -2891,7 +3149,7 @@ fn spawn_metadata_probe(state: &Rc<RefCell<AppState>>) {
         .borrow()
         .entries
         .iter()
-        .filter(|e| e.needs_probe())
+        .filter(|e| e.needs_probe() && !import_queue::is_pending(&e.id))
         .filter_map(|e| e.probe_source().map(|p| (e.id.clone(), p)))
         .collect();
     if pending.is_empty() {
@@ -2953,6 +3211,14 @@ fn stop_wallpaper(state: &Rc<RefCell<AppState>>) {
         s.config.wallpaper.slideshow = None;
         s.config.monitors.clear();
         s.config.save().ok();
+    }
+    // Stop takes the daemon down, and the scheduler with it; say so instead of
+    // letting a configured schedule silently stop switching.
+    if schedule_active(&state.borrow().config) {
+        show_toast(
+            state,
+            t!("The day/night schedule won't switch until you start Fresco again"),
+        );
     }
     // Fire-and-forget, like the status pill's pause/resume: config already
     // says "off" on disk and callers already update the UI optimistically
@@ -4037,8 +4303,9 @@ fn pick_items_to_add(
 // ─── Batch import ────────────────────────────────────────────────────────────
 
 /// Import a batch as **one wallpaper per file**, skipping anything the library
-/// already holds. Returns `(added, skipped)`.
-fn import_individually(state: &Rc<RefCell<AppState>>, paths: Vec<PathBuf>) -> (usize, usize) {
+/// already holds. Thumbnails and metadata finish in the background via
+/// `import_queue`, which also reports the result toast when done.
+fn import_individually(state: &Rc<RefCell<AppState>>, paths: Vec<PathBuf>) {
     let (fresh, dupes) = {
         let s = state.borrow();
         library::partition_new(&s.entries, paths)
@@ -4054,9 +4321,13 @@ fn import_individually(state: &Rc<RefCell<AppState>>, paths: Vec<PathBuf>) -> (u
         }
         save_entries(&s.entries).ok();
     }
-    spawn_thumbnail_batch(state, ids.clone());
-    spawn_metadata_probe(state);
-    (ids.len(), dupes.len())
+    // Worker pool with per-item card updates and a progress row; the toast
+    // waits for the queue so it reports the finished import.
+    let (added, skipped) = (ids.len(), dupes.len());
+    let state_t = state.clone();
+    import_queue::start(state, ids, move |_cancelled| {
+        report_import(&state_t, added, skipped);
+    });
 }
 
 /// Render thumbnails for a batch off the UI thread.
@@ -4069,7 +4340,9 @@ pub(crate) fn spawn_thumbnail_batch(state: &Rc<RefCell<AppState>>, ids: Vec<Stri
         let s = state.borrow();
         s.entries
             .iter()
-            .filter(|e| ids.contains(&e.id) && e.thumbnail.is_none())
+            .filter(|e| {
+                ids.contains(&e.id) && e.thumbnail.is_none() && !import_queue::is_pending(&e.id)
+            })
             .cloned()
             .collect()
     };
@@ -4236,8 +4509,7 @@ fn show_import_choice_dialog(
         let paths = paths.clone();
         let d = dialog.clone();
         separate.connect_clicked(move |_| {
-            let (added, skipped) = import_individually(&state2, (*paths).clone());
-            report_import(&state2, added, skipped);
+            import_individually(&state2, (*paths).clone());
             let r = state2.borrow().refresh.clone();
             if let Some(r) = r {
                 r();
@@ -4361,8 +4633,7 @@ fn show_folder_import_choice(
                 d.close();
                 return;
             }
-            let (added, skipped) = import_individually(&state2, files);
-            report_import(&state2, added, skipped);
+            import_individually(&state2, files);
             let r = state2.borrow().refresh.clone();
             if let Some(r) = r {
                 r();
@@ -4500,7 +4771,9 @@ pub(crate) fn apply_entry_by_idx(state: Rc<RefCell<AppState>>, idx: usize) {
         let Some(entry) = s.entries.get_mut(idx) else {
             return;
         };
-        if entry.broken {
+        // Refuse an entry that is still being imported (no thumbnail / probe
+        // yet). By id, at call time: `idx` may be stale by now.
+        if entry.broken || import_queue::is_pending(&entry.id) {
             return;
         }
         entry.touch();
@@ -5170,6 +5443,7 @@ fn show_advanced_dialog(window: &adw::ApplicationWindow, state: Rc<RefCell<AppSt
     add_lyrics_group(&page, state.clone());
     add_clock_group(&page, state.clone());
     add_visualizer_group(&page, state.clone());
+    add_deepin_group(&page, state.clone());
     add_disc_group(&page, state);
     dialog.add(&page);
     dialog.present();
@@ -5232,22 +5506,61 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
             enable.set_selected(1);
             day_time.set_text(&sch.day_start);
             night_time.set_text(&sch.night_start);
-            let find = |w: Option<&crate::config::Wallpaper>| -> u32 {
-                w.and_then(|w| w.path.as_ref())
-                    .and_then(|p| {
-                        candidates
-                            .iter()
-                            .position(|(i, _)| st.entries[*i].path.as_deref() == Some(p.as_path()))
-                    })
-                    .map(|i| i as u32)
-                    .unwrap_or(0)
+            // A stored wallpaper that left the library must show as unselected,
+            // not as the first library item: the next edit would otherwise
+            // save that stranger over the user's schedule.
+            let find = |w: Option<&crate::config::Wallpaper>| -> Option<u32> {
+                let p = w.and_then(|w| w.path.as_deref())?;
+                crate::schedule::library_position(
+                    candidates
+                        .iter()
+                        .map(|(i, _)| st.entries[*i].path.as_deref()),
+                    p,
+                )
+                .map(|i| i as u32)
             };
-            day_row.set_selected(find(sch.day.as_ref()));
-            night_row.set_selected(find(sch.night.as_ref()));
+            for (row, w) in [
+                (&day_row, sch.day.as_ref()),
+                (&night_row, sch.night.as_ref()),
+            ] {
+                match find(w) {
+                    Some(i) => row.set_selected(i),
+                    None => {
+                        row.set_selected(gtk4::INVALID_LIST_POSITION);
+                        row.set_subtitle(t!("No longer in your library — pick another wallpaper"));
+                    }
+                }
+            }
         } else {
             day_time.set_text("07:00");
             night_time.set_text("19:00");
         }
+    }
+
+    // "Service not running" warning + the "Next switch" hint (see below).
+    let service_row = ServiceRow::new(state.clone());
+    let refresh_hint: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let enable = enable.clone();
+        let candidates = candidates.clone();
+        Rc::new(move || enable.set_subtitle(&next_switch_subtitle(&state, &candidates)))
+    };
+    refresh_hint();
+    // Once a minute the hint's time may pass; stop when the dialog closes.
+    {
+        let tick = refresh_hint.clone();
+        let id = Rc::new(RefCell::new(Some(glib::timeout_add_seconds_local(
+            60,
+            move || {
+                tick();
+                glib::ControlFlow::Continue
+            },
+        ))));
+        enable.connect_unmap(move |_| {
+            if let Some(id) = id.borrow_mut().take() {
+                id.remove();
+            }
+        });
     }
 
     let write = {
@@ -5258,8 +5571,23 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
         let day_time = day_time.clone();
         let night_time = night_time.clone();
         let candidates = candidates.clone();
+        let service_row = service_row.clone();
+        let refresh_hint = refresh_hint.clone();
         move || {
             let on = enable.selected() == 1;
+            // A fresh pick replaces the "no longer in your library" note.
+            for row in [&day_row, &night_row] {
+                if row.selected() != gtk4::INVALID_LIST_POSITION {
+                    row.set_subtitle("");
+                }
+            }
+            for e in [&day_time, &night_time] {
+                if on && crate::schedule::parse_hhmm(&e.text()).is_none() {
+                    e.add_css_class("error");
+                } else {
+                    e.remove_css_class("error");
+                }
+            }
             let config = {
                 let mut s = state.borrow_mut();
                 if !on {
@@ -5276,13 +5604,22 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
                     {
                         return; // incomplete/invalid times — wait for a valid edit
                     }
-                    let pick = |row: &adw::ComboRow| -> Option<crate::config::Wallpaper> {
+                    // An unselected combo (stored wallpaper left the library)
+                    // keeps what is stored rather than being overwritten.
+                    let pick = |row: &adw::ComboRow,
+                                stored: Option<&crate::config::Wallpaper>|
+                     -> Option<crate::config::Wallpaper> {
                         candidates
                             .get(row.selected() as usize)
                             .and_then(|(i, _)| s.entries.get(*i))
                             .map(|e| e.to_wallpaper())
+                            .or_else(|| stored.cloned())
                     };
-                    let (Some(day), Some(night)) = (pick(&day_row), pick(&night_row)) else {
+                    let old = s.config.schedule.as_ref();
+                    let (Some(day), Some(night)) = (
+                        pick(&day_row, old.and_then(|o| o.day.as_ref())),
+                        pick(&night_row, old.and_then(|o| o.night.as_ref())),
+                    ) else {
                         return;
                     };
                     s.config.schedule = Some(crate::config::Schedule {
@@ -5300,8 +5637,23 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
                     Some(s.config.clone())
                 }
             };
+            refresh_hint();
+            service_row.refresh();
             if let Some(config) = config {
-                daemon_ctl::apply_async(&config, |_| {});
+                let state = state.clone();
+                let service_row = service_row.clone();
+                daemon_ctl::apply_async(&config, move |outcome| {
+                    if !outcome.superseded {
+                        if let Err(e) = outcome.result {
+                            log::error!("failed to apply the day/night schedule: {e}");
+                            show_toast(
+                                &state,
+                                t!("Couldn’t apply the schedule. Check ~/.local/state/fresco/frescod.log"),
+                            );
+                        }
+                    }
+                    service_row.refresh();
+                });
             }
         }
     };
@@ -5317,12 +5669,137 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
     let w = write;
     night_time.connect_changed(move |_| w());
 
+    group.add(&service_row.row);
     group.add(&enable);
     group.add(&day_row);
     group.add(&night_row);
     group.add(&day_time_row);
     group.add(&night_time_row);
     page.add(&group);
+    service_row.refresh();
+}
+
+/// Whether a schedule exists and is live (enabled and not paused).
+fn schedule_active(config: &Config) -> bool {
+    config.schedule.is_some() && !config.schedule_paused
+}
+
+/// "Next switch at HH:MM: name" for the Day/night row, or empty when there is
+/// nothing to switch to (no schedule, paused, or unusable times).
+fn next_switch_subtitle(state: &Rc<RefCell<AppState>>, candidates: &[(usize, String)]) -> String {
+    use chrono::Offset as _;
+    let s = state.borrow();
+    let Some(sch) = s
+        .config
+        .schedule
+        .as_ref()
+        .filter(|_| schedule_active(&s.config))
+    else {
+        return String::new();
+    };
+    let now = chrono::Local::now();
+    let off = now.offset().fix().local_minus_utc() / 60;
+    let Some((at, w)) = crate::schedule::next_switch(sch, now.naive_local(), off) else {
+        return String::new();
+    };
+    let name = candidates
+        .iter()
+        .find(|(i, _)| s.entries[*i].path.as_deref() == w.path.as_deref())
+        .map(|(_, n)| n.clone())
+        .or_else(|| {
+            w.path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    crate::schedule::next_switch_hint(at, &name)
+}
+
+/// Start the background service on the user's request (the "Start" buttons):
+/// enable, point the wallpaper at what the schedule wants now, and apply —
+/// `apply_blocking` spawns the daemon when it is down. Toasts the outcome and
+/// then calls `done` so the caller can re-check liveness.
+fn start_schedule_service(state: &Rc<RefCell<AppState>>, done: impl FnOnce() + 'static) {
+    let config = {
+        let mut s = state.borrow_mut();
+        s.config.enabled = true;
+        sync_wallpaper_to_schedule(&mut s.config);
+        s.config.save().ok();
+        s.config.clone()
+    };
+    let state = state.clone();
+    daemon_ctl::apply_async(&config, move |outcome| {
+        if !outcome.superseded {
+            match outcome.result {
+                Ok(()) => show_toast(&state, t!("Fresco’s background service started")),
+                Err(e) => {
+                    log::error!("failed to start the background service: {e}");
+                    show_toast(
+                        &state,
+                        t!("Couldn’t start the background service. Check ~/.local/state/fresco/frescod.log"),
+                    );
+                }
+            }
+        }
+        done();
+    });
+}
+
+/// The main window's dismissible "service not running" notice (hooked into
+/// the status poll in status.rs).
+fn service_notice(state: &Rc<RefCell<AppState>>) -> gtk4::Widget {
+    let active: Rc<dyn Fn() -> bool> = {
+        let state = state.clone();
+        Rc::new(move || schedule_active(&state.borrow().config))
+    };
+    let start: Rc<dyn Fn()> = {
+        let state = state.clone();
+        Rc::new(move || start_schedule_service(&state, super::status::refresh_service_notice))
+    };
+    super::status::build_service_notice(active, start)
+}
+
+/// Warning row for the Advanced Day/Night group: shown while a live schedule
+/// has no running daemon to act on it. Liveness is probed off the GTK thread.
+#[derive(Clone)]
+struct ServiceRow {
+    row: adw::ActionRow,
+    state: Rc<RefCell<AppState>>,
+}
+
+impl ServiceRow {
+    fn new(state: Rc<RefCell<AppState>>) -> Self {
+        let row = adw::ActionRow::new();
+        row.set_title(t!(
+            "Fresco's background service isn't running, so the schedule can't switch wallpapers."
+        ));
+        row.set_title_lines(3);
+        row.add_prefix(&gtk4::Image::from_icon_name("dialog-warning-symbolic"));
+        let start = gtk4::Button::with_label(t!("Start"));
+        start.set_valign(gtk4::Align::Center);
+        row.add_suffix(&start);
+        row.set_visible(false);
+        let this = Self { row, state };
+        {
+            let this = this.clone();
+            start.connect_clicked(move |_| {
+                let again = this.clone();
+                start_schedule_service(&this.state, move || again.refresh());
+            });
+        }
+        this
+    }
+
+    fn refresh(&self) {
+        if !schedule_active(&self.state.borrow().config) {
+            self.row.set_visible(false);
+            return;
+        }
+        let row = self.row.clone();
+        super::status::probe_daemon(move |alive| row.set_visible(!alive));
+        super::status::refresh_service_notice();
+    }
 }
 
 /// Point `config.wallpaper` at whatever the schedule wants RIGHT NOW, so
@@ -6667,6 +7144,60 @@ fn disc_spin_row(
     })
 }
 
+/// "Deepin desktop" preferences group (issue #33): the opt-in for the
+/// experimental icon mirror, which keeps DDE's desktop icons visible above the
+/// live wallpaper. Shown on Deepin only. Off writes `Auto`, not `Restack`, so
+/// turning it off hands the choice back to the daemon's default rather than
+/// pinning a strategy the user never picked.
+fn add_deepin_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>) {
+    if !crate::capability::is_deepin_dde() {
+        return;
+    }
+    let group = adw::PreferencesGroup::new();
+    group.set_title(t!("Deepin desktop"));
+
+    let row = adw::ActionRow::new();
+    row.set_title(t!("Show desktop icons over the video (experimental)"));
+    row.set_subtitle(t!(
+        "Keeps your icons visible and clickable above the live wallpaper. Turn this off if icons flicker or look wrong."
+    ));
+    let switch = gtk4::Switch::new();
+    switch.set_valign(gtk4::Align::Center);
+    switch.set_active(state.borrow().config.dde_mode == crate::config::DdeMode::Mirror);
+    row.add_suffix(&switch);
+    row.set_activatable_widget(Some(&switch));
+    {
+        let state = state.clone();
+        switch.connect_active_notify(move |sw| {
+            let config = {
+                let mut s = state.borrow_mut();
+                s.config.dde_mode = if sw.is_active() {
+                    crate::config::DdeMode::Mirror
+                } else {
+                    crate::config::DdeMode::Auto
+                };
+                s.config.save().ok();
+                s.config.clone()
+            };
+            let state = state.clone();
+            daemon_ctl::apply_async(&config, move |outcome| {
+                if outcome.superseded {
+                    return;
+                }
+                if let Err(e) = outcome.result {
+                    log::error!("failed to apply the Deepin icon setting: {e}");
+                    show_toast(
+                        &state,
+                        t!("Couldn’t start the wallpaper. Run frescod --check"),
+                    );
+                }
+            });
+        });
+    }
+    group.add(&row);
+    page.add(&group);
+}
+
 /// "Album art" preferences group (WIDGETS_ROADMAP W2 GUI). Built exactly like
 /// the three groups above it: off by default, and every row below the master
 /// switch is insensitive until it is on.
@@ -7362,6 +7893,87 @@ fn menu_item(label: &str) -> gtk4::Button {
     btn
 }
 
+/// Page id of the header menu's root page (see `build_menu_popover`).
+const MENU_ROOT: &str = "root";
+
+/// Dim trailing text for the Appearance row: what the mode is now.
+fn theme_mode_label(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::System => t!("System"),
+        ThemeMode::Light => t!("Light"),
+        ThemeMode::Dark => t!("Dark"),
+    }
+}
+
+/// A menu row that opens a second-level page: label, an optional live
+/// subtitle (the current value) and a chevron. Switching is a stack swap inside
+/// the same popover — no second popup surface, see `build_language_row`.
+fn nav_row(
+    label: &str,
+    subtitle: Option<&gtk4::Label>,
+    stack: &gtk4::Stack,
+    page: &'static str,
+) -> gtk4::Button {
+    let btn = gtk4::Button::new();
+    btn.add_css_class("flat");
+    btn.add_css_class("menu-item");
+    btn.set_halign(gtk4::Align::Fill);
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let lbl = gtk4::Label::new(Some(label));
+    lbl.set_xalign(0.0);
+    lbl.set_hexpand(true);
+    row.append(&lbl);
+    if let Some(sub) = subtitle {
+        sub.add_css_class("dim");
+        row.append(sub);
+    }
+    row.append(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    btn.set_child(Some(&row));
+    let stack = stack.clone();
+    btn.connect_clicked(move |_| {
+        stack.set_visible_child_name(page);
+        // Keyboard users land on the page's first control (its back button),
+        // not on a row that has just slid out of view.
+        if let Some(child) = stack.visible_child() {
+            child.child_focus(gtk4::DirectionType::TabForward);
+        }
+    });
+    btn
+}
+
+/// A second-level menu page: back button + bold title, then `content` as-is.
+/// `opener` is the root row that leads here; going back re-focuses it.
+fn menu_page(
+    title: &str,
+    stack: &gtk4::Stack,
+    opener: &gtk4::Button,
+    content: &impl IsA<gtk4::Widget>,
+) -> gtk4::Box {
+    let page = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    let back = gtk4::Button::from_icon_name("go-previous-symbolic");
+    back.add_css_class("flat");
+    back.set_tooltip_text(Some(t!("Back")));
+    {
+        let stack = stack.clone();
+        let opener = opener.clone();
+        back.connect_clicked(move |_| {
+            stack.set_visible_child_name(MENU_ROOT);
+            opener.grab_focus();
+        });
+    }
+    let heading = gtk4::Label::new(Some(title));
+    heading.add_css_class("heading");
+    heading.set_xalign(0.0);
+    heading.set_hexpand(true);
+    header.append(&back);
+    header.append(&heading);
+    page.append(&header);
+    page.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    page.append(content);
+    page
+}
+
 /// A menu item that opens a window, closing the menu on the way.
 ///
 /// The popdown is the load-bearing part. A `GtkPopover` is a native surface of
@@ -7431,7 +8043,7 @@ fn switch_row<F: Fn(bool) + 'static>(label: &str, active: bool, on_toggle: F) ->
 /// widget in the window; a toast that names the requirement is more honest than
 /// a partial retranslation, and matches how GNOME's own language switch
 /// behaves.
-fn build_language_row(state: Rc<RefCell<AppState>>) -> gtk4::Box {
+fn build_language_row(state: Rc<RefCell<AppState>>, subtitle: gtk4::Label) -> gtk4::Box {
     use crate::i18n::Language;
 
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
@@ -7459,6 +8071,7 @@ fn build_language_row(state: Rc<RefCell<AppState>>) -> gtk4::Box {
         {
             let state2 = state.clone();
             let checks = checks.clone();
+            let subtitle = subtitle.clone();
             btn.connect_clicked(move |_| {
                 {
                     let mut s = state2.borrow_mut();
@@ -7471,6 +8084,7 @@ fn build_language_row(state: Rc<RefCell<AppState>>) -> gtk4::Box {
                 for (l, img) in checks.borrow().iter() {
                     img.set_visible(*l == lang);
                 }
+                subtitle.set_text(lang.display_name());
                 show_toast(&state2, t!("Restart Fresco to apply the new language"));
             });
         }
@@ -7974,6 +8588,13 @@ fn show_command_palette(
         add_cmd(
             t!("Advanced settings"),
             Rc::new(move || show_advanced_dialog(&w, s.clone())),
+        );
+    }
+    {
+        let (w, s) = (window.clone(), state.clone());
+        add_cmd(
+            t!("Lock Screen settings"),
+            Rc::new(move || super::lockscreen::show_lockscreen_window(&w, s.clone())),
         );
     }
     {
@@ -9490,6 +10111,13 @@ fn show_notification_modal(window: &adw::ApplicationWindow, notif: &crate::supab
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn menu_subtitle_names_each_theme_mode() {
+        assert_eq!(theme_mode_label(ThemeMode::System), "System");
+        assert_eq!(theme_mode_label(ThemeMode::Light), "Light");
+        assert_eq!(theme_mode_label(ThemeMode::Dark), "Dark");
+    }
+
     use super::*;
     use std::path::PathBuf;
 
