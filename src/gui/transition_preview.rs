@@ -2,11 +2,22 @@
 //!
 //! Given two demo frames (typically the slideshow's first two images) this
 //! widget plays the chosen [`Transition`] over and over so the user can see the
-//! effect before applying it. Animation is purely client-side: it nudges child
-//! `opacity`, a CSS `filter: blur()` class, and `gsk` transforms (translate /
-//! scale) on two stacked [`gtk4::Picture`]s laid out in a [`gtk4::Fixed`]
-//! "stage". No media decoding, no daemon — just a ~30fps `glib` timeout
-//! driving one frame at a time.
+//! effect before applying it. Animation is purely client-side: a ~30fps `glib`
+//! timeout advances a phase, turns it into per-frame parameters (opacity, slide
+//! offset, scale, defocus) and asks a small custom widget, [`Stage`], to
+//! repaint. The stage draws both frames itself in `snapshot()` — cover-fit,
+//! clipped to its own bounds — so no child widget, CSS filter or
+//! `gtk4::Fixed` is involved. No media decoding, no daemon.
+//!
+//! Why a custom widget: the stage used to be a `Fixed` holding two `Picture`s,
+//! and every tick pinned the pictures' minimum size to the stage's own
+//! allocation. `Fixed` measures the *transformed* bounds of its children, so a
+//! Ken Burns / Zoom / Slide transform pushed the minimum above the allocation,
+//! the stage grew, the next tick pinned the pictures even larger, and the whole
+//! window ballooned until it covered the screen (issue #31). [`Stage`] now
+//! answers a constant from `measure` that depends on neither its content nor
+//! its allocation, and the tick only ever calls `queue_draw`, so the enclosing
+//! 16:9 `AspectFrame` alone decides the size and nothing can feed back.
 //!
 //! Everything here is an *approximation* of what the daemon does to the one
 //! running mpv player, and the approximations are chosen to be honest about
@@ -27,13 +38,14 @@
 //! and skips the frame's work while the window is minimised. The editor still
 //! calls [`TransitionPreview::stop`] explicitly when leaving.
 
-use std::cell::RefCell;
-use std::path::PathBuf;
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::prelude::*;
-use gtk4::{gio, glib, graphene, gsk};
+use gtk4::subclass::prelude::*;
+use gtk4::{gdk, glib, graphene, gsk};
 
 use crate::config::Transition;
 
@@ -49,38 +61,176 @@ const STEP: f64 = 0.033;
 /// The daemon travels 0.22 in mpv's log2 `video-zoom` units, which is this in
 /// linear scale (`2^0.22`) — the same ~16% the desktop actually moves.
 const ZOOM_PEAK: f32 = 1.165;
-/// Defocus ladder, softest last. GTK's CSS `filter` takes a literal length, so
-/// the steps are pre-declared in the stylesheet (see `theme.rs`) and picked by
-/// class rather than rebuilt into a provider 30 times a second.
-const BLUR_CLASSES: [&str; 6] = [
-    "tp-blur-1",
-    "tp-blur-2",
-    "tp-blur-3",
-    "tp-blur-4",
-    "tp-blur-5",
-    "tp-blur-6",
-];
+/// Defocus ladder, softest last, as blur radii in px. These are the values the
+/// `.tp-blur-N` CSS classes used to declare (`filter: blur(Npx)`); the ladder
+/// stays a set of discrete steps so the softness is quantised exactly as it
+/// was, now applied with `push_blur` in the snapshot instead of a class swap.
+const BLUR_RADII: [f64; 6] = [2.0, 4.0, 7.0, 10.0, 14.0, 18.0];
+/// Preview textures are decoded to fit this box. The preview shows a few
+/// hundred pixels across; keeping a 4K or 8K original as a texture would cost
+/// tens of MB of RAM and GPU memory per frame for nothing.
+const DECODE_W: i32 = 1280;
+const DECODE_H: i32 = 720;
+/// Corner radius of the stage's frame, matching `.crop-frame` in `theme.rs`.
+const CORNER_RADIUS: f32 = 12.0;
+
+/// How one of the two frames is drawn this tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameParams {
+    opacity: f64,
+    /// Horizontal offset as a fraction of the stage width (slide).
+    dx: f32,
+    /// Scale about the stage's center.
+    scale: f32,
+    /// Defocus step on the [`BLUR_RADII`] ladder, `0` for sharp.
+    blur_step: u8,
+}
+
+impl FrameParams {
+    const SHOWN: Self = Self {
+        opacity: 1.0,
+        dx: 0.0,
+        scale: 1.0,
+        blur_step: 0,
+    };
+    const HIDDEN: Self = Self {
+        opacity: 0.0,
+        ..Self::SHOWN
+    };
+}
+
+/// The resting look: first frame shown, second hidden, nothing transformed.
+const REST: [FrameParams; 2] = [FrameParams::SHOWN, FrameParams::HIDDEN];
+
+mod imp {
+    use super::*;
+
+    /// Paints the two demo frames. Holds only what `snapshot` reads; the tick
+    /// updates it and calls `queue_draw`, never anything that could resize.
+    pub struct Stage {
+        pub textures: RefCell<[Option<gdk::Texture>; 2]>,
+        pub frames: Cell<[FrameParams; 2]>,
+    }
+
+    impl Default for Stage {
+        fn default() -> Self {
+            Self {
+                textures: RefCell::new([None, None]),
+                frames: Cell::new(REST),
+            }
+        }
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Stage {
+        const NAME: &'static str = "FrescoTransitionStage";
+        type Type = super::Stage;
+        type ParentType = gtk4::Widget;
+    }
+
+    impl ObjectImpl for Stage {}
+
+    impl WidgetImpl for Stage {
+        /// A constant, whatever the orientation, `for_size`, textures or current
+        /// allocation. This is the whole fix for #31: the enclosing
+        /// `AspectFrame` decides the stage's size, and nothing the stage paints
+        /// (or how it is transformed while painting) can ask for more room.
+        fn measure(&self, orientation: gtk4::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
+            let (min, nat) = match orientation {
+                gtk4::Orientation::Horizontal => (32, 320),
+                _ => (18, 180),
+            };
+            (min, nat, -1, -1)
+        }
+
+        fn snapshot(&self, snapshot: &gtk4::Snapshot) {
+            let widget = self.obj();
+            let (w, h) = (widget.width() as f32, widget.height() as f32);
+            if w <= 0.0 || h <= 0.0 {
+                return;
+            }
+            let ctx = widget.style_context();
+            snapshot.render_background(&ctx, 0.0, 0.0, w as f64, h as f64);
+
+            // Clip to the rounded frame: Ken Burns / Zoom scale past the
+            // bounds and Slide parks a frame entirely outside them, and none of
+            // that may show.
+            let bounds = graphene::Rect::new(0.0, 0.0, w, h);
+            snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(bounds, CORNER_RADIUS));
+
+            let textures = self.textures.borrow();
+            let frames = self.frames.get();
+            // Index 0 is the bottom layer, 1 sits on top.
+            for (texture, frame) in textures.iter().zip(frames.iter()) {
+                let Some(texture) = texture else { continue };
+                if frame.opacity <= 0.0 {
+                    continue;
+                }
+                let Some((x, y, tw, th)) =
+                    cover_rect(texture.width() as f32, texture.height() as f32, w, h)
+                else {
+                    continue;
+                };
+                snapshot.push_opacity(frame.opacity);
+                let radius = blur_radius(frame.blur_step);
+                if radius > 0.0 {
+                    snapshot.push_blur(radius);
+                }
+                snapshot.save();
+                snapshot.translate(&graphene::Point::new(frame.dx * w, 0.0));
+                let (cx, cy) = (w / 2.0, h / 2.0);
+                snapshot.translate(&graphene::Point::new(cx, cy));
+                snapshot.scale(frame.scale, frame.scale);
+                snapshot.translate(&graphene::Point::new(-cx, -cy));
+                snapshot.append_texture(texture, &graphene::Rect::new(x, y, tw, th));
+                snapshot.restore();
+                if radius > 0.0 {
+                    snapshot.pop();
+                }
+                snapshot.pop();
+            }
+
+            snapshot.pop();
+            snapshot.render_frame(&ctx, 0.0, 0.0, w as f64, h as f64);
+        }
+    }
+}
+
+glib::wrapper! {
+    /// The preview's drawing surface; see the module docs.
+    pub struct Stage(ObjectSubclass<imp::Stage>) @extends gtk4::Widget;
+}
+
+impl Stage {
+    fn new() -> Self {
+        glib::Object::new()
+    }
+
+    fn set_textures(&self, a: Option<gdk::Texture>, b: Option<gdk::Texture>) {
+        *self.imp().textures.borrow_mut() = [a, b];
+        self.queue_draw();
+    }
+
+    /// Swap the two frames (B becomes the new A) without re-decoding anything.
+    fn swap_textures(&self) {
+        self.imp().textures.borrow_mut().swap(0, 1);
+    }
+
+    fn set_frames(&self, frames: [FrameParams; 2]) {
+        self.imp().frames.set(frames);
+        self.queue_draw();
+    }
+}
 
 /// Mutable, shared animation state. GTK objects are refcounted, so the stored
-/// widgets are cheap clones of the live ones.
+/// stage is a cheap clone of the live one.
 struct State {
-    first: Option<PathBuf>,
-    second: Option<PathBuf>,
     transition: Transition,
     /// Phase within the loop, `0.0..=CYCLE`.
     t: f64,
     /// The running animation timer, if any.
     source: Option<glib::SourceId>,
-    stage: gtk4::Fixed,
-    pic_a: gtk4::Picture,
-    pic_b: gtk4::Picture,
-    /// Last (w, h) pushed to the pictures; avoids a relayout on every frame.
-    last_size: (i32, i32),
-    /// Defocus step currently applied to each picture, `0` for none. Tracked so
-    /// a frame that does not change the blur touches no CSS class at all —
-    /// swapping classes forces a style recompute, and doing that twice a frame
-    /// for no reason is exactly the sort of cost this preview should not have.
-    blur_step: (u8, u8),
+    stage: Stage,
     /// A transition was chosen and not since stopped: the loop *should* run
     /// whenever the stage is mapped. Separate from `source`, which says whether
     /// it *is* running — the difference is what lets `map` resume it.
@@ -102,7 +252,8 @@ enum Gate {
 
 /// The order matters and is the bug this replaced: an unrooted or unmapped
 /// stage also reports a zero size, so the size check must come last or it
-/// masks the "gone" cases and the timer never ends.
+/// masks the "gone" cases and the timer never ends. The size is only asked
+/// "is there one yet", never used to size anything.
 fn gate(rooted: bool, mapped: bool, minimized: bool, w: i32, h: i32) -> Gate {
     if !rooted || !mapped {
         Gate::Stop
@@ -121,35 +272,17 @@ pub struct TransitionPreview {
 
 impl TransitionPreview {
     pub fn new() -> Self {
-        let stage = gtk4::Fixed::new();
-        stage.set_overflow(gtk4::Overflow::Hidden);
+        let stage = Stage::new();
         stage.add_css_class("wp-thumb");
         stage.add_css_class("crop-frame");
         stage.set_hexpand(true);
         stage.set_vexpand(true);
 
-        // pic_a is the bottom layer, pic_b sits on top.
-        let pic_a = gtk4::Picture::new();
-        pic_a.set_can_shrink(true);
-        pic_a.set_keep_aspect_ratio(true);
-        let pic_b = gtk4::Picture::new();
-        pic_b.set_can_shrink(true);
-        pic_b.set_keep_aspect_ratio(true);
-
-        stage.put(&pic_a, 0.0, 0.0);
-        stage.put(&pic_b, 0.0, 0.0);
-
         let state = Rc::new(RefCell::new(State {
-            first: None,
-            second: None,
             transition: Transition::None,
             t: 0.0,
             source: None,
             stage: stage.clone(),
-            pic_a,
-            pic_b,
-            last_size: (0, 0),
-            blur_step: (0, 0),
             wanted: false,
         }));
 
@@ -183,11 +316,14 @@ impl TransitionPreview {
     /// Either may be None.
     pub fn set_images(&self, first: Option<PathBuf>, second: Option<PathBuf>) {
         let mut state = self.state.borrow_mut();
-        state.first = first;
-        state.second = second;
         state.t = 0.0;
-        load_into(&state.pic_a, state.first.as_ref());
-        load_into(&state.pic_b, state.second.as_ref());
+        // Decoded on the main thread, as before: `Pixbuf` is not `Send`, and
+        // `from_file_at_scale` uses the decoder's own downscaling, so a 4K JPEG
+        // costs about what a 720p one does.
+        state.stage.set_textures(
+            first.as_deref().and_then(load_texture),
+            second.as_deref().and_then(load_texture),
+        );
     }
 
     /// Choose which transition to demo and (re)start the loop. `Transition::None`
@@ -202,15 +338,8 @@ impl TransitionPreview {
             state.t = 0.0;
         }
 
+        // None is a static first frame, which `stop` already left on the stage.
         if transition == Transition::None {
-            // Static first frame: pic_a visible, pic_b hidden, no animation.
-            let state = self.state.borrow();
-            state.pic_a.set_opacity(1.0);
-            state.pic_b.set_opacity(0.0);
-            state.stage.set_child_transform(&state.pic_a, None);
-            state.stage.set_child_transform(&state.pic_b, None);
-            clear_blur(&state.pic_a);
-            clear_blur(&state.pic_b);
             return;
         }
 
@@ -225,16 +354,11 @@ impl TransitionPreview {
         if let Some(source) = state.source.take() {
             source.remove();
         }
-        // Reset to sensible defaults: first frame shown, transforms cleared,
-        // and — the one that would otherwise persist — the defocus removed. A
-        // leftover blur class would leave the editor's still preview soft.
-        state.pic_a.set_opacity(1.0);
-        state.pic_b.set_opacity(0.0);
-        state.stage.set_child_transform(&state.pic_a, None);
-        state.stage.set_child_transform(&state.pic_b, None);
-        clear_blur(&state.pic_a);
-        clear_blur(&state.pic_b);
-        state.blur_step = (0, 0);
+        // Back to the first frame, untransformed and — the one that would
+        // otherwise persist — undefocused, so the editor's still preview is
+        // sharp. Nothing here touches the stage's size: it never has any
+        // requests to undo.
+        state.stage.set_frames(REST);
     }
 }
 
@@ -266,52 +390,36 @@ fn is_minimized(widget: &impl IsA<gtk4::Widget>) -> bool {
     widget
         .native()
         .and_then(|n| n.surface())
-        .and_then(|s| s.downcast::<gtk4::gdk::Toplevel>().ok())
-        .is_some_and(|t| t.state().contains(gtk4::gdk::ToplevelState::MINIMIZED))
+        .and_then(|s| s.downcast::<gdk::Toplevel>().ok())
+        .is_some_and(|t| t.state().contains(gdk::ToplevelState::MINIMIZED))
 }
 
-/// Load `path` into `pic`, or clear it if `path` is None.
-fn load_into(pic: &gtk4::Picture, path: Option<&PathBuf>) {
-    match path {
-        Some(path) => pic.set_file(Some(&gio::File::for_path(path))),
-        None => pic.set_file(gio::File::NONE),
-    }
+/// Decode `path` for display: downscaled to fit [`DECODE_W`]x[`DECODE_H`]
+/// (aspect kept), EXIF-rotated, and only then uploaded, so a full-resolution
+/// texture is never retained. `None` when the file cannot be decoded — the
+/// stage then simply draws nothing for that frame.
+fn load_texture(path: &Path) -> Option<gdk::Texture> {
+    let pixbuf =
+        gdk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, DECODE_W, DECODE_H, true).ok()?;
+    let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
+    Some(gdk::Texture::for_pixbuf(&pixbuf))
 }
 
-/// Remove every defocus class from `pic`.
-fn clear_blur(pic: &gtk4::Picture) {
-    for class in BLUR_CLASSES {
-        pic.remove_css_class(class);
-    }
-}
-
-/// Apply defocus step `step` (`0` = sharp, `BLUR_CLASSES.len()` = softest) to
-/// `pic`, doing nothing when it already carries that step. `cur` is the caller's
-/// record of what is on the widget now and is updated in place.
-fn set_blur(pic: &gtk4::Picture, cur: &mut u8, step: u8) {
-    if *cur == step {
-        return;
-    }
-    if let Some(old) = blur_class(*cur) {
-        pic.remove_css_class(old);
-    }
-    if let Some(new) = blur_class(step) {
-        pic.add_css_class(new);
-    }
-    *cur = step;
-}
-
-/// The CSS class for defocus step `step`, or `None` for step `0` (sharp).
+/// Blur radius for defocus step `step`, `0.0` for step `0` (sharp).
 /// Indexed through `get` rather than `[]`: the crate builds with
 /// `panic = "abort"`, so an out-of-range step would take the whole app down
 /// rather than merely showing the wrong amount of blur.
-fn blur_class(step: u8) -> Option<&'static str> {
-    BLUR_CLASSES.get((step as usize).checked_sub(1)?).copied()
+fn blur_radius(step: u8) -> f64 {
+    (step as usize)
+        .checked_sub(1)
+        .and_then(|i| BLUR_RADII.get(i))
+        .copied()
+        .unwrap_or(0.0)
 }
 
-/// `0.0..=1.0` softness onto a defocus step on the [`BLUR_CLASSES`] ladder.
+/// `0.0..=1.0` softness onto a defocus step on the [`BLUR_RADII`] ladder.
 fn blur_step_for(softness: f64) -> u8 {
-    let steps = BLUR_CLASSES.len() as f64;
+    let steps = BLUR_RADII.len() as f64;
     (softness.clamp(0.0, 1.0) * steps).round().min(steps) as u8
 }
 
@@ -330,14 +438,122 @@ fn ease_in_out(x: f64) -> f64 {
     }
 }
 
-/// A scale-about-center transform for a stage of `w` x `h`.
-fn scale_about_center(w: i32, h: i32, s: f32) -> gsk::Transform {
-    let cx = w as f32 / 2.0;
-    let cy = h as f32 / 2.0;
-    gsk::Transform::new()
-        .translate(&graphene::Point::new(cx, cy))
-        .scale(s, s)
-        .translate(&graphene::Point::new(-cx, -cy))
+/// The rectangle `(x, y, w, h)` that covers a `dw` x `dh` area with a `tw` x `th`
+/// texture, aspect kept and centred (the overflow is cropped by the stage's
+/// clip). `None` for any non-positive dimension.
+fn cover_rect(tw: f32, th: f32, dw: f32, dh: f32) -> Option<(f32, f32, f32, f32)> {
+    if tw <= 0.0 || th <= 0.0 || dw <= 0.0 || dh <= 0.0 {
+        return None;
+    }
+    let s = (dw / tw).max(dh / th);
+    let (w, h) = (tw * s, th * s);
+    Some(((dw - w) / 2.0, (dh - h) / 2.0, w, h))
+}
+
+/// `0.0..=1.0` softness of the [`Transition::Blur`] ramp at progress `p`.
+fn blur_softness(p: f64) -> f64 {
+    if p < 0.5 {
+        ease_in_out(p * 2.0)
+    } else {
+        ease_in_out((1.0 - p) * 2.0)
+    }
+}
+
+/// Both frames' parameters for `transition` at progress `p` (`0.0..=1.0`
+/// through the moving part; it stays `1.0` during the hold).
+fn frame_params(transition: Transition, p: f64) -> [FrameParams; 2] {
+    let shown = FrameParams::SHOWN;
+    let hidden = FrameParams::HIDDEN;
+    match transition {
+        Transition::None => REST,
+        // Crossfade is a fade. It has never been anything else — mpv drives
+        // `gamma` on one decoder and cannot show two files at once — and this
+        // preview used to cross-dissolve them, promising an effect the daemon
+        // could not deliver. Same arm, same dip through black.
+        Transition::Fade | Transition::Crossfade => {
+            // Fade out to black, then fade the next frame in.
+            if p < 0.5 {
+                [
+                    FrameParams {
+                        opacity: 1.0 - p * 2.0,
+                        ..shown
+                    },
+                    hidden,
+                ]
+            } else {
+                [
+                    hidden,
+                    FrameParams {
+                        opacity: (p - 0.5) * 2.0,
+                        ..shown
+                    },
+                ]
+            }
+        }
+        Transition::Slide => [
+            FrameParams {
+                dx: -(p as f32),
+                ..shown
+            },
+            FrameParams {
+                dx: 1.0 - p as f32,
+                ..shown
+            },
+        ],
+        // Slow zoom on the first frame only, scaled about its center.
+        Transition::KenBurns => [
+            FrameParams {
+                scale: 1.0 + 0.22 * p as f32,
+                ..shown
+            },
+            hidden,
+        ],
+        Transition::Zoom => {
+            // Punch in on the outgoing frame, cut at the peak, settle out on
+            // the incoming one — the daemon ramps `video-zoom` and issues its
+            // `loadfile` at the top of the ramp, so the cut belongs there and
+            // not at a dissolve. The incoming frame starts at the peak the
+            // outgoing one reached, which is what puts the cut inside one
+            // continuous move rather than between two.
+            if p < 0.5 {
+                let k = ease_in_out(p * 2.0) as f32;
+                [
+                    FrameParams {
+                        scale: 1.0 + (ZOOM_PEAK - 1.0) * k,
+                        ..shown
+                    },
+                    hidden,
+                ]
+            } else {
+                let k = ease_in_out((p - 0.5) * 2.0) as f32;
+                [
+                    hidden,
+                    FrameParams {
+                        scale: ZOOM_PEAK - (ZOOM_PEAK - 1.0) * k,
+                        ..shown
+                    },
+                ]
+            }
+        }
+        Transition::Blur => {
+            // Defocus out, swap at the softest point, focus back in — sigma
+            // ramping up over the first half and back down over the second,
+            // exactly as the daemon ramps `lavfi=[gblur=sigma=…]` and then
+            // clears it. `vf` is a player property rather than a per-file one,
+            // so over there the incoming media arrives already defocused and
+            // the swap is never seen; here the swap lands at peak blur for the
+            // same reason. Nothing scales: the real effect is defocus only.
+            let blurred = FrameParams {
+                blur_step: blur_step_for(blur_softness(p)),
+                ..shown
+            };
+            if p < 0.5 {
+                [blurred, hidden]
+            } else {
+                [hidden, blurred]
+            }
+        }
+    }
 }
 
 /// Drive one animation frame (~30fps). Returns `Break` once the widget leaves
@@ -345,14 +561,12 @@ fn scale_about_center(w: i32, h: i32, s: f32) -> gsk::Transform {
 fn tick(state_rc: &Rc<RefCell<State>>) -> glib::ControlFlow {
     let mut state = state_rc.borrow_mut();
 
-    let w = state.stage.width();
-    let h = state.stage.height();
     match gate(
         state.stage.root().is_some(),
         state.stage.is_mapped(),
         is_minimized(&state.stage),
-        w,
-        h,
+        state.stage.width(),
+        state.stage.height(),
     ) {
         Gate::Stop => {
             // Returning Break destroys the source; forget its id so `stop()`
@@ -369,128 +583,13 @@ fn tick(state_rc: &Rc<RefCell<State>>) -> glib::ControlFlow {
     state.t += STEP;
     if state.t >= CYCLE {
         state.t = 0.0;
-        let st = &mut *state;
-        std::mem::swap(&mut st.first, &mut st.second);
-        load_into(&st.pic_a, st.first.as_ref());
-        load_into(&st.pic_b, st.second.as_ref());
+        state.stage.swap_textures();
     }
 
-    // Size both pictures to fill the stage, but only when the size actually
-    // changes — doing it every frame would queue a relayout each tick and make
-    // the whole editor jitter/resize during the animation.
-    if (w, h) != state.last_size {
-        state.last_size = (w, h);
-        state.pic_a.set_size_request(w, h);
-        state.pic_b.set_size_request(w, h);
-    }
-
-    // Progress through the moving part; stays at 1.0 during the hold.
+    // Progress through the moving part; stays at 1.0 during the hold. Only
+    // state and a repaint request follow — never a resize request.
     let p = (state.t / DUR).min(1.0);
-
-    match state.transition {
-        Transition::None => {}
-        // Crossfade is a fade. It has never been anything else — mpv drives
-        // `gamma` on one decoder and cannot show two files at once — and this
-        // preview used to cross-dissolve them, promising an effect the daemon
-        // could not deliver. Same arm, same dip through black.
-        Transition::Fade | Transition::Crossfade => {
-            // Fade out to black, then fade the next frame in.
-            if p < 0.5 {
-                state.pic_a.set_opacity(1.0 - p * 2.0);
-                state.pic_b.set_opacity(0.0);
-            } else {
-                state.pic_a.set_opacity(0.0);
-                state.pic_b.set_opacity((p - 0.5) * 2.0);
-            }
-            state.stage.set_child_transform(&state.pic_a, None);
-            state.stage.set_child_transform(&state.pic_b, None);
-        }
-        Transition::Slide => {
-            state.pic_a.set_opacity(1.0);
-            state.pic_b.set_opacity(1.0);
-            let a =
-                gsk::Transform::new().translate(&graphene::Point::new(-(w as f32) * p as f32, 0.0));
-            let b = gsk::Transform::new()
-                .translate(&graphene::Point::new((w as f32) * (1.0 - p as f32), 0.0));
-            state.stage.set_child_transform(&state.pic_a, Some(&a));
-            state.stage.set_child_transform(&state.pic_b, Some(&b));
-        }
-        Transition::KenBurns => {
-            // Slow zoom on the first frame only, scaled about its center.
-            state.pic_a.set_opacity(1.0);
-            state.pic_b.set_opacity(0.0);
-            let s = 1.0 + 0.22 * p as f32;
-            let cx = w as f32 / 2.0;
-            let cy = h as f32 / 2.0;
-            let a = gsk::Transform::new()
-                .translate(&graphene::Point::new(cx, cy))
-                .scale(s, s)
-                .translate(&graphene::Point::new(-cx, -cy));
-            state.stage.set_child_transform(&state.pic_a, Some(&a));
-            state.stage.set_child_transform(&state.pic_b, None);
-        }
-        Transition::Zoom => {
-            // Punch in on the outgoing frame, cut at the peak, settle out on
-            // the incoming one — the daemon ramps `video-zoom` and issues its
-            // `loadfile` at the top of the ramp, so the cut belongs there and
-            // not at a dissolve. The incoming frame starts at the peak the
-            // outgoing one reached, which is what puts the cut inside one
-            // continuous move rather than between two.
-            let (front, back, s) = if p < 0.5 {
-                let k = ease_in_out(p * 2.0) as f32;
-                (&state.pic_a, &state.pic_b, 1.0 + (ZOOM_PEAK - 1.0) * k)
-            } else {
-                let k = ease_in_out((p - 0.5) * 2.0) as f32;
-                (
-                    &state.pic_b,
-                    &state.pic_a,
-                    ZOOM_PEAK - (ZOOM_PEAK - 1.0) * k,
-                )
-            };
-            front.set_opacity(1.0);
-            back.set_opacity(0.0);
-            let t = scale_about_center(w, h, s);
-            state.stage.set_child_transform(front, Some(&t));
-            state.stage.set_child_transform(back, None);
-        }
-        Transition::Blur => {
-            // Defocus out, swap at the softest point, focus back in — sigma
-            // ramping up over the first half and back down over the second,
-            // exactly as the daemon ramps `lavfi=[gblur=sigma=…]` and then
-            // clears it. `vf` is a player property rather than a per-file one,
-            // so over there the incoming media arrives already defocused and
-            // the swap is never seen; here the swap lands at peak blur for the
-            // same reason. Nothing scales: the real effect is defocus only.
-            let soft = if p < 0.5 {
-                ease_in_out(p * 2.0)
-            } else {
-                ease_in_out((1.0 - p) * 2.0)
-            };
-            let step = blur_step_for(soft);
-            let st = &mut *state;
-            let (front, back, front_step, back_step) = if p < 0.5 {
-                (
-                    &st.pic_a,
-                    &st.pic_b,
-                    &mut st.blur_step.0,
-                    &mut st.blur_step.1,
-                )
-            } else {
-                (
-                    &st.pic_b,
-                    &st.pic_a,
-                    &mut st.blur_step.1,
-                    &mut st.blur_step.0,
-                )
-            };
-            front.set_opacity(1.0);
-            back.set_opacity(0.0);
-            set_blur(front, front_step, step);
-            set_blur(back, back_step, 0);
-            st.stage.set_child_transform(front, None);
-            st.stage.set_child_transform(back, None);
-        }
-    }
+    state.stage.set_frames(frame_params(state.transition, p));
 
     glib::ControlFlow::Continue
 }
@@ -526,23 +625,17 @@ mod tests {
 
     /// The defocus must start sharp, peak exactly where the frames swap, and
     /// finish sharp. The last of those is the one that matters beyond looks: a
-    /// ramp that ended anywhere but zero would leave a blur class on the
-    /// picture, and the editor's still preview would stay soft — the same
-    /// "leave nothing behind" rule the daemon's own machine is built around.
+    /// ramp that ended anywhere but zero would leave the picture soft, and the
+    /// editor's still preview would stay soft — the same "leave nothing behind"
+    /// rule the daemon's own machine is built around.
     #[test]
     fn the_defocus_ramp_starts_and_ends_sharp_and_peaks_at_the_swap() {
-        let softness = |p: f64| {
-            if p < 0.5 {
-                ease_in_out(p * 2.0)
-            } else {
-                ease_in_out((1.0 - p) * 2.0)
-            }
-        };
+        let softness = blur_softness;
         assert_eq!(blur_step_for(softness(0.0)), 0);
         assert_eq!(blur_step_for(softness(1.0)), 0);
         assert_eq!(
             blur_step_for(softness(0.5)),
-            BLUR_CLASSES.len() as u8,
+            BLUR_RADII.len() as u8,
             "the swap must land on the softest step, which is what hides it"
         );
 
@@ -561,28 +654,191 @@ mod tests {
         }
     }
 
-    /// Every step the ramp can produce must name a class the stylesheet
-    /// actually declares, and step 0 must name none at all.
+    /// Every step the ramp can produce must name a radius, step 0 must name
+    /// none, and the ladder must only ever get softer.
     #[test]
-    fn every_blur_step_maps_to_a_declared_class() {
-        assert_eq!(blur_class(0), None, "step 0 is sharp and carries no class");
-        for step in 1..=BLUR_CLASSES.len() as u8 {
-            assert_eq!(blur_class(step), Some(BLUR_CLASSES[step as usize - 1]));
+    fn every_blur_step_maps_to_a_radius() {
+        assert_eq!(blur_radius(0), 0.0, "step 0 is sharp");
+        for step in 1..=BLUR_RADII.len() as u8 {
+            assert_eq!(blur_radius(step), BLUR_RADII[step as usize - 1]);
         }
+        assert!(BLUR_RADII.windows(2).all(|w| w[0] < w[1]));
         // Out of range degrades to "no blur" instead of aborting the process.
-        assert_eq!(blur_class(BLUR_CLASSES.len() as u8 + 1), None);
+        assert_eq!(blur_radius(BLUR_RADII.len() as u8 + 1), 0.0);
     }
 
     /// The zoom must be a single continuous move through the cut: both halves
     /// meet at the punch peak, and both ends sit at rest.
     #[test]
     fn the_zoom_punch_is_continuous_across_the_cut() {
-        let out = |p: f64| 1.0 + (ZOOM_PEAK as f64 - 1.0) * ease_in_out(p * 2.0);
-        let back =
-            |p: f64| ZOOM_PEAK as f64 - (ZOOM_PEAK as f64 - 1.0) * ease_in_out((p - 0.5) * 2.0);
-        assert!((out(0.0) - 1.0).abs() < 1e-9);
-        assert!((out(0.5) - ZOOM_PEAK as f64).abs() < 1e-9);
-        assert!((back(0.5) - ZOOM_PEAK as f64).abs() < 1e-9);
-        assert!((back(1.0) - 1.0).abs() < 1e-9);
+        let scale_at = |p: f64| {
+            let f = frame_params(Transition::Zoom, p);
+            if p < 0.5 {
+                f[0].scale
+            } else {
+                f[1].scale
+            }
+        };
+        assert!((scale_at(0.0) - 1.0).abs() < 1e-6);
+        assert!((scale_at(0.4999) - ZOOM_PEAK).abs() < 1e-3);
+        assert!((scale_at(0.5) - ZOOM_PEAK).abs() < 1e-6);
+        assert!((scale_at(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cover_rect_fills_the_area_and_centres_the_overflow() {
+        // Wider than the area: height matches, sides are cropped equally.
+        let (x, y, w, h) = cover_rect(200.0, 100.0, 100.0, 100.0).unwrap();
+        assert_eq!((y, h), (0.0, 100.0));
+        assert_eq!((x, w), (-50.0, 200.0));
+        // Taller than the area: width matches, top and bottom are cropped.
+        let (x, y, w, h) = cover_rect(100.0, 200.0, 100.0, 100.0).unwrap();
+        assert_eq!((x, w), (0.0, 100.0));
+        assert_eq!((y, h), (-50.0, 200.0));
+        // Same aspect: exact fit.
+        assert_eq!(
+            cover_rect(1280.0, 720.0, 640.0, 360.0),
+            Some((0.0, 0.0, 640.0, 360.0))
+        );
+        assert_eq!(cover_rect(0.0, 10.0, 10.0, 10.0), None);
+        assert_eq!(cover_rect(10.0, 10.0, 0.0, 10.0), None);
+    }
+
+    #[test]
+    fn each_transition_starts_at_rest_and_moves_as_documented() {
+        // Fade dips through black at the half-way point.
+        let f = frame_params(Transition::Fade, 0.5);
+        assert_eq!((f[0].opacity, f[1].opacity), (0.0, 0.0));
+        let f = frame_params(Transition::Fade, 0.25);
+        assert!((f[0].opacity - 0.5).abs() < 1e-9 && f[1].opacity == 0.0);
+        let f = frame_params(Transition::Crossfade, 1.0);
+        assert_eq!((f[0].opacity, f[1].opacity), (0.0, 1.0));
+
+        // Slide: A leaves left as B arrives from the right, both fully opaque.
+        let f = frame_params(Transition::Slide, 0.25);
+        assert!((f[0].dx + 0.25).abs() < 1e-6 && (f[1].dx - 0.75).abs() < 1e-6);
+        assert_eq!((f[0].opacity, f[1].opacity), (1.0, 1.0));
+
+        // Ken Burns: only the first frame, growing to 1.22.
+        let f = frame_params(Transition::KenBurns, 0.0);
+        assert_eq!((f[0].scale, f[1].opacity), (1.0, 0.0));
+        let f = frame_params(Transition::KenBurns, 1.0);
+        assert!((f[0].scale - 1.22).abs() < 1e-6);
+
+        // Blur: sharp at the ends, softest at the swap, and the frame that is
+        // shown flips with it; nothing scales or slides.
+        assert_eq!(frame_params(Transition::Blur, 0.0)[0].blur_step, 0);
+        let f = frame_params(Transition::Blur, 0.75);
+        assert_eq!(f[0].opacity, 0.0);
+        assert!(f[1].blur_step > 0 && f[1].scale == 1.0 && f[1].dx == 0.0);
+        assert_eq!(frame_params(Transition::Blur, 0.4999)[0].blur_step, 6);
+        assert_eq!(frame_params(Transition::None, 0.7), REST);
+    }
+
+    /// Regression for #31: the stage must not grow while Ken Burns / Zoom /
+    /// Slide run, and must not stay enlarged afterwards. Needs a display, so
+    /// run it with `xvfb-run -a cargo test transition_preview_does_not_grow --
+    /// --ignored`.
+    #[gtk4::test]
+    #[ignore = "needs a display"]
+    fn transition_preview_does_not_grow_the_window() {
+        let dir = std::env::temp_dir().join(format!("fresco-tp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = Vec::new();
+        for (i, shade) in [60u8, 200].into_iter().enumerate() {
+            // 1080p is what inflated the old minimum height.
+            let pb = gdk::gdk_pixbuf::Pixbuf::new(
+                gdk::gdk_pixbuf::Colorspace::Rgb,
+                false,
+                8,
+                1920,
+                1080,
+            )
+            .unwrap();
+            pb.fill(u32::from_be_bytes([shade, 90, 255 - shade, 255]));
+            let path = dir.join(format!("{i}.png"));
+            pb.savev(&path, "png", &[]).unwrap();
+            paths.push(path);
+        }
+
+        let window = gtk4::Window::new();
+        window.set_default_size(1000, 600);
+        let pane = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        pane.set_hexpand(true);
+        pane.set_valign(gtk4::Align::Center);
+        pane.set_margin_start(20);
+        pane.set_margin_end(20);
+        let preview = TransitionPreview::new();
+        let frame = gtk4::AspectFrame::new(0.5, 0.5, 16.0 / 9.0, false);
+        frame.set_child(Some(&preview.root));
+        frame.set_hexpand(true);
+        frame.set_vexpand(false);
+        pane.append(&frame);
+        window.set_child(Some(&pane));
+        window.present();
+        preview.set_images(Some(paths[0].clone()), Some(paths[1].clone()));
+
+        let ctx = glib::MainContext::default();
+        let pump = |ticks: u32, sizes: &mut Vec<(i32, i32, i32, i32)>| {
+            for _ in 0..ticks {
+                let until = std::time::Instant::now() + Duration::from_millis(33);
+                while std::time::Instant::now() < until {
+                    ctx.iteration(false);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                sizes.push((
+                    window.width(),
+                    window.height(),
+                    preview.root.width(),
+                    preview.root.height(),
+                ));
+            }
+        };
+
+        let mut settle = Vec::new();
+        pump(15, &mut settle);
+        let base = *settle.last().unwrap();
+        assert!(base.2 > 0 && base.3 > 0, "stage never got an allocation");
+        println!(
+            "baseline window {}x{} stage {}x{}",
+            base.0, base.1, base.2, base.3
+        );
+
+        for t in [
+            Transition::KenBurns,
+            Transition::Zoom,
+            Transition::Slide,
+            Transition::Blur,
+            Transition::Fade,
+        ] {
+            preview.set_transition(t);
+            let mut sizes = Vec::new();
+            pump(60, &mut sizes);
+            let max = sizes.iter().fold(base, |m, s| {
+                (m.0.max(s.0), m.1.max(s.1), m.2.max(s.2), m.3.max(s.3))
+            });
+            println!(
+                "{t:?}: max window {}x{} stage {}x{}",
+                max.0, max.1, max.2, max.3
+            );
+            for (i, s) in [(0, max.0), (1, max.1), (2, max.2), (3, max.3)] {
+                let b = [base.0, base.1, base.2, base.3][i];
+                assert!(s - b <= 1, "{t:?}: size component {i} grew from {b} to {s}");
+            }
+        }
+        // Back on Fade after the big ones the size is unchanged, not stuck.
+        let last = *{
+            let mut v = Vec::new();
+            pump(3, &mut v);
+            v
+        }
+        .last()
+        .unwrap();
+        assert!(
+            (last.2 - base.2).abs() <= 1 && (last.3 - base.3).abs() <= 1,
+            "stage stayed enlarged: {last:?} vs {base:?}"
+        );
+        preview.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
