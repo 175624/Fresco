@@ -6,7 +6,7 @@ Status: adopted 2026-07-03. Baseline: v0.0.91.
 
 Fresco is stable and well-engineered (self-healing renderers, hwdec, strong CI) but its value is capped by five things:
 
-1. **Broken funnel** — landing page has placeholder screenshots; install is .deb-only (no Flathub/AUR), excluding the Arch/Hyprland ricing crowd and everyone outside Debian-family.
+1. **Broken funnel** — landing page has placeholder screenshots; install is .deb-only (no AUR), excluding the Arch/Hyprland ricing crowd and everyone outside Debian-family.
 2. **No content** — users must bring their own mp4. Wallpaper Engine's lesson: the Workshop is ~90% of its value.
 3. **GNOME Wayland is static-only** — the majority Linux desktop gets no live wallpaper, and GNOME is removing X11 (disabled in GNOME 49), so the "works on GNOME X11" story is melting.
 4. **Honesty debt** — README claims "live hotplug handling" (README.md:37) and Hyprland/KDE support (README.md:30,65,96), but Wayland hotplug is unimplemented and only Sway is proven on-screen (docs/WAYLAND_VERIFICATION.md).
@@ -18,14 +18,14 @@ The ambition: **make Fresco the world's best wallpaper app for Linux users, with
 
 | Lever | Multiplier | Cost |
 |---|---|---|
-| Fix reach (Flathub, AUR, real screenshots, true claims) | 3–4x reachable installs | days–weeks |
+| Fix reach (AUR, real screenshots, true claims) | 3–4x reachable installs | days–weeks |
 | Content catalog (kill "bring your own mp4") | 1.5–2x retention + conversion | 2–3 weeks |
 | GNOME Wayland live wallpapers | 2–3x addressable users | XL, gated by a 1-week spike |
 | Engine v1.0 (native backend) | enables shaders + perf wins | XL, invisible to users until then |
 
 Sequencing philosophy: **prove before advertising, grow before rewriting.** The native-backend rewrite comes late because the gallery/GUI features are backend-agnostic (they produce library entries both engines consume) — nothing built before it gets reworked.
 
-**What "world's best on Linux" means concretely:** after P1–P2 Fresco is the most trustworthy + easiest-to-install option (no competitor has proven claims + Flathub + AUR); after P3 it's the only Linux wallpaper app with a content ecosystem (Wallpaper Engine's actual moat); after P4 it's the only GUI app with live wallpapers on GNOME, the majority desktop; after P5–P6 it has engine quality and one-click shaders nothing else on Linux offers. The Linux competition (Komorebi abandoned, Hidamari GNOME-only, mpvpaper CLI-only) is cleared by P2; the real benchmark is Wallpaper Engine.
+**What "world's best on Linux" means concretely:** after P1–P2 Fresco is the most trustworthy + easiest-to-install option (no competitor has proven claims + AUR); after P3 it's the only Linux wallpaper app with a content ecosystem (Wallpaper Engine's actual moat); after P4 it's the only GUI app with live wallpapers on GNOME, the majority desktop; after P5–P6 it has engine quality and one-click shaders nothing else on Linux offers. The Linux competition (Komorebi abandoned, Hidamari GNOME-only, mpvpaper CLI-only) is cleared by P2; the real benchmark is Wallpaper Engine.
 
 **macOS readiness principle (applies from P3 onward):** the portable assets are the *brain* — catalog, library schema, scheduler, config, update abstractions — not the Linux backends. New core modules (`catalog.rs`, `schedule.rs`, download worker) must contain no Linux-isms (no XDG paths hardcoded outside a platform layer, no Unix-socket assumptions in core types). This costs ~nothing now and makes Phase 7 a port, not a rewrite. macOS work itself starts only after the Linux position is secured — a solo dev splitting across two platforms before winning one risks both.
 
@@ -108,13 +108,8 @@ Quality degrades on large/high-res displays — softness and occasional broken p
 
 ## Phase 2 — Reach (~2–3 weeks)
 
-### 2.1 Flathub, for real
-The manifest (flatpak/…yaml) is an unbuilt draft pinned to v0.0.2. Flathub covers Fedora/openSUSE/Arch-adjacent/Steam Deck at once and provides public install stats (the measurement instrument for later phases). Sandbox work required: autostart via the Background portal (gio D-Bus, no new crate; keep file-write path outside Flatpak), update UI + daemon update-notifications fully suppressed in-sandbox, mpvpaper + libmpv built as manifest modules (dlopen resolves in /app/lib), dconf access for the GNOME static path, runtime retargeted to current GNOME.
-- **AC:**
-  - Manifest builds reproducibly from a pinned tag+commit with `org.flatpak.Builder`; `flatpak-builder-lint` zero errors.
-  - Inside the sandbox: `frescod --check` reports bundled libmpv + correct capability; live wallpaper works on X11 and Sway; autostart created via portal; update prompts absent (log assertion).
-  - Published on Flathub; app appears in GNOME Software/Discover with real screenshots; store listing explicitly sets the GNOME Wayland static-frame expectation (Flathub's core audience is GNOME — do not oversell).
-  - Landing "Coming soon" replaced with a live Flathub badge; metainfo.xml release list updated (currently stale at 0.0.2).
+### 2.1 Flathub — dropped
+Flatpak packaging was dropped (owner decision; the draft manifest and `docs/FLATHUB.md` are removed from the repo). Reach comes from the .deb, AUR, `install.sh` and Spark Store instead; the public install stats Flathub would have given are not available.
 
 ### 2.2 Per-monitor assignment GUI
 Config (`Config.monitors` map) and both daemon reconcile paths already honor per-connector wallpapers — this is GUI + one additive IPC field. Multi-monitor is the enthusiast norm and this is the cheapest "wow" in the backlog. Monitor names must come from the daemon (GDK connector API needs GTK 4.10; crate pins v4_6): add `monitors_info: Vec<MonitorInfo>` to StatusReply with `#[serde(default)]` (old-daemon compatible), listing **all** connected outputs.
@@ -128,7 +123,7 @@ Config (`Config.monitors` map) and both daemon reconcile paths already honor per
 Ricers script everything; documenting the control socket turns Fresco into a building block (waybar toggles, workspace-based wallpaper scripts) and earns community respect cheaply.
 - **AC:** a docs page with 5 copy-pasteable recipes (set wallpaper from script, per-output set, pause/resume, status JSON, playlist-next); each verified in headless Sway.
 
-**Second launch moment:** next release + Flathub announcement.
+**Second launch moment:** next release announcement.
 
 ---
 
@@ -150,7 +145,7 @@ The Workshop lever — converts acquisition (gallery = demo + SEO), activation (
   - Measurable goal: within 4 weeks, catalog installs ≥ 40% of new-version downloads.
 
 ### 3.2 Add-from-URL (direct media URLs only)
-Paste an `https://….mp4/.webm` link → downloads into the library (shares the 3.1 worker). **No yt-dlp / YouTube integration** — ToS gray zone that endangers Flathub/AUR standing, perpetual bitrot, and it competes with the catalog (the strategic asset).
+Paste an `https://….mp4/.webm` link → downloads into the library (shares the 3.1 worker). **No yt-dlp / YouTube integration** — ToS gray zone that endangers AUR standing, perpetual bitrot, and it competes with the catalog (the strategic asset).
 - **AC:** direct URL downloads to library + entry + thumbnail (testable against a local http.server fixture); Content-Length pre-check with size cap and mid-stream abort; cancel leaves no partial; clear error surface.
 
 ### 3.3 Scheduled / time-of-day wallpapers
@@ -233,6 +228,56 @@ User-requested (2026-07-26): song lyrics with themes, audio-level waves, a spinn
 
 The one structural fact that belongs here: **text and rich widgets are different architectures.** Text can ride mpv's `osd-overlay` on today's substrate. Bitmaps and animation cannot — ASS has no bitmap support — so the album-art disc, visualiser and clock need a surface Fresco owns, i.e. **hard-depends on 5.1**, exactly like 6.1. Audio reactivity needs PipeWire capture + FFT, which **shares 6.1's audio-reactive module** rather than growing a second one.
 
+### 6.6 Lock screen: Fresco's wallpaper and widgets while locked
+
+Reopened 2026-09-28 (was a non-goal; see the Non-goals list). **Decision:**
+the real system lock screen shows Fresco's wallpaper (live where the host
+allows it, a still frame otherwise) plus Fresco's own widgets — clock,
+greeting, now playing, album art, battery — instead of each distro's default
+lock-screen furniture. Fresco changes UI only: no PAM, no setuid, no password
+handling anywhere in this feature. The host's existing, already-audited
+locker keeps 100% of the authentication and draws its own password prompt;
+Fresco's renderer is always a child process, plugin, or background layer of
+that locker, never a replacement for it. The old non-goal's objections are
+answered rather than dismissed: GDM (the login screen) and GNOME's lock
+screen keep the old limit (still frame only, no plugin surface exists);
+per-compositor divergence is contained behind one shared renderer feeding
+thin per-host adapters, the same pattern Fresco already uses for the desktop
+wallpaper itself; and the payoff was under-priced — the lock screen is the
+most-screenshotted moment in the ricing community, hyprlock and KDE's Smart
+Video Wallpaper Reborn both show demand, and no Linux project currently
+layers custom widgets onto it.
+
+**Host approach:** COSMIC gets live video through `cosmic-session-lock-layer-v1`
+with widgets around cosmic-greeter's own panel. wlroots compositors get
+`fresco lock`, wrapping swaylock-plugin with a fail-closed fallback chain
+down to `loginctl lock-session`. X11 (via xsecurelock) and MATE/Xfce
+(the same saver packaged as a screensaver theme) share one Fresco saver
+module with no auth capability of its own. KDE Plasma 6 reads a widget PNG
+through a wallpaper plugin, gated on a seccomp spike. GNOME, Cinnamon and
+Deepin get a still frame only, through the existing overview-sync mechanism;
+widgets are later, host-specific work. Flatpak builds are no longer provided — the feature
+needs host files no sandbox can reach.
+
+- **AC:**
+  - Fail-closed, verified per host: `kill -9` the Fresco-owned
+    process/plugin ×10 while locked → session stays locked and the password
+    prompt still works every time.
+  - Lock/unlock ×50 on each supported host leaves no leaked process and the
+    desktop renderer resumes; suspend/resume never flashes desktop content or
+    desktop-only widgets.
+  - `fresco lock` always ends in a locked session, including every step of
+    its fallback chain, with loud failure reporting rather than a silent
+    return to an unlocked desktop.
+  - On battery, CPU while locked is within noise of the still-image baseline
+    (`turbostat`, the same rig and standard as §6.4); live video is AC-only
+    by default.
+  - No network access from any process running inside a locker; no
+    notification or calendar content on the lock screen ever; every widget
+    carries its own privacy note in the GUI.
+  - The in-app lock-screen preview never calls any locking primitive, and
+    matches the real per-preset lock screen on each host it covers.
+
 ### 6.2 Catalog v2: community submissions
 Only now, once traffic justifies moderation: submissions via GitHub PRs to the `fresco-wallpapers` repo — deliberately not an in-app upload flow (no accounts, no abuse surface; reuses GitHub identity + review tooling).
 - **AC:** submission-to-published ≤1 week; CI validates license field, loop cleanliness (first/last frame diff), size caps; contributor credited in-app.
@@ -273,8 +318,8 @@ Cut GPU load for a video wallpaper on weak hardware (Intel N150). Shipped at two
 ## Sequencing dependencies (explicit)
 
 1. **Prove before advertise:** 1.2 before any Hyprland/KDE marketing; 4 before any "GNOME live" claim; 5.3 before restoring the unconditional hotplug claim. README violates this today — 1.2/1.4 remediate.
-2. v0.0.91's update flow → Flathub (2.1): the updater must branch on packaging type before a second packaging type exists (shipped; 2.1 verifies in-sandbox).
-3. Flathub (2.1) → measurement: its public stats are the adoption instrument for P3+.
+2. (Former Flathub items dropped with Flatpak packaging; the updater still branches on packaging type.)
+3. Measurement: GitHub release counts and AUR votes are the adoption instrument for P3+.
 4. Catalog `content_type` (3.1) → shaders (6.1): reserve the field now, no migration later.
 5. GNOME spike (3.4) → Phase 4 scope → COPR/Fedora outreach only after GNOME live exists.
 6. Native backend (5.1) → shaders (6.1): impossible on the mpvpaper substrate.
@@ -286,9 +331,9 @@ Cut GPU load for a video wallpaper on weak hardware (Intel N150). Shipped at two
 ## Non-goals (killed, with reasons)
 
 - **Web/HTML wallpapers** — stays killed (as at 0.0.1): WebKitGTK/CEF per monitor is a giant RAM/security/maintenance surface; popular web wallpapers are mostly reproducible as video or shaders. Revisit only if shader adoption proves demand.
-- **yt-dlp / YouTube download** — ToS gray zone poisoning Flathub/AUR standing + perpetual bitrot + competes with the catalog. Direct media URLs (3.2) cover the legitimate need.
-- **Lock-screen wallpapers** — GDM doesn't permit it; per-compositor divergence; payoff is one glance a day.
-- **Snap** — audience covered by .deb + Flathub; hostile perception in the exact community being courted.
+- **yt-dlp / YouTube download** — ToS gray zone poisoning AUR standing + perpetual bitrot + competes with the catalog. Direct media URLs (3.2) cover the legitimate need.
+- **Lock-screen wallpapers** — reopened 2026-09-28: see §6.6.
+- **Snap** — audience covered by .deb + AUR; hostile perception in the exact community being courted.
 - **Mouse-parallax interactivity** — pointer access on Wayland background surfaces is privileged/fragile; niche payoff.
 - **Accounts, ratings, in-app uploads, "marketplace"** — moderation/abuse/GDPR surface a solo dev cannot carry; GitHub-PR submissions capture ~90% of the value at ~5% of the cost, and preserve the no-accounts privacy differentiation.
 - **Windows port, monetization** — out of scope by identity ("free forever, no paid tier"). macOS is NOT killed — it is deferred to Phase 7 and designed-for from Phase 3 (see macOS readiness principle).
@@ -300,7 +345,7 @@ The event-discarding X11 loop + 2s re-lower heuristic in Daemon::run; the WlOutp
 
 ## Measurement (no client telemetry)
 
-- **Baseline (P1 week 1):** GitHub release download counts (API) + stars slope; then Flathub install stats + AUR votes.
+- **Baseline (P1 week 1):** GitHub release download counts (API) + stars slope; then AUR votes.
 - **Retention proxy:** catalog per-item server-side installs ÷ release downloads (target ≥40% by P3+4wk).
 - **Reputation:** r/unixporn post performance; existing opt-in 👍/👎 feedback ratio trending positive.
 - **Target:** 10x weekly installs vs baseline by end of Phase 4 (distribution 3–4x compounded with GNOME 2–3x).
@@ -310,7 +355,6 @@ The event-discarding X11 loop + 2s re-lower heuristic in Daemon::run; the WlOutp
 - engine-notes/ENGINE_IMPROVEMENTS.md — items C (hotplug) & D (cpu%) open; A & B already shipped
 - docs/GNOME_LIVE_WALLPAPER_PLAN.md — the 3.4 spike + Phase 4 architecture (policy-based differentiation)
 - docs/WAYLAND_VERIFICATION.md — the evidence ledger 1.2/2.2/5.x flip to PROVEN
-- flatpak/io.github.dibbayajyotiroy.Fresco.yaml — stale draft 2.1 makes real
 - supabase/schema.sql + admin/ — extend with catalog_items for 3.1
 - src/gui/library.rs (LibraryEntry/entries.json) — the store catalog installs converge on
 - src/ipc.rs (StatusReply) — additive monitors_info for 2.2

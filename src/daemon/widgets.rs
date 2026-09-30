@@ -295,9 +295,20 @@ pub struct OutputGeom {
     pub w: u32,
     /// Height in pixels.
     pub h: u32,
+    /// The output's HiDPI scale in thousandths (`1000` = 1.0, `1500` = 1.5).
+    /// Only the lock engine reads it (COSMIC's greeter panel is sized in
+    /// *logical* pixels, so the reservation needs the real factor); the
+    /// desktop widget engine sizes from `w`/`h` alone. See
+    /// [`crate::daemon::monitors::Monitor::scale_milli`].
+    pub scale_milli: u16,
 }
 
 impl OutputGeom {
+    /// [`OutputGeom::scale_milli`] as the `f32` the widget toolkit takes.
+    pub fn scale(&self) -> f32 {
+        f32::from(self.scale_milli.max(1)) / 1000.0
+    }
+
     /// The [`WidgetUpdate::target`] for this output: `None` for the unnamed
     /// one, since there is then nothing to tell apart.
     fn target(&self) -> Option<String> {
@@ -2237,7 +2248,7 @@ fn place(
 /// angle changes every tick; folding it in here would defeat [`DISC_FPS`] and
 /// redraw at the loop rate. Animation is the separate, rate-capped `stepped`
 /// input to `BitmapState::push`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContentKey(u64);
 
 impl ContentKey {
@@ -2638,7 +2649,13 @@ fn slot_path(stem: &Path, n: usize) -> PathBuf {
 /// shrinking anyway — buys back only tmpfs pages we have already capped, and
 /// stakes a renderer crash on an implementation detail of whichever mpv the
 /// user's distribution ships. Not worth it.
-fn write_frame(path: &Path, frame: &Bgra) -> std::io::Result<()> {
+///
+/// `pub(super)`, not private: `daemon::lock::engine` writes its own per-slot
+/// bitmap frames through this exact function rather than a second copy of the
+/// "grow, never shrink" mmap-safety rule above — the same reasoning
+/// `overview::render_still` being `pub(super)` documents for
+/// `daemon::cosmic_bg`.
+pub(super) fn write_frame(path: &Path, frame: &Bgra) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -2733,6 +2750,10 @@ pub struct WidgetEngine {
     /// Line selection, offsets, presets and the "unchanged ⇒ [`Action::Idle`]"
     /// fast path all live in here; this module never re-implements any of it.
     lyrics: LyricsRuntime,
+    /// The lock screen's Album Art widget wants cover art fetched, even if
+    /// [`DiscWidgetCfg::enabled`] is false. See
+    /// [`WidgetEngine::set_lock_album_art`].
+    lock_wants_art: bool,
     /// `Some` exactly while the lyric widget is enabled.
     worker: Option<Worker>,
     /// [`Track::seq`] of the track currently loaded into `lyrics`.
@@ -2802,12 +2823,14 @@ impl WidgetEngine {
                 connector: String::new(),
                 w: 1920,
                 h: 1080,
+                scale_milli: 1000,
             }],
             accent: config::Accent::default(),
             theme_cfg: config::WidgetTheme::default(),
             theme: Theme::for_accent(Mode::Dark, config::Accent::default()),
             fonts: Fonts::new(),
             lyrics: LyricsRuntime::new(&config::Lyrics::default()),
+            lock_wants_art: false,
             worker: None,
             track_seq: None,
             lyrics_view: None,
@@ -2889,9 +2912,14 @@ impl WidgetEngine {
     fn sync_worker(&mut self) {
         let folder = self.lyrics_cfg.folder.clone();
         // `None` here is what stops the worker touching the network for a
-        // picture nobody asked for.
-        let art = self.disc_cfg.enabled.then_some(self.disc_cfg.size_px);
-        if self.lyrics_cfg.enabled || self.disc_cfg.enabled {
+        // picture nobody asked for. The lock screen's own vote (see
+        // `set_lock_album_art`) is OR'd in here rather than gating a second,
+        // independent fetch: one worker, one cover art per track, shared by
+        // whichever of the desktop disc and the lock screen's Album Art
+        // widget currently wants it.
+        let wants_art = self.disc_cfg.enabled || self.lock_wants_art;
+        let art = wants_art.then_some(self.disc_cfg.size_px);
+        if self.lyrics_cfg.enabled || wants_art {
             match &self.worker {
                 Some(worker) => {
                     worker.set_folder(folder);
@@ -2951,6 +2979,7 @@ impl WidgetEngine {
             connector: String::new(),
             w,
             h,
+            scale_milli: 1000,
         }]);
     }
 
@@ -3104,6 +3133,24 @@ impl WidgetEngine {
         self.sync_worker();
     }
 
+    /// Tell the engine whether the lock screen's Album Art widget wants cover
+    /// art fetched, independent of the desktop disc widget's own switch.
+    ///
+    /// `daemon::lock::engine` shares this engine's now-playing worker rather
+    /// than running a second one — a second thread shelling out to `gdbus`
+    /// against the same player would double the idle cost for nothing (see
+    /// `sync_worker`'s "one worker, one cover art" rule).
+    /// `false` — the default, and what a session with the lock screen off, or
+    /// its Album Art widget off, or not currently locked, always passes —
+    /// costs nothing beyond the one `bool` comparison in `sync_worker`.
+    pub fn set_lock_album_art(&mut self, wants: bool) {
+        if wants == self.lock_wants_art {
+            return;
+        }
+        self.lock_wants_art = wants;
+        self.sync_worker();
+    }
+
     /// Whether any widget is enabled. `false` means every other method is a
     /// no-op and the loop can skip its widget block entirely.
     pub fn is_active(&self) -> bool {
@@ -3200,14 +3247,45 @@ impl WidgetEngine {
     /// with it, so the next [`tick`](Self::tick) re-establishes the current line
     /// from the worker's snapshot rather than staying dark until the next song.
     pub fn clear_all(&mut self) -> Vec<WidgetUpdate> {
+        self.clear_selected(true, true, true, true)
+    }
+
+    /// Like [`clear_all`](Self::clear_all), but leaves the lyric and/or
+    /// visualiser overlays exactly as they are — for the lock screen's v1
+    /// rule (`docs/plan-lock-screen.md`; see `daemon::lock::engine`'s module
+    /// docs "Media" section) that a lyric or visualiser overlay already on
+    /// screen stays there through a lock rather than being taken down and
+    /// left dark. `clear_all` itself is unchanged and remains what every
+    /// non-lock call site (wallpaper swap, renderer teardown, output
+    /// respawn) uses; this is strictly additive.
+    pub fn clear_for_lock(
+        &mut self,
+        keep_lyrics: bool,
+        keep_visualizer: bool,
+    ) -> Vec<WidgetUpdate> {
+        self.clear_selected(!keep_lyrics, true, !keep_visualizer, true)
+    }
+
+    /// Shared body: blank whichever of the four overlays `clear_*` is asked
+    /// to, and reset only *that* widget's belief about what is on screen.
+    fn clear_selected(
+        &mut self,
+        clear_lyrics: bool,
+        clear_clock: bool,
+        clear_visual: bool,
+        clear_disc: bool,
+    ) -> Vec<WidgetUpdate> {
         let mut out = Vec::new();
         let live = [
-            (LYRICS_OVERLAY, self.lyrics_cfg.enabled),
-            (CLOCK_OVERLAY, self.clock_cfg.enabled),
-            (VISUALIZER_OVERLAY, self.visual_cfg.enabled),
-            (DISC_OVERLAY, self.disc_cfg.enabled),
+            (LYRICS_OVERLAY, self.lyrics_cfg.enabled, clear_lyrics),
+            (CLOCK_OVERLAY, self.clock_cfg.enabled, clear_clock),
+            (VISUALIZER_OVERLAY, self.visual_cfg.enabled, clear_visual),
+            (DISC_OVERLAY, self.disc_cfg.enabled, clear_disc),
         ];
-        for (id, enabled) in live {
+        for (id, enabled, clear) in live {
+            if !clear {
+                continue;
+            }
             let Some(slot) = overlay_slot(id) else {
                 continue;
             };
@@ -3223,27 +3301,36 @@ impl WidgetEngine {
             // nothing to read — an overlay we believe is already blank, which
             // is cleared anyway precisely because that belief may be wrong.
             out.push(WidgetUpdate::blank(id, on.unwrap_or(self.substrate(id))));
+            self.on_screen[slot] = None;
         }
-        if let Some(l) = &mut self.lyrics_view {
-            l.bmp.forget();
+        if clear_lyrics {
+            if let Some(l) = &mut self.lyrics_view {
+                l.bmp.forget();
+            }
+            // Back to "we have pushed nothing", not to "the overlay is
+            // empty": the next tick must re-adopt the track rather than
+            // assume it still holds.
+            self.lyrics.clear();
+            self.track_seq = None;
         }
-        self.clock_due = None;
-        if let Some(c) = &mut self.clock {
-            c.bmp.forget();
+        if clear_clock {
+            self.clock_due = None;
+            if let Some(c) = &mut self.clock {
+                c.bmp.forget();
+            }
         }
-        if let Some(v) = &mut self.visual {
-            v.bmp.forget();
-            v.shown = false;
+        if clear_visual {
+            if let Some(v) = &mut self.visual {
+                v.bmp.forget();
+                v.shown = false;
+            }
         }
-        if let Some(d) = &mut self.disc {
-            d.bmp.forget();
+        if clear_disc {
+            if let Some(d) = &mut self.disc {
+                d.bmp.forget();
+            }
         }
-        // Back to "we have pushed nothing", not to "the overlay is empty": the
-        // next tick must re-adopt the track rather than assume it still holds.
-        self.lyrics.clear();
-        self.track_seq = None;
         self.repush = false;
-        self.on_screen = [None; OVERLAY_SLOTS];
         out
     }
 
@@ -3939,7 +4026,11 @@ fn min_instant(a: Option<Instant>, b: Instant) -> Option<Instant> {
 /// behind the card. The dark palette is the one every alpha in the spec was
 /// fitted for, against a white worst-case backdrop, and it is also the cheaper
 /// of the two (52 lu of shadow bleed against 84).
-fn widget_mode(theme: config::WidgetTheme) -> Mode {
+/// `pub(super)`: the lock engine's widget theme must be derived by the exact
+/// same rule as the desktop's (`daemon::lock::engine`/`daemon::mod`'s
+/// `LockRuntime`), so the two can never pick different palettes for the same
+/// config.
+pub(super) fn widget_mode(theme: config::WidgetTheme) -> Mode {
     match theme {
         config::WidgetTheme::Auto | config::WidgetTheme::Dark => Mode::Dark,
         config::WidgetTheme::Light => Mode::Light,
@@ -4530,6 +4621,47 @@ mod tests {
             engine.clear_all(),
             vec![WidgetUpdate::remove(CLOCK_OVERLAY)]
         );
+    }
+
+    #[test]
+    fn clear_for_lock_leaves_a_kept_overlay_exactly_as_it_was() {
+        // Lyrics + clock both on screen; the lock screen keeps lyrics but not
+        // the clock (its own clock widget takes over that job).
+        let mut engine = WidgetEngine::new(Some(&widgets(true)), ACCENT);
+        engine.set_clock(Some(&clock_cfg()));
+        let t0 = Instant::now();
+        let snap = snapshot_at(t0, Some(fixture()), us(10.0), PlaybackStatus::Playing, 1);
+        let wall = Some(at(14, 32, 30));
+        let up = engine.tick_at(Some(&snap), t0, wall);
+        assert_eq!(ids(&up), vec![LYRICS_OVERLAY, CLOCK_OVERLAY]);
+
+        let cleared = engine.clear_for_lock(true, false);
+        // Only the clock comes down; lyrics is untouched — no update at all
+        // for it, not even a re-send of what's already there.
+        assert_eq!(ids(&cleared), vec![CLOCK_OVERLAY]);
+        assert!(cleared.iter().all(WidgetUpdate::is_clear));
+
+        // A tick right after is expected to bring the *clock* back — it was
+        // genuinely cleared, so the engine correctly believes it needs
+        // redrawing, same as a wallpaper-swap `clear_all` followed by a tick.
+        // Lyrics must NOT be part of that: its belief was never disturbed, so
+        // an unchanged line produces no update for it at all.
+        let after = engine.tick_at(Some(&snap), t0, wall);
+        assert_eq!(
+            ids(&after),
+            vec![CLOCK_OVERLAY],
+            "only the cleared overlay redraws"
+        );
+    }
+
+    #[test]
+    fn clear_for_lock_with_both_kept_clears_nothing() {
+        let mut engine = WidgetEngine::new(Some(&widgets(true)), ACCENT);
+        let t0 = Instant::now();
+        let snap = snapshot_at(t0, Some(fixture()), us(10.0), PlaybackStatus::Playing, 1);
+        let wall = Some(at(14, 32, 30));
+        engine.tick_at(Some(&snap), t0, wall);
+        assert!(engine.clear_for_lock(true, true).is_empty());
     }
 
     #[test]
@@ -5837,11 +5969,13 @@ mod tests {
             connector: "DP-1".into(),
             w: 3840,
             h: 2160,
+            scale_milli: 1000,
         };
         let hd = OutputGeom {
             connector: "HDMI-1".into(),
             w: 1280,
             h: 720,
+            scale_milli: 1000,
         };
         let mut engine = WidgetEngine::new(None, ACCENT);
         with_disc(&mut engine, disc_cfg(), "twoup");
@@ -5917,11 +6051,13 @@ mod tests {
                 connector: "DP-1".into(),
                 w: 3840,
                 h: 2160,
+                scale_milli: 1000,
             },
             OutputGeom {
                 connector: "HDMI-1".into(),
                 w: 1280,
                 h: 720,
+                scale_milli: 1000,
             },
         ];
         let mut out = Vec::new();
@@ -6012,6 +6148,7 @@ mod tests {
             connector: String::new(),
             w: 1920,
             h: 1080,
+            scale_milli: 1000,
         }];
         let retry = Duration::from_secs(2);
         let mut renders = 0u32;
@@ -6071,6 +6208,7 @@ mod tests {
             connector: c.into(),
             w,
             h,
+            scale_milli: 1000,
         };
         st.sync(&[geom("A", 1920, 1080), geom("B", 3840, 2160)]);
         let b_path = st.slots[1].path.clone();
@@ -6101,6 +6239,7 @@ mod tests {
             connector: String::new(),
             w: 3840,
             h: 2160,
+            scale_milli: 1000,
         }];
         let mut out = Vec::new();
         let drawn = st.push(

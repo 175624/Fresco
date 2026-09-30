@@ -134,9 +134,7 @@ this document:
 
 **Consequence, and it is the single biggest decision in this plan:** every theme below is
 tagged either *stock font* (ships today, zero risk) or *needs bundling*. Bundled fonts go into
-`/app/share/fonts` via a new module in `flatpak/io.github.dibbayajyotiroy.Fresco.yaml` (the
-sandbox already bundles its own mpvpaper, so libass inside the sandbox will see them), and
-into `/usr/share/fonts/fresco/` from the `packaging/debian` and `packaging/aur` recipes.
+`/usr/share/fonts/fresco/` from the `packaging/debian` and `packaging/aur` recipes.
 Fresco should also run `fc-list "<family>" family` at theme-apply time and, if empty, show a
 "this theme's font is not installed — it will look wrong" note in the picker rather than
 silently rendering Noto Sans. **Only SIL OFL / Apache-2.0 / MIT / public-domain families
@@ -623,7 +621,7 @@ That is **seven controls total**, down from eighteen-plus.
 **Live preview.** The theme cards should not be shipped screenshots. Render each card by
 pushing the theme's ASS to a hidden mpv instance over a still frame of the user's *current
 wallpaper* — Fresco already spawns and controls mpv, already has the thumbnailer
-(`ffmpegthumbnailer` is in the Flatpak manifest), and already fades thumbnails in on first map
+(`ffmpegthumbnailer` is already a dependency), and already fades thumbnails in on first map
 in `library_card`. Failing that, a static PNG per theme rendered at build time is an
 acceptable v1; a wrong-looking preview is worse than a generic one.
 
@@ -713,8 +711,7 @@ Each is gated on bundling a font (Michroma / DSEG / — / Press Start 2P / Anton
 Cathode, on the `\iclip` mask primitive. All are genuinely good; none is worth doing before
 the five items above.
 
-**Do the font bundling as one change, not five.** A single `fonts` module in the Flatpak
-manifest and one `/usr/share/fonts/fresco/` directory in the deb and AUR recipes, carrying
+**Do the font bundling as one change, not five.** One `/usr/share/fonts/fresco/` directory in the deb and AUR recipes, carrying
 Orbitron + VT323 + DSEG + Press Start 2P + Michroma + Anton, is one packaging review across
 three targets. Doing it per-theme means paying that review five times. Total weight is under
 2 MB and all six are SIL OFL.

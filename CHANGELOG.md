@@ -17,6 +17,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so Fresco turns up when you search for 动态壁纸 (issue #33).
 - **The day/night section shows the next switch time** and highlights
   invalid times (issue #32).
+- **Fresco can now show your wallpaper and widgets on the real lock screen**
+  (opt-in, off by default; see [docs/LOCKSCREEN.md](docs/LOCKSCREEN.md)).
+  COSMIC 1.9+ and KDE Plasma 6 get live video and the full widget layer;
+  Sway, Hyprland, niri, river, labwc and Wayfire get it through the new
+  `fresco lock` command wrapping swaylock-plugin, and X11 window managers
+  through xsecurelock. MATE and Xfce can pick Fresco as their screensaver
+  theme for the same wallpaper, but that pairing is still experimental — the
+  widget layer doesn't reach every `mate-screensaver` version. GNOME,
+  Cinnamon and Deepin show a still frame only, since none of them expose a
+  way to draw widgets onto their lock screens yet.
+- **A new `fresco lock` command locks your session through your desktop's
+  own locker.** It's what the lock-screen feature above binds to a key or an
+  idle daemon on Sway, Hyprland, and X11, but it works standalone too, and
+  it always ends in a locked session — falling back through
+  `swaylock`/`hyprlock`/`gtklock` or `xsecurelock`/`i3lock`, and finally
+  `loginctl lock-session`, if Fresco's own daemon or host adapter can't lock
+  it directly.
 
 ### Changed
 - **The main menu is split into pages** (Appearance, Language, Behavior,
@@ -29,6 +46,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   service is running; when it is down, a notice with a Start button appears
   in the Day/Night section and in the main window. Stopping the wallpaper
   while a schedule is active now says the schedule is paused.
+- **COSMIC's own lock screen now shows a still frame of your Fresco
+  wallpaper instead of the stock image.** This applies whether or not the
+  new lock-screen feature above is turned on: Fresco keeps `cosmic-bg`'s
+  configuration pointed at a still frame of your current wallpaper, the same
+  way it already does for GNOME and Cinnamon, and restores your original
+  background when Fresco stops.
+
+### Removed
+- **Flatpak packaging is gone.** The Flatpak manifest and Flathub submission
+  notes are removed from the repo; Fresco ships as a `.deb`, through the AUR,
+  `install.sh` and the Spark Store. Existing Flatpak installs keep running.
 
 ### Fixed
 - **Picking a slideshow transition (Ken Burns, Zoom, …) in the editor no
@@ -44,6 +72,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no longer starts ffmpeg for every image.
 - **A wallpaper removed from the library no longer silently replaces your
   saved day/night pick** (issue #32).
+- **"Pause on battery" no longer pauses desktops that have a wireless mouse
+  or keyboard reporting its own battery.** The check read any power supply
+  reporting "Discharging" as the machine running on battery, which included
+  Bluetooth/USB peripherals exposing the same sysfs files a laptop battery
+  does. The daemon now ignores peripheral batteries and only looks at the
+  system's own.
 
 ## [1.1.45] — 2026-09-28
 

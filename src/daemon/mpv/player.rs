@@ -23,6 +23,35 @@ impl Player {
         scaling: Scaling,
         power_saving: PowerSaving,
     ) -> Result<Player> {
+        Self::new_with_extra_options(wid, wallpaper, scaling, power_saving, &[])
+    }
+
+    /// Like [`Player::new`], but applies `extra_options` as additional
+    /// `mpv_set_option_string` calls right before `mpv_initialize` — the only
+    /// hook this embeds-into-a-given-X-window path needs beyond `new` itself,
+    /// since `wid` alone already lets any caller embed into a window it did
+    /// not create.
+    ///
+    /// The one user today is `daemon::saver` (the X11 lock-screen saver,
+    /// `frescod --saver`): it runs as its own OS process, separate from
+    /// `frescod`, so the main daemon can only reach its wallpaper over mpv's
+    /// JSON IPC — `input-ipc-server=<path>` — the same way it already drives
+    /// an external `mpvpaper` child's socket (`daemon::mpvpaper::MpvIpc`).
+    /// That option only takes effect if set before `mpv_initialize`, exactly
+    /// like every option in this function's own list below, so it cannot be
+    /// added after the fact through a method on an already-constructed
+    /// `Player` — there would be nothing left to call it on in time.
+    ///
+    /// Applied *after* the defaults below, so a future caller could in
+    /// principle override one of them; today's only caller (`input-ipc-server`)
+    /// never collides with anything already set.
+    pub fn new_with_extra_options(
+        wid: u32,
+        wallpaper: &Wallpaper,
+        scaling: Scaling,
+        power_saving: PowerSaving,
+        extra_options: &[(&str, &str)],
+    ) -> Result<Player> {
         let f = fns()?;
         let handle = f.create();
         if handle.is_null() {
@@ -114,6 +143,10 @@ impl Player {
 
             // Fit mode.
             apply_fit_options(f, handle, wallpaper.fit);
+
+            for (k, v) in extra_options {
+                f.set_option(handle, k, v);
+            }
 
             if f.initialize(handle) < 0 {
                 f.terminate_destroy(handle);

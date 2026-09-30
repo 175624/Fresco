@@ -17,6 +17,7 @@ Parent roadmap: [ROADMAP.md](ROADMAP.md) §6.5 (this document is the detail).
 | W3 | Audio visualiser | 🟡 `dsp` + `audio_capture` + `visualizer` complete and tested; no daemon wiring |
 | W4 | Album-art disc + clock | Clock ✅ shipped · disc 🟡 (`artwork`) |
 | W5 | Themes & styling | Partial — per-widget presets and accent-follow shipped; no shared theme layer |
+| L1 | Lock screen (own wallpaper + widgets while locked) | ⬜ in progress — planned 2026-09-28, no code yet ([ROADMAP.md](ROADMAP.md) §6.6) |
 
 ## What we're building
 
@@ -184,7 +185,7 @@ from it, because the differences are the load-bearing part.
 **Scope:** current lyric line (+ optional next), title/artist, 3–4 style presets, 9-point position grid, accent-follow, one monitor by default.
 
 **Now-playing source — settled by research:**
-- MPRIS over `gdbus`, matching the existing `dde.rs` shell-out. `gdbus` is the **only** D-Bus CLI present in both the `org.freedesktop.Platform` and `org.gnome.Platform` Flatpak runtimes (`busctl`/`dbus-monitor` are absent), so this is also the Flathub-safe choice. Measured: 3.1ms CPU per call; a parked `gdbus monitor` costs **0 CPU ticks over 10s** at 6MB RSS. zbus would add 66 crates plus an async runtime to a deliberately synchronous codebase — rejected.
+- MPRIS over `gdbus`, matching the existing `dde.rs` shell-out. `gdbus` is the **only** D-Bus CLI present in both the `org.freedesktop.Platform` and `org.gnome.Platform` Flatpak runtimes (`busctl`/`dbus-monitor` are absent); Flatpak packaging has since been dropped. Measured: 3.1ms CPU per call; a parked `gdbus monitor` costs **0 CPU ticks over 10s** at 6MB RSS. zbus would add 66 crates plus an async runtime to a deliberately synchronous codebase — rejected.
 - **Sync design:** long-lived `gdbus monitor` subprocesses for `PropertiesChanged`/`Seeked`/`NameOwnerChanged` (event plane, zero idle CPU) + a monotonic `Instant` anchor advanced on a 100ms local tick + a 1s `Position` resync while playing. Slew errors under ~300ms, hard-snap beyond — snapping every second reads worse than being 150ms off. **Never poll while paused.** Key track identity on `mpris:trackid`, not title (repeat-one won't retrigger otherwise).
 - **Player choice ladder:** actively `Playing` → single `Paused` → most recently active, with a user-overridable priority list. Selection must be sticky so a background browser tab can't steal the overlay mid-song.
 
@@ -306,6 +307,19 @@ One styling layer across every widget: font, size, colour, opacity, position, ac
 - Ship a small set of opinionated presets ("Minimal", "Karaoke", "Vibes", "Corner card") rather than exposing every knob — presets are what make this feel designed rather than configurable.
 - Accent-follow reuses `theme.rs::accent_pair` (currently private — needs a `pub` accessor or a `pub fn accent_hex`).
 - **Constraint:** `theme.rs` colours are `#RRGGBB`, but **`#` cannot be passed through mpvpaper's `-o` options** — mpvpaper forwards them through an mpv config file where `#` starts a comment (`mpvpaper.rs:325`). Widget colours must go over IPC at runtime, or be pre-converted to ASS `&HBBGGRR&`.
+
+---
+
+## L1 — Lock screen (own wallpaper + widgets while locked) · ⬜ in progress
+
+Not a W-numbered phase — its roadmap home is
+[ROADMAP.md](ROADMAP.md) §6.6, not this doc's §6.5 — but listed here because
+it leans on this doc's machinery: the lock scene reuses the `clock`,
+`nowplaying` and `disc` cards as-is and adds two new ones (`greeting`,
+`battery`). Like the disc, it ships on the `overlay-add` bitmap substrate
+(see the 2026-07-29 correction above) rather than waiting on W2's still-unbuilt
+widget surface. Status as of 2026-09-28: planned and decided, no code written
+yet. Full plan, per-host detail and acceptance criteria live in ROADMAP §6.6.
 
 ---
 
@@ -448,17 +462,10 @@ Only once that works should an online source be added, opt-in, behind the same c
    network lookup has **no consent step and no separate toggle** — enabling the
    lyrics widget enables it, which does not meet the opt-in-with-consent
    standard telemetry sets, and the doc comment on `config::Lyrics` still claims
-   "no network, no API"; (c) the Flathub implications were never worked through.
-3. **Flatpak permission — unchanged and now actually blocking.**
-   `flatpak/io.github.dibbayajyotiroy.Fresco.yaml` carries **no** MPRIS
-   `--talk-name`, so lyrics cannot see any player in the Flatpak build today.
-   `--talk-name=org.mpris.MediaPlayer2.*` is shipped by a synced-lyrics app on
-   the current runtime, so there is precedent. Do **not** use
-   `--socket=session-bus` — the docs call it a security risk and it would draw a
-   Flathub review objection. Also unverified: the shipped implementation
-   discovers players with `ListNames` on `org.freedesktop.DBus`, and whether the
-   Flatpak D-Bus proxy returns the MPRIS names through it once the talk-name is
-   granted has not been tested.
+   "no network, no API"; (c) the Flathub implications were never worked through (moot: Flatpak packaging was dropped).
+3. **Flatpak permission — moot.** Flatpak packaging was dropped, so the missing
+   MPRIS `--talk-name` no longer blocks anything; old Flatpak builds simply
+   cannot see players.
 
 **Opened by the work**
 

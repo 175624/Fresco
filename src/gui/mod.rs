@@ -4,6 +4,7 @@ mod gallery;
 mod hover_preview;
 mod import_queue;
 mod library;
+mod lockscreen;
 mod preview;
 mod status;
 mod theme;

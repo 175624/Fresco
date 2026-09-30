@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- AppStream metadata required by Flathub. Validate with:
+<!-- AppStream metadata. Validate with:
      appstreamcli validate data/io.github.dibbayajyotiroy.Fresco.metainfo.xml -->
 <component type="desktop-application">
   <id>io.github.dibbayajyotiroy.Fresco</id>

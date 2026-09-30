@@ -1320,6 +1320,231 @@ impl Default for Disc {
     }
 }
 
+/// `[lockscreen]` — Fresco's own widgets drawn on the OS lock screen, in place
+/// of the distro's default lock-screen clock and status area. Absent from
+/// `config.toml` until the user turns it on, the same shape as
+/// [`Config::schedule`] and [`Config::widgets`]: a config written before this
+/// feature existed keeps parsing untouched, and nobody who never asks for it
+/// ever sees the key.
+///
+/// # Fresco draws; it never authenticates
+///
+/// This block reaches a **renderer only**. Unlocking the session — the
+/// password prompt, PAM, the decision that the session is actually unlocked —
+/// stays exactly where it already lives: `swaylock-plugin` on wlroots/COSMIC,
+/// `xsecurelock` or the desktop's own screensaver on X11, `kscreenlocker` on
+/// KDE. Those lockers already support handing their background to another
+/// process; this struct configures Fresco's side of that arrangement — the
+/// wallpaper and the widgets laid over it — and nothing declared here, or in
+/// [`crate::lockscreen`], ever sees a password or talks to PAM.
+///
+/// # A second, smaller widget list
+///
+/// [`LockScreen::widgets`] is its own set, not a reuse of [`Config::widgets`]:
+/// a lock screen is semi-public — anyone standing at the machine sees it, not
+/// only its owner — so its defaults lean more private (no lyrics or avatar
+/// unless asked) and its vocabulary is deliberately smaller. See
+/// [`crate::lockscreen::LockWidget`] for what is left out, and why.
+///
+/// # What actually resolves this
+///
+/// This struct is only the on-disk shape and enforces nothing by itself — a
+/// hand-edited `dim = 5.0` parses fine. Clamping, the clock theme a preset
+/// implies when [`LockScreen::clock_theme`] is unset, and what the greeting
+/// resolves to are decided by [`crate::lockscreen::resolve`], which both the
+/// GUI (to preview a preset) and the daemon (to actually draw the lock screen)
+/// call against this value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LockScreen {
+    /// Master switch. **False by default**, for the same reason every other
+    /// overlay in this file is: taking over the system lock screen is not
+    /// something Fresco does uninvited.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Which overall look to draw. See [`LockPreset`].
+    #[serde(default)]
+    pub preset: LockPreset,
+    /// Whether the wallpaper plays as live video behind the lock screen, or
+    /// falls back to a still frame; see [`LiveVideo`].
+    #[serde(default)]
+    pub live_video: LiveVideo,
+    /// How much to darken the wallpaper under the lock widgets: `0.0`
+    /// (untouched) to `1.0` (black). Clamped to `0.0..=0.8` on resolve — past
+    /// that point the wallpaper underneath is not doing anything a plain black
+    /// background would not, which defeats the point of a wallpaper lock
+    /// screen. See [`crate::lockscreen::resolve`].
+    #[serde(default = "default_lock_dim")]
+    pub dim: f32,
+    /// Gaussian blur over a still frame: `0.0` (sharp) to `1.0` (softest).
+    /// Clamped to that range on resolve.
+    ///
+    /// **Still-frame hosts only.** A live-video wallpaper would need every
+    /// decoded frame pushed back through a blur filter for as long as the
+    /// screen stays locked, which is exactly the per-frame render cost
+    /// [`PowerSaving`] exists to avoid elsewhere in this file; a still frame is
+    /// blurred once, when the lock screen appears, and costs nothing after.
+    #[serde(default)]
+    pub blur: f32,
+    /// Override the preset's own clock look. `None` — the default — takes
+    /// whichever [`crate::clock::ClockTheme`] the preset was designed around,
+    /// so picking a preset is one decision instead of two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_theme: Option<crate::clock::ClockTheme>,
+    /// Override the greeting line. `None` — the default — resolves to "Good
+    /// morning, `<first name>`" (time of day plus whatever the host's
+    /// user-info provider knows); `Some(String::new())` removes the line
+    /// entirely, for someone who wants the other widgets but not a message
+    /// addressed to them by name. Any other string is shown verbatim, with no
+    /// time-of-day or name substitution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub greeting: Option<String>,
+    /// Which of Fresco's own widgets are drawn on the lock screen. See
+    /// [`LockWidgets`].
+    #[serde(default)]
+    pub widgets: LockWidgets,
+}
+
+fn default_lock_dim() -> f32 {
+    0.2
+}
+
+impl Default for LockScreen {
+    fn default() -> Self {
+        LockScreen {
+            enabled: false,
+            preset: LockPreset::default(),
+            live_video: LiveVideo::default(),
+            dim: default_lock_dim(),
+            blur: 0.0,
+            clock_theme: None,
+            greeting: None,
+            widgets: LockWidgets::default(),
+        }
+    }
+}
+
+/// The overall look of the lock screen. Each preset fixes a clock theme and a
+/// widget arrangement together, on the same bargain [`LyricStylePreset`] and
+/// [`ClockThemeCfg`] already make: a person picks a *feeling*, not a pile of
+/// layout knobs that mostly combine into something ugly.
+///
+/// TOML spellings are the variant names lowercased: `"classic"`, `"minimal"`,
+/// `"glass"`, `"bigtype"`, `"terminal"`. The daemon maps each variant onto
+/// `widgetkit::lockscene::LockArrangement` 1:1 — picking a preset is a
+/// complete answer, never a partial one the daemon has to interpret further.
+/// See `crate::lockscreen::LockPreset::default_clock_theme` for the clock look
+/// each one implies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LockPreset {
+    /// The default: the date above a large, centred time, no card — the way a
+    /// phone or laptop lock screen has always looked.
+    #[default]
+    Classic,
+    /// Time only, small and out of the way.
+    Minimal,
+    /// A translucent card carrying the clock and the rest of the widgets.
+    Glass,
+    /// One oversized time that dominates the screen.
+    BigType,
+    /// Dot-matrix digits, monochrome and sparse.
+    Terminal,
+}
+
+/// Whether the wallpaper plays as live video behind the lock screen, or falls
+/// back to a still frame; see `crate::lockscreen::LiveVideo::plays`.
+///
+/// TOML spellings are the variant names lowercased: `"ac"`, `"always"`,
+/// `"never"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveVideo {
+    /// Play while on mains power; fall back to a still frame plus the widgets
+    /// on battery. **The default**, and deliberately conservative: a locked
+    /// screen still decodes and composites a full frame for as long as it
+    /// stays on screen, which on a laptop can be hours, and a still frame with
+    /// widgets that repaint at 1 Hz costs close to nothing next to that.
+    #[default]
+    Ac,
+    /// Always play, on battery or not.
+    Always,
+    /// Never play; always show a still frame, even on mains power.
+    Never,
+}
+
+/// Which of Fresco's own widgets are drawn on the lock screen — a separate
+/// list from the desktop overlay's [`Widgets`], because a lock screen is seen
+/// by anyone standing at the machine and its defaults are chosen accordingly.
+/// See [`crate::lockscreen::LockWidget`] for the resolved, ordered form of
+/// this list, and for the widget kinds deliberately left out entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockWidgets {
+    /// The time. On by default — it is most of what a lock screen is for.
+    #[serde(default = "default_true")]
+    pub clock: bool,
+    /// The date. On by default, and free: it changes once a day.
+    #[serde(default = "default_true")]
+    pub date: bool,
+    /// "Good morning, `<first name>`" (or [`LockScreen::greeting`]'s
+    /// override). On by default; it reveals a first name to whoever is
+    /// standing at the machine, which is no more than most phone and desktop
+    /// lock screens already show.
+    #[serde(default = "default_true")]
+    pub greeting: bool,
+    /// The user's profile picture. **Off by default** — a photo identifies
+    /// someone more directly than a first name does, and unlike the greeting
+    /// it has no "leave it blank" middle ground, so the safer default is to
+    /// ask first.
+    #[serde(default)]
+    pub avatar: bool,
+    /// The playing track's title, artist and transport state. On by default:
+    /// "what is this machine doing right now" is information lock screens
+    /// have shown across every desktop for years.
+    #[serde(default = "default_true")]
+    pub now_playing: bool,
+    /// The playing track's cover art. On by default, alongside
+    /// [`LockWidgets::now_playing`] — a title with no cover beside it reads as
+    /// unfinished rather than as a choice.
+    #[serde(default = "default_true")]
+    pub album_art: bool,
+    /// Battery level and charge state. On by default. This flag only says the
+    /// user wants it: [`crate::lockscreen::resolve`] takes no host state, so a
+    /// machine with no battery still has this widget filtered out by the host
+    /// at draw time, not here.
+    #[serde(default = "default_true")]
+    pub battery: bool,
+    /// Synced lyrics for the playing track. **Off by default, and a privacy
+    /// default, not a taste one**: the desktop's own [`Lyrics`] overlay is
+    /// already opt-in for the same reason, but a lock screen is more exposed —
+    /// visible to anyone walking past a machine its owner cannot see — so
+    /// lyrics must never appear there merely because they are already on for
+    /// the desktop.
+    #[serde(default)]
+    pub lyrics: bool,
+    /// An audio-spectrum visualiser. **Off by default**, matching
+    /// [`Visualizer::enabled`] — see its type docs for why: it opens a capture
+    /// stream on the machine's audio output, and that is never turned on
+    /// without the user asking, on the lock screen or off it.
+    #[serde(default)]
+    pub visualizer: bool,
+}
+
+impl Default for LockWidgets {
+    fn default() -> Self {
+        LockWidgets {
+            clock: true,
+            date: true,
+            greeting: true,
+            avatar: false,
+            now_playing: true,
+            album_art: true,
+            battery: true,
+            lyrics: false,
+            visualizer: false,
+        }
+    }
+}
+
 fn default_volume() -> u8 {
     50
 }
@@ -1578,6 +1803,13 @@ pub struct Config {
     /// feature existed says, so they all keep their current behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub widgets: Option<Widgets>,
+    /// Optional lock-screen takeover: Fresco's own widgets drawn on the OS
+    /// lock screen instead of the distro's defaults; see [`LockScreen`].
+    /// Absent = the system lock screen is untouched, which is what every
+    /// config written before this feature existed says, so they all keep
+    /// their current behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockscreen: Option<LockScreen>,
 }
 
 fn default_version() -> u32 {
@@ -1659,6 +1891,7 @@ impl Default for Config {
             schedule: None,
             schedule_paused: false,
             widgets: None,
+            lockscreen: None,
         }
     }
 }
@@ -1702,12 +1935,21 @@ impl Config {
     /// It clears `enabled` rather than remembering it: a stored "on, but not
     /// really" is a state the GUI would then have to render, and the switch is
     /// one click.
+    ///
+    /// Covers [`LockWidgets::visualizer`] as well as [`Visualizer::enabled`]:
+    /// the lock screen opened a second place a visualiser flag can be set, but
+    /// it did not open a second capture stream or a second consent — it is the
+    /// same audio-output capture either way, so it is gated by exactly the same
+    /// flag.
     fn enforce_audio_consent(&mut self) {
         if self.audio_capture_consented {
             return;
         }
         if let Some(w) = self.widgets.as_mut() {
             w.visualizer.enabled = false;
+        }
+        if let Some(l) = self.lockscreen.as_mut() {
+            l.widgets.visualizer = false;
         }
     }
 
@@ -1754,6 +1996,7 @@ impl Config {
         }
         // `widgets` needs nothing here: it has never shipped under another
         // name, so no released config can contain a deprecated spelling of it.
+        // `lockscreen` needs nothing here either, for the same reason.
     }
 
     pub fn save(&self) -> Result<()> {
@@ -2969,6 +3212,289 @@ opacity = 200
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         assert!(text.contains("[widgets"), "got:\n{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), cfg);
+    }
+
+    // -- lockscreen ----------------------------------------------------------
+
+    #[test]
+    fn lockscreen_absent_unless_configured() {
+        // Every config.toml written before the lock screen existed must keep
+        // working and must not acquire a lock-screen takeover by accident.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.lockscreen, None);
+
+        let legacy: Config = toml::from_str(
+            "version = 1\nenabled = true\n\n[wallpaper]\nkind = \"video\"\npath = \"/a.mp4\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.lockscreen, None);
+    }
+
+    #[test]
+    fn empty_lockscreen_table_uses_every_default() {
+        // Naming the block never by itself takes over the system lock screen,
+        // and every field the table leaves out takes its pinned default.
+        let cfg: Config = toml::from_str("[lockscreen]\n").unwrap();
+        let l = cfg.lockscreen.expect("[lockscreen] table must deserialize");
+        assert_eq!(l, LockScreen::default());
+        assert!(!l.enabled, "lockscreen must default to OFF");
+        assert_eq!(l.preset, LockPreset::Classic);
+        assert_eq!(l.live_video, LiveVideo::Ac);
+        assert_eq!(l.dim, 0.2);
+        assert_eq!(l.blur, 0.0);
+        assert_eq!(l.clock_theme, None, "None = the preset's own theme");
+        assert_eq!(l.greeting, None, "None = the generated greeting");
+        assert_eq!(l.widgets, LockWidgets::default());
+    }
+
+    #[test]
+    fn lockscreen_widget_defaults_match_the_privacy_contract() {
+        // Pinned by value, not merely "whatever Default says": these defaults
+        // are the product's privacy contract (lyrics and the avatar are opt-in
+        // because a lock screen is semi-public) as much as they are a look.
+        let w = LockWidgets::default();
+        assert!(w.clock);
+        assert!(w.date);
+        assert!(w.greeting);
+        assert!(!w.avatar, "a photo is more identifying than a first name");
+        assert!(w.now_playing);
+        assert!(w.album_art);
+        assert!(w.battery);
+        assert!(!w.lyrics, "never on unless the user turns it on");
+        assert!(!w.visualizer, "never on without the audio-capture consent");
+    }
+
+    #[test]
+    fn fully_populated_lockscreen_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+[lockscreen]
+enabled = true
+preset = "glass"
+live_video = "never"
+dim = 0.5
+blur = 0.3
+clock_theme = "card"
+greeting = "Welcome back"
+
+[lockscreen.widgets]
+clock = true
+date = false
+greeting = false
+avatar = true
+now_playing = false
+album_art = false
+battery = false
+lyrics = true
+visualizer = true
+"#,
+        )
+        .unwrap();
+        let l = cfg.lockscreen.unwrap();
+        assert!(l.enabled);
+        assert_eq!(l.preset, LockPreset::Glass);
+        assert_eq!(l.live_video, LiveVideo::Never);
+        assert_eq!(l.dim, 0.5);
+        assert_eq!(l.blur, 0.3);
+        assert_eq!(l.clock_theme, Some(crate::clock::ClockTheme::Card));
+        assert_eq!(l.greeting.as_deref(), Some("Welcome back"));
+        assert_eq!(
+            l.widgets,
+            LockWidgets {
+                clock: true,
+                date: false,
+                greeting: false,
+                avatar: true,
+                now_playing: false,
+                album_art: false,
+                battery: false,
+                lyrics: true,
+                visualizer: true,
+            }
+        );
+    }
+
+    #[test]
+    fn lockscreen_roundtrip_through_toml() {
+        // Every field set away from its default, so a dropped #[serde]
+        // attribute shows up as a mismatch rather than as a coincidence.
+        let l = LockScreen {
+            enabled: true,
+            preset: LockPreset::Terminal,
+            live_video: LiveVideo::Always,
+            dim: 0.65,
+            blur: 0.9,
+            clock_theme: Some(crate::clock::ClockTheme::Lock),
+            greeting: Some(String::new()),
+            widgets: LockWidgets {
+                clock: false,
+                date: true,
+                greeting: false,
+                avatar: true,
+                now_playing: true,
+                album_art: false,
+                battery: true,
+                lyrics: true,
+                visualizer: false,
+            },
+        };
+        let cfg = Config {
+            lockscreen: Some(l.clone()),
+            ..Config::default()
+        };
+        let s = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(
+            back, cfg,
+            "every lockscreen field must survive a round trip"
+        );
+        assert_eq!(back.lockscreen.unwrap(), l);
+    }
+
+    #[test]
+    fn lockscreen_greeting_distinguishes_absent_from_empty() {
+        // `None` (the generated greeting) and `Some("")` (no text at all) are
+        // different settings and must not collapse into each other.
+        let absent: Config = toml::from_str("[lockscreen]\n").unwrap();
+        assert_eq!(absent.lockscreen.unwrap().greeting, None);
+
+        let empty: Config = toml::from_str("[lockscreen]\ngreeting = \"\"\n").unwrap();
+        assert_eq!(empty.lockscreen.unwrap().greeting.as_deref(), Some(""));
+
+        let cfg = Config {
+            lockscreen: Some(LockScreen {
+                greeting: Some(String::new()),
+                ..LockScreen::default()
+            }),
+            ..Config::default()
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(
+            text.contains("greeting = \"\""),
+            "an explicit empty greeting must still be written, got:\n{text}"
+        );
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.lockscreen.unwrap().greeting.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn lockscreen_preset_spellings_are_stable() {
+        // These strings are the config file's public surface; renaming a
+        // variant must not silently invalidate everyone's config.toml.
+        for (text, want) in [
+            ("classic", LockPreset::Classic),
+            ("minimal", LockPreset::Minimal),
+            ("glass", LockPreset::Glass),
+            ("bigtype", LockPreset::BigType),
+            ("terminal", LockPreset::Terminal),
+        ] {
+            let cfg: Config =
+                toml::from_str(&format!("[lockscreen]\npreset = \"{text}\"")).unwrap();
+            assert_eq!(cfg.lockscreen.unwrap().preset, want, "preset {text}");
+            let l = LockScreen {
+                preset: want,
+                ..LockScreen::default()
+            };
+            assert!(
+                toml::to_string(&l)
+                    .unwrap()
+                    .contains(&format!("preset = \"{text}\"")),
+                "preset {text} must serialize back the same"
+            );
+        }
+    }
+
+    #[test]
+    fn lockscreen_live_video_spellings_are_stable() {
+        for (text, want) in [
+            ("ac", LiveVideo::Ac),
+            ("always", LiveVideo::Always),
+            ("never", LiveVideo::Never),
+        ] {
+            let cfg: Config =
+                toml::from_str(&format!("[lockscreen]\nlive_video = \"{text}\"")).unwrap();
+            assert_eq!(
+                cfg.lockscreen.unwrap().live_video,
+                want,
+                "live_video {text}"
+            );
+            let l = LockScreen {
+                live_video: want,
+                ..LockScreen::default()
+            };
+            assert!(
+                toml::to_string(&l)
+                    .unwrap()
+                    .contains(&format!("live_video = \"{text}\"")),
+                "live_video {text} must serialize back the same"
+            );
+        }
+    }
+
+    #[test]
+    fn lockscreen_clock_theme_shares_the_desktop_clocks_spellings() {
+        // `LockScreen::clock_theme` embeds `crate::clock::ClockTheme` directly
+        // rather than a second config-file mirror, so its TOML spelling must be
+        // exactly `ClockTheme`'s own — "lockscreen" for `ClockTheme::Lock`
+        // included.
+        let cfg: Config = toml::from_str("[lockscreen]\nclock_theme = \"lockscreen\"\n").unwrap();
+        assert_eq!(
+            cfg.lockscreen.unwrap().clock_theme,
+            Some(crate::clock::ClockTheme::Lock)
+        );
+    }
+
+    #[test]
+    fn audio_capture_needs_consent_before_the_lockscreen_visualiser_can_run() {
+        // The lock screen opened a second place to flip a visualiser flag, but
+        // not a second consent: the same enforcement in `enforce_audio_consent`
+        // must cover it.
+        //
+        // Same throwaway-directory idiom as `save_load_file`, so this test
+        // needs no dependency the crate does not already have.
+        let dir =
+            std::env::temp_dir().join(format!("fresco-lockscreen-consent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        std::fs::write(
+            &path,
+            "[lockscreen]\nenabled = true\n[lockscreen.widgets]\nvisualizer = true\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(
+            !cfg.lockscreen.unwrap().widgets.visualizer,
+            "no consent recorded yet, so the capture must be forced off"
+        );
+
+        std::fs::write(
+            &path,
+            "audio_capture_consented = true\n\n[lockscreen]\nenabled = true\n[lockscreen.widgets]\nvisualizer = true\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.lockscreen.unwrap().widgets.visualizer);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_lockscreen_key_when_unset() {
+        // What skip_serializing_if buys: a user who never touches the lock
+        // screen never gets the key written into their config.toml.
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(
+            !text.contains("lockscreen"),
+            "lockscreen: None must emit no key, got:\n{text}"
+        );
+        // ...and it does appear once configured.
+        let cfg = Config {
+            lockscreen: Some(LockScreen::default()),
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("[lockscreen"), "got:\n{text}");
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), cfg);
     }
 }

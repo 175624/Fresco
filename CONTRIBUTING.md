@@ -33,7 +33,7 @@ sudo apt install libgtk-4-dev libadwaita-1-dev libmpv-dev mpv
 | `src/daemon/` | Background wallpaper daemon |
 | `extension/` | Browser new-tab extension |
 | `landing/` | Website |
-| `flatpak/`, `packaging/` | Distribution packaging |
+| `packaging/` | Distribution packaging |
 | `docs/` | Architecture notes, roadmap, install docs |
 | `tests/` | Integration, Wayland, and fidelity tests |
 

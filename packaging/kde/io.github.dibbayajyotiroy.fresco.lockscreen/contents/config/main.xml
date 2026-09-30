@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+  <!--
+    This schema is never edited through kcm_screenlocker's UI (config.qml just
+    points the user back to Fresco). It exists so kscreenlocker's KConfigLoader
+    knows the key names/types/defaults and exposes them to main.qml as
+    wallpaper.configuration.<Key> / root.configuration.<Key>.
+
+    On disk these land under, e.g.:
+      ~/.config/kscreenlockerrc
+      [Greeter][Wallpaper][io.github.dibbayajyotiroy.fresco.lockscreen][General]
+      VideoPath=...
+      Dim=0.2
+    The "General" group name below is what supplies that trailing [General]
+    segment; see packaging/kde/README.md for how this was verified against
+    kscreenlocker's own source (settings/wallpaper_integration.cpp).
+  -->
+  <kcfgfile name=""/>
+
+  <group name="General">
+    <entry name="VideoPath" type="String">
+      <label>Absolute path to the video Fresco is currently showing as the desktop wallpaper.</label>
+      <default></default>
+    </entry>
+    <entry name="StillPath" type="String">
+      <label>Absolute path to a still-image fallback (poster frame / photo wallpaper).</label>
+      <default></default>
+    </entry>
+    <entry name="PlayVideo" type="Bool">
+      <label>Play VideoPath as a looping, muted video instead of showing StillPath.</label>
+      <default>true</default>
+    </entry>
+    <entry name="Dim" type="Double">
+      <label>Opacity (0-0.8) of the black veil drawn over the media, for prompt legibility.</label>
+      <default>0.2</default>
+      <min>0</min>
+      <max>0.8</max>
+    </entry>
+    <entry name="LayerDir" type="String">
+      <label>Directory holding Fresco's widget-layer PNGs (layer-&lt;connector&gt;.png, layer.png).</label>
+      <default></default>
+    </entry>
+    <entry name="RefreshMs" type="Int">
+      <label>How often (ms) to re-check the widget-layer PNGs for a new frame.</label>
+      <default>1000</default>
+    </entry>
+  </group>
+</kcfg>
