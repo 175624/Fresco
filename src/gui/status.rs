@@ -25,11 +25,14 @@ pub(crate) fn cached_monitors() -> Vec<MonitorInfo> {
     LAST_MONITORS.with(|m| m.borrow().clone())
 }
 
+/// Callback that shows/hides the service notice from a reachability result.
+type NoticeHook = Rc<dyn Fn(bool)>;
+
 thread_local! {
     /// Updates the "service not running" notice from a reachability result.
     /// Set once by `build_service_notice`; the status poll and
     /// `refresh_service_notice` feed it.
-    static NOTICE_HOOK: RefCell<Option<Rc<dyn Fn(bool)>>> = const { RefCell::new(None) };
+    static NOTICE_HOOK: RefCell<Option<NoticeHook>> = const { RefCell::new(None) };
 }
 
 fn notify_reachable(reachable: bool) {
