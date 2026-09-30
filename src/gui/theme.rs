@@ -346,6 +346,9 @@ window.glass .background {{ background: transparent; }}
 /* Placeholder shown inside a card while (or if) no thumbnail exists. */
 .wp-placeholder {{ background-color: @thumb_mat; }}
 .wp-placeholder image {{ color: @dim_fg; }}
+/* Card whose import work (thumbnail / metadata) is still outstanding: same
+   size as a real card, glyph dimmed so it reads as loading, not empty. */
+.wp-card.wp-loading .wp-placeholder image {{ opacity: 0.45; }}
 
 /* ===== Status ===== */
 .status-pill {{ background-color: @card_bg_color; border: 1px solid @card_border; border-radius: 999px; padding: 2px 12px; color: @dim_fg; font-size: 12px; }}

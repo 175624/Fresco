@@ -316,6 +316,13 @@ impl LibraryEntry {
 
     /// Generate thumbnail via ffmpegthumbnailer (silently skips if not available).
     pub fn generate_thumbnail(&mut self) {
+        self.generate_thumbnail_dims();
+    }
+
+    /// [`generate_thumbnail`](Self::generate_thumbnail), also returning the
+    /// source's own pixel size when a still image was decoded in-process — the
+    /// import queue uses it to skip the ffprobe run for images.
+    pub fn generate_thumbnail_dims(&mut self) -> Option<(u32, u32)> {
         let source = match self.kind {
             Kind::Video | Kind::Playlist => {
                 self.path.clone().or_else(|| self.paths.first().cloned())
@@ -330,19 +337,30 @@ impl LibraryEntry {
                 })
             }),
         };
-        let Some(src) = source else { return };
+        let src = source?;
         if !src.exists() {
-            return;
+            return None;
         }
         let out = self.expected_thumbnail();
         if let Some(dir) = out.parent() {
             fs::create_dir_all(dir).ok();
         }
+        let rotation = self.rotation.unwrap_or(0) % 360;
+        // Still images are decoded in-process: no ffmpeg/ffprobe process per
+        // file, which is what made a 200-image folder import crawl. GIFs are
+        // not `is_image`, so they keep the video tools; a decode failure (a
+        // format the pixbuf loaders lack) falls through to ffmpeg below.
+        if is_image(&src) {
+            if let Some(dims) = image_thumbnail(&src, &out, rotation) {
+                self.thumbnail = Some(out);
+                self.thumbnail_rotation = Some(rotation);
+                return Some(dims);
+            }
+        }
         // The thumbnail must show the entry's ROTATION, or the card keeps the
         // old orientation after an edit. ffmpegthumbnailer can't rotate, so
         // rotated entries go through ffmpeg (fall through to the unrotated
         // thumbnailer if that fails).
-        let rotation = self.rotation.unwrap_or(0) % 360;
         if rotation != 0 {
             let transpose = match rotation {
                 90 => "transpose=1",
@@ -375,7 +393,7 @@ impl LibraryEntry {
             if ok {
                 self.thumbnail = Some(out);
                 self.thumbnail_rotation = Some(rotation);
-                return;
+                return None;
             }
         }
         let ok = std::process::Command::new("ffmpegthumbnailer")
@@ -398,6 +416,7 @@ impl LibraryEntry {
             // the rotated path above was wanted and failed.
             self.thumbnail_rotation = Some(0);
         }
+        None
     }
 
     /// Rotation already present in the pixels of `thumbnail`.
@@ -1410,6 +1429,56 @@ pub fn probe_media(path: &Path) -> MediaMeta {
     meta
 }
 
+/// Longest side of a card thumbnail — what `ffmpegthumbnailer -s 256` produces.
+pub const THUMB_SIZE: u32 = 256;
+
+/// Thumbnail size for a `w`×`h` source: longest side scaled to `max`, aspect
+/// kept, never upscaled (a 64px icon stays 64px; the card scales it anyway).
+pub fn thumb_dims(w: u32, h: u32, max: u32) -> (u32, u32) {
+    let (w, h) = (w.max(1), h.max(1));
+    if w <= max && h <= max {
+        return (w, h);
+    }
+    let scale = |side: u32, long: u32| {
+        ((side as u64 * max as u64 + long as u64 / 2) / long as u64).max(1) as u32
+    };
+    if w >= h {
+        (max, scale(h, w))
+    } else {
+        (scale(w, h), max)
+    }
+}
+
+/// Decode a still image with gdk-pixbuf and write a card thumbnail PNG to
+/// `out`: EXIF orientation applied, then the entry's `rotation` (clockwise
+/// degrees, like the ffmpeg path's `transpose`). Returns the source's stored
+/// pixel size (what ffprobe would report), or `None` if it can't be decoded.
+pub fn image_thumbnail(src: &Path, out: &Path, rotation: u16) -> Option<(u32, u32)> {
+    use gtk4::gdk_pixbuf::{Pixbuf, PixbufRotation};
+    let (_, w, h) = Pixbuf::file_info(src)?;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let (tw, th) = thumb_dims(w as u32, h as u32, THUMB_SIZE);
+    let pix = Pixbuf::from_file_at_scale(src, tw as i32, th as i32, true).ok()?;
+    let oriented = pix.apply_embedded_orientation();
+    let pix = oriented.unwrap_or(pix);
+    // gdk-pixbuf names rotations by counterclockwise degrees, so its
+    // "Clockwise" is the 90 the entry means.
+    let angle = match rotation % 360 {
+        90 => Some(PixbufRotation::Clockwise),
+        180 => Some(PixbufRotation::Upsidedown),
+        270 => Some(PixbufRotation::Counterclockwise),
+        _ => None,
+    };
+    let pix = match angle {
+        Some(a) => pix.rotate_simple(a)?,
+        None => pix,
+    };
+    pix.savev(out, "png", &[]).ok()?;
+    Some((w as u32, h as u32))
+}
+
 /// Parse ffprobe's "num/den" frame-rate fraction ("60/1", "30000/1001", "0/0").
 fn parse_frame_rate(s: &str) -> Option<f32> {
     let (num, den) = s.split_once('/')?;
@@ -1467,6 +1536,18 @@ pub fn is_image(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumb_dims_fits_longest_side_without_upscaling() {
+        assert_eq!(thumb_dims(1920, 1080, 256), (256, 144));
+        assert_eq!(thumb_dims(1080, 1920, 256), (144, 256));
+        assert_eq!(thumb_dims(4000, 4000, 256), (256, 256));
+        assert_eq!(thumb_dims(64, 32, 256), (64, 32));
+        assert_eq!(thumb_dims(256, 256, 256), (256, 256));
+        // Extreme panorama never rounds to a zero-height thumbnail.
+        assert_eq!(thumb_dims(20000, 10, 256), (256, 1));
+        assert_eq!(thumb_dims(0, 0, 256), (1, 1));
+    }
 
     /// A pre-1.2 entries.json entry (no metadata/favorite fields) must load,
     /// with defaults filled in.

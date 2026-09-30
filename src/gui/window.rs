@@ -10,7 +10,7 @@ use libadwaita::{self as adw, prelude::*};
 use super::theme;
 use super::window_state;
 use super::{
-    daemon_ctl,
+    daemon_ctl, import_queue,
     library::{self, load_entries, save_entries, LibraryEntry},
     status,
 };
@@ -634,6 +634,11 @@ fn build_library_view(
             app.set_accels_for_action("win.open-menu", &["<primary>comma"]);
         }
     }
+
+    // ── Import progress row (hidden until a folder/file import is running) ──
+    let import_slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    super::import_queue::install_progress_row(&import_slot);
+    root.append(&import_slot);
 
     // ── Scrollable content ──
     let scroll = gtk4::ScrolledWindow::new();
@@ -2268,7 +2273,11 @@ fn build_mini_card(
     {
         let state_c = state.clone();
         let stack_c = stack.clone();
+        let id = entry.id.clone();
         click.connect_released(move |_, n_press, _, _| {
+            if import_queue::is_pending(&id) {
+                return;
+            }
             if n_press == 1 {
                 apply_entry_by_idx(state_c.clone(), idx);
             } else if n_press == 2 {
@@ -2323,7 +2332,17 @@ fn build_library_card(
         overlay.add_css_class("active");
     }
     overlay.set_overflow(gtk4::Overflow::Hidden);
-    overlay.set_valign(gtk4::Align::Start);
+    // Fill the AspectFrame. (This used to be `Align::Start`, which shrinks the
+    // overlay to its measured child's height — for a card still showing the
+    // ~20px placeholder glyph that left a thin sliver at the top of the frame.)
+    overlay.set_valign(gtk4::Align::Fill);
+    // Import work outstanding: the card is inert until it finishes (checked at
+    // event time below, so it can come alive without a rebuild).
+    let pending = import_queue::is_pending(&entry.id);
+    if pending {
+        overlay.add_css_class("wp-loading");
+    }
+    let mut placeholder: Option<gtk4::Box> = None;
 
     let pic = gtk4::Picture::new();
     pic.set_can_shrink(true);
@@ -2344,7 +2363,9 @@ fn build_library_card(
         // No thumbnail (yet): mat + kind glyph as the base layer, with the
         // (transparent, empty) Picture stacked above it so the hover preview
         // can still render into it. Keeps the card from collapsing to 0-size.
-        overlay.set_child(Some(&thumb_placeholder(entry.kind)));
+        let ph = thumb_placeholder(entry.kind);
+        overlay.set_child(Some(&ph));
+        placeholder = Some(ph);
         pic.set_hexpand(true);
         pic.set_vexpand(true);
         overlay.add_overlay(&pic);
@@ -2376,12 +2397,20 @@ fn build_library_card(
             heart.add_css_class("wp-fav-glyph");
             meta_row.append(&heart);
         }
-        if let Some(line) = entry.meta_line() {
-            let meta = gtk4::Label::new(Some(&line));
+        let line = entry.meta_line();
+        // A pending card gets its (possibly empty, hidden) meta label up front
+        // so the import queue can fill it in place when the probe lands.
+        let meta_label = (line.is_some() || pending).then(|| {
+            let meta = gtk4::Label::new(line.as_deref());
             meta.add_css_class("wp-meta");
             meta.set_xalign(0.0);
             meta.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            meta.set_visible(line.is_some());
             meta_row.append(&meta);
+            meta
+        });
+        if let (true, Some(ph), Some(meta)) = (pending, &placeholder, &meta_label) {
+            import_queue::register_card(&entry.id, &overlay, &pic, ph, meta);
         }
         if meta_row.first_child().is_some() {
             scrim.append(&meta_row);
@@ -2544,7 +2573,12 @@ fn build_library_card(
     let motion = gtk4::EventControllerMotion::new();
     {
         let actions = actions.clone();
-        motion.connect_enter(move |_, _, _| actions.set_visible(true));
+        let id = entry.id.clone();
+        motion.connect_enter(move |_, _, _| {
+            if !import_queue::is_pending(&id) {
+                actions.set_visible(true);
+            }
+        });
     }
     {
         let actions = actions.clone();
@@ -2558,10 +2592,16 @@ fn build_library_card(
         let state_c = state.clone();
         let stack_c = stack.clone();
         let overlay_c = overlay.clone();
+        let id = entry.id.clone();
         click.connect_released(move |_, n_press, _, _| {
             // Inline rename editor is up on this card (#21) — don't let the
             // click fall through to apply/open underneath it.
             if overlay_c.has_css_class("renaming") {
+                return;
+            }
+            // Still importing: a half-built card must not act (it used to
+            // hit the favorite heart that overlapped its sliver).
+            if import_queue::is_pending(&id) {
                 return;
             }
             if n_press == 1 {
@@ -2580,8 +2620,9 @@ fn build_library_card(
         let state_c = state.clone();
         let stack_c = stack.clone();
         let overlay_c = overlay.clone();
+        let id = entry.id.clone();
         rclick.connect_pressed(move |_, _, x, y| {
-            if overlay_c.has_css_class("renaming") {
+            if overlay_c.has_css_class("renaming") || import_queue::is_pending(&id) {
                 return;
             }
             show_card_menu(
@@ -2600,7 +2641,9 @@ fn build_library_card(
     // Video/GIF cards play a muted, looping preview while hovered. Rotated
     // entries keep their static (rotated) thumbnail instead: GTK's MediaFile
     // can't rotate, and motion in the WRONG orientation reads as a bug.
-    if entry.rotation.unwrap_or(0).is_multiple_of(360) {
+    // A pending card stays inert; the queue's closing refresh rebuilds it with
+    // the preview attached.
+    if !pending && entry.rotation.unwrap_or(0).is_multiple_of(360) {
         if let Some(video) = preview_video_path(entry) {
             super::hover_preview::attach(&overlay, &pic, video);
         }
@@ -3091,7 +3134,7 @@ fn spawn_metadata_probe(state: &Rc<RefCell<AppState>>) {
         .borrow()
         .entries
         .iter()
-        .filter(|e| e.needs_probe())
+        .filter(|e| e.needs_probe() && !import_queue::is_pending(&e.id))
         .filter_map(|e| e.probe_source().map(|p| (e.id.clone(), p)))
         .collect();
     if pending.is_empty() {
@@ -4245,8 +4288,9 @@ fn pick_items_to_add(
 // ─── Batch import ────────────────────────────────────────────────────────────
 
 /// Import a batch as **one wallpaper per file**, skipping anything the library
-/// already holds. Returns `(added, skipped)`.
-fn import_individually(state: &Rc<RefCell<AppState>>, paths: Vec<PathBuf>) -> (usize, usize) {
+/// already holds. Thumbnails and metadata finish in the background via
+/// `import_queue`, which also reports the result toast when done.
+fn import_individually(state: &Rc<RefCell<AppState>>, paths: Vec<PathBuf>) {
     let (fresh, dupes) = {
         let s = state.borrow();
         library::partition_new(&s.entries, paths)
@@ -4262,9 +4306,13 @@ fn import_individually(state: &Rc<RefCell<AppState>>, paths: Vec<PathBuf>) -> (u
         }
         save_entries(&s.entries).ok();
     }
-    spawn_thumbnail_batch(state, ids.clone());
-    spawn_metadata_probe(state);
-    (ids.len(), dupes.len())
+    // Worker pool with per-item card updates and a progress row; the toast
+    // waits for the queue so it reports the finished import.
+    let (added, skipped) = (ids.len(), dupes.len());
+    let state_t = state.clone();
+    import_queue::start(state, ids, move |_cancelled| {
+        report_import(&state_t, added, skipped);
+    });
 }
 
 /// Render thumbnails for a batch off the UI thread.
@@ -4277,7 +4325,9 @@ pub(crate) fn spawn_thumbnail_batch(state: &Rc<RefCell<AppState>>, ids: Vec<Stri
         let s = state.borrow();
         s.entries
             .iter()
-            .filter(|e| ids.contains(&e.id) && e.thumbnail.is_none())
+            .filter(|e| {
+                ids.contains(&e.id) && e.thumbnail.is_none() && !import_queue::is_pending(&e.id)
+            })
             .cloned()
             .collect()
     };
@@ -4444,8 +4494,7 @@ fn show_import_choice_dialog(
         let paths = paths.clone();
         let d = dialog.clone();
         separate.connect_clicked(move |_| {
-            let (added, skipped) = import_individually(&state2, (*paths).clone());
-            report_import(&state2, added, skipped);
+            import_individually(&state2, (*paths).clone());
             let r = state2.borrow().refresh.clone();
             if let Some(r) = r {
                 r();
@@ -4569,8 +4618,7 @@ fn show_folder_import_choice(
                 d.close();
                 return;
             }
-            let (added, skipped) = import_individually(&state2, files);
-            report_import(&state2, added, skipped);
+            import_individually(&state2, files);
             let r = state2.borrow().refresh.clone();
             if let Some(r) = r {
                 r();
@@ -4708,7 +4756,9 @@ pub(crate) fn apply_entry_by_idx(state: Rc<RefCell<AppState>>, idx: usize) {
         let Some(entry) = s.entries.get_mut(idx) else {
             return;
         };
-        if entry.broken {
+        // Refuse an entry that is still being imported (no thumbnail / probe
+        // yet). By id, at call time: `idx` may be stale by now.
+        if entry.broken || import_queue::is_pending(&entry.id) {
             return;
         }
         entry.touch();

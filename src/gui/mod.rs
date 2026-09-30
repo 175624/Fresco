@@ -2,6 +2,7 @@ pub mod add_link;
 mod daemon_ctl;
 mod gallery;
 mod hover_preview;
+mod import_queue;
 mod library;
 mod preview;
 mod status;
