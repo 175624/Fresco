@@ -1,0 +1,27 @@
+{
+    "KPackageStructure": "Plasma/Wallpaper",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Dibbayajyoti Roy"
+            }
+        ],
+        "BugReportUrl": "https://github.com/DibbayajyotiRoy/fresco/issues",
+        "Category": "",
+        "Description": "Fresco's live wallpaper and widgets on the lock screen",
+        "Icon": "preferences-desktop-wallpaper",
+        "Id": "io.github.dibbayajyotiroy.fresco.lockscreen",
+        "License": "GPL-3.0-or-later",
+        "Name": "Fresco (lock screen)",
+        "Version": "1.1.45",
+        "Website": "https://github.com/DibbayajyotiRoy/fresco"
+    },
+    "Keywords": [
+        "wallpaper",
+        "video",
+        "lockscreen",
+        "fresco"
+    ],
+    "X-KDE-ParentApp": "org.kde.plasmashell",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

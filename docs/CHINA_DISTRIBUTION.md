@@ -524,10 +524,10 @@ converts a `.deb` into a linglong package and generates the `linglong.yaml`
 Tooling: `sudo apt install linglong-builder linglong-box linglong-bin`, then
 `ll-builder build`. ⚠️ **Big caveat:** linglong is a *sandboxed* container format
 (`ll-box`), so it will hit the exact same class of problems documented in
-[`FLATHUB.md`](FLATHUB.md) — wlr-layer-shell access, a daemon that must outlive the
+the sandbox problems Flatpak hit (wlr-layer-shell access, a daemon that must outlive the
 GUI, `--filesystem=host:ro`-equivalent access to arbitrary user media, and writing an
 autostart entry. Do **not** treat linglong as a mechanical repackage; budget it as
-its own project, and only after Flatpak's sandbox story is settled.
+its own project, and only after its sandbox story is settled.
 
 ### 8c. GitCode — optional, step 4
 

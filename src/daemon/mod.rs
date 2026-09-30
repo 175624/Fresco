@@ -4,8 +4,10 @@
 mod caja_mirror;
 pub mod cinnamon_bg;
 mod control;
+mod cosmic_bg;
 mod dde;
 mod fullscreen;
+mod lock;
 mod signals;
 // Public so the widget engine's API stays visible while the daemon-loop call
 // sites are being built out; the module is otherwise internal.
@@ -16,6 +18,7 @@ pub mod mpv;
 mod mpvpaper;
 mod notifier;
 mod overview;
+pub mod saver;
 mod transition;
 mod wayland_outputs;
 mod webbridge;
@@ -33,8 +36,12 @@ use x11rb::protocol::xproto::Screen;
 use x11rb::rust_connection::RustConnection;
 
 use crate::config::{Config, Kind, PowerSaving, Scaling, Transition, Wallpaper};
-use crate::ipc::{MonitorInfo, Request, Response, StatusReply};
+use crate::ipc::{LockReply, LockSocket, LockStatus, MonitorInfo, Request, Response, StatusReply};
 
+use lock::engine::LockEngine;
+use lock::hosts::{HostCtx, HostKind, LockHost, LockTargets, RunningHost};
+use lock::preview::PreviewRenderer;
+use lock::state::LockMonitor;
 use monitors::Monitor;
 use mpv::Player;
 use mpvpaper::WaylandPlayer;
@@ -113,6 +120,321 @@ const HEARTBEAT_RECHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// During a transition the loop ticks at ~60fps for buttery, eased motion.
 const ANIM_TICK: Duration = Duration::from_millis(16);
+
+// ---------------------------------------------------------------------------
+// Lock mode: shared wiring for all three run loops
+// ---------------------------------------------------------------------------
+
+/// The daemon's `daemon::lock` wiring: host detection, the lock-state
+/// monitor, the lock widget engine, and the `Request::Lock*` handlers — one
+/// instance per run loop ([`Daemon`], `run_gnome_static`,
+/// `run_wayland_layershell`), driven through the exact same handful of
+/// methods so the request-handling and transition logic can never drift
+/// between backends the way `raise_demuxer_cache` once did between the X11
+/// and Wayland players (`widgets.rs`'s own module doc names that failure).
+///
+/// What this type does *not* own: the desktop widget engine (each loop's
+/// own) and the live player handles it must pause/dim on the `Desktop`
+/// target — both differ enough per backend (`Vec<Renderer>` vs
+/// `BTreeMap<String, WlOutput>` vs none at all in `run_gnome_static`) that
+/// unifying them here would cost more than it saves. Each loop calls
+/// [`LockRuntime::poll`] every tick and reacts to a transition with its own
+/// glue; see `run_wayland_layershell` for the fullest example (COSMIC is the
+/// one host with a `Desktop` target today).
+struct LockRuntime {
+    kind: HostKind,
+    host: Box<dyn LockHost>,
+    monitor: LockMonitor,
+    /// `Some` for exactly as long as the session is believed locked *and*
+    /// there is somewhere for it to draw (`LockTargets` other than `None`).
+    engine: Option<LockEngine>,
+    /// Set by a daemon-driven `Request::Lock` (`host.lock(ctx)` succeeding)
+    /// and by `Request::LockNotify` reporting sockets; cleared on unlock or
+    /// when its `child` (if any) exits. `RunningHost::targets` — when it is
+    /// not `LockTargets::None` — takes priority over
+    /// `LockHost::targets_while_locked` the moment either is known, per the
+    /// contract's own `targets_while_locked` doc comment ("where the lock
+    /// widget engine draws while the session is locked *by the DE itself*
+    /// (not by `LockHost::lock`)").
+    running: Option<RunningHost>,
+    preview: PreviewRenderer,
+    /// Mirrors `self.monitor.current().is_locked()` — kept alongside it
+    /// rather than recomputed every time so [`LockRuntime::poll`] can tell
+    /// "genuinely flipped" from "moved between `Locked` and
+    /// `SleepImminent`, both already `is_locked()`", which must not
+    /// re-trigger `begin_lock`/`end_lock`.
+    locked: bool,
+    /// Set by [`LockRuntime::begin_lock`]/cleared by
+    /// [`LockRuntime::end_lock`]: whether the *current* lock targets the live
+    /// desktop wallpaper surface (COSMIC only). The Wayland loop's live-video/
+    /// dim policy (`docs/plan-lock-screen.md` §3.1) applies only then — a
+    /// `Sockets`/`LayerFiles` target has no bearing on the desktop's own
+    /// mpvpaper properties at all.
+    desktop_target: bool,
+}
+
+impl LockRuntime {
+    fn new() -> Self {
+        let kind = lock::hosts::detect();
+        let host = lock::hosts::host_for(kind);
+        // Read back through the trait rather than trusting `kind` verbatim:
+        // `host_for` promises `host_for(k).kind() == k` (see its own tests),
+        // and asking confirms `self.kind` always agrees with the adapter
+        // actually driving `self.host`, not just with what `detect` returned
+        // a moment before `host_for` ran.
+        let kind = host.kind();
+        LockRuntime {
+            kind,
+            host,
+            monitor: LockMonitor::new(kind, Instant::now()),
+            engine: None,
+            running: None,
+            preview: PreviewRenderer::new(),
+            locked: false,
+            desktop_target: false,
+        }
+    }
+
+    /// `Request::Apply`: re-run host detection (cheap — see `hosts::detect`)
+    /// and rebuild the host adapter if it changed. The state monitor is left
+    /// running under its existing `HostKind` rather than rebuilt — throwing
+    /// away its debounce state and `gdbus` children on every Apply would
+    /// cost real latency for no benefit, since `hosts::classify` only reads
+    /// things (`XDG_SESSION_TYPE`, the Wayland globals) that do not change
+    /// while a session runs.
+    fn on_apply(&mut self, config: &Config) {
+        let kind = lock::hosts::detect();
+        if kind != self.kind {
+            log::info!("lock: host changed {:?} -> {kind:?}", self.kind);
+            self.host = lock::hosts::host_for(kind);
+            self.kind = self.host.kind();
+        }
+        if matches!(self.kind, HostKind::Kde) {
+            // Keep the KDE greeter plugin's config (wallpaper paths, live/still,
+            // dim) in step with the GUI's Apply. `refresh_config` is a no-op
+            // until the user has run setup, and it touches no output geometry,
+            // so an empty output list is fine. Best-effort by design: a failed
+            // kwriteconfig6 must never turn a good Apply into an error reply.
+            let ctx = self.ctx(config, &[]);
+            if let Err(e) = lock::hosts::kde::refresh_config(&ctx) {
+                log::warn!("lock: kde config refresh failed: {e}");
+            }
+        }
+    }
+
+    fn ctx<'a>(&self, config: &'a Config, outputs: &'a [widgets::OutputGeom]) -> HostCtx<'a> {
+        HostCtx {
+            config,
+            outputs,
+            runtime_dir: crate::ipc::socket_dir(),
+        }
+    }
+
+    /// The resolved lock config, or `None` when the feature is off —
+    /// `[lockscreen].enabled = false` is the default, and every call site
+    /// below treats "nothing to do" and "disabled" the same way.
+    fn resolved(config: &Config) -> Option<crate::lockscreen::ResolvedLock> {
+        let cfg = config.lockscreen.as_ref()?;
+        cfg.enabled.then(|| crate::lockscreen::resolve(cfg))
+    }
+
+    /// Where the lock engine should draw right now: a daemon-spawned host's
+    /// own targets when it has any, else the host's own
+    /// `targets_while_locked`. See [`LockRuntime::running`]'s doc comment.
+    fn targets_now(&self, ctx: &HostCtx) -> LockTargets {
+        if let Some(running) = &self.running {
+            if running.targets != LockTargets::None {
+                return running.targets.clone();
+            }
+        }
+        self.host.targets_while_locked(ctx)
+    }
+
+    /// Poll every source `daemon::lock::state` owns directly, plus the one
+    /// this type alone can see (a daemon-spawned host's child exiting).
+    /// Returns `Some(is_locked)` only on a genuine is-locked transition —
+    /// moving between `Locked` and `SleepImminent` (both already
+    /// `is_locked()`) is not one, so a caller reacting to `Some` never
+    /// double-runs its swap.
+    fn poll(&mut self, now: Instant) -> Option<bool> {
+        let mut child_exited = false;
+        if let Some(running) = &mut self.running {
+            if let Some(child) = &mut running.child {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    child_exited = true;
+                }
+            }
+        }
+        if child_exited {
+            self.running = None;
+            self.monitor.on_host_child_exited(now);
+        }
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(LockEngine::all_sockets_disconnected)
+        {
+            self.monitor.on_sockets_disconnected(now);
+        }
+        self.monitor.poll(now);
+        let now_locked = self.monitor.current().is_locked();
+        if now_locked != self.locked {
+            self.locked = now_locked;
+            return Some(now_locked);
+        }
+        None
+    }
+
+    /// Start the lock widget engine for a transition into locked mode. The
+    /// caller is responsible for the parts this type doesn't own: clearing
+    /// the desktop widget engine (`widgets::WidgetEngine::clear_for_lock`)
+    /// and, on the `Desktop` target only, the live-video/dim policy on the
+    /// player handle.
+    fn begin_lock(
+        &mut self,
+        resolved: &crate::lockscreen::ResolvedLock,
+        ctx: &HostCtx,
+        theme: crate::widgetkit::Theme,
+    ) -> LockTargets {
+        let targets = self.targets_now(ctx);
+        self.desktop_target = targets == LockTargets::Desktop;
+        let mut engine = LockEngine::new(self.kind, resolved, ctx.outputs, theme);
+        engine.set_targets(targets.clone());
+        self.engine = Some(engine);
+        targets
+    }
+
+    /// End a locked session: take the engine's own overlays down (for the
+    /// `Desktop` target — `Sockets`/`LayerFiles` clean up their own state
+    /// inside `LockEngine::clear`) and forget the daemon-spawned host, if
+    /// there was one.
+    fn end_lock(&mut self) -> Vec<widgets::WidgetUpdate> {
+        self.running = None;
+        self.desktop_target = false;
+        match self.engine.take() {
+            Some(mut e) => e.clear(),
+            None => Vec::new(),
+        }
+    }
+
+    // -- Request handling, identical across all three run loops -------------
+
+    /// `Request::Lock`.
+    fn lock(&mut self, ctx: &HostCtx) -> Response {
+        match self.host.lock(ctx) {
+            Ok(running) => {
+                self.running = Some(running);
+                Response::Lock(LockReply {
+                    host: self.kind.id().to_string(),
+                    ok: true,
+                    message: None,
+                })
+            }
+            Err(e) => {
+                // Fail closed even when this host's own adapter can't:
+                // `loginctl lock-session` is the universal fallback every
+                // `LockHost` in this snapshot already routes through, so a
+                // host whose own chain fails (or isn't implemented yet — the
+                // wlroots/X11 hosts today) still tries the one mechanism that
+                // works everywhere before reporting failure.
+                let ok = lock::hosts::loginctl_lock_session().is_ok();
+                Response::Lock(LockReply {
+                    host: self.kind.id().to_string(),
+                    ok,
+                    message: Some(e),
+                })
+            }
+        }
+    }
+
+    /// `Request::LockNotify`.
+    fn lock_notify(&mut self, locked: bool, sockets: Vec<LockSocket>, now: Instant) {
+        // Any same-user process can send this, and we connect to whatever
+        // paths it names — filter first (see `lock::notify`).
+        let sockets = lock::notify::validate_sockets(
+            sockets,
+            &crate::ipc::socket_dir(),
+            &lock::notify::dir_is_symlink_or_unreadable,
+        );
+        if !sockets.is_empty() {
+            let targets = LockTargets::Sockets(sockets);
+            match &mut self.running {
+                Some(running) => running.targets = targets,
+                None => {
+                    self.running = Some(RunningHost {
+                        child: None,
+                        targets,
+                    })
+                }
+            }
+        }
+        self.monitor.on_lock_notify(locked, now);
+    }
+
+    /// `Request::LockSetup`.
+    fn lock_setup(&self, ctx: &HostCtx) -> Response {
+        match self.host.setup(ctx) {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::Err { message },
+        }
+    }
+
+    /// `Request::LockUndo`.
+    fn lock_undo(&self, ctx: &HostCtx) -> Response {
+        match self.host.undo(ctx) {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::Err { message },
+        }
+    }
+
+    /// `Request::LockPreview`.
+    fn lock_preview(
+        &mut self,
+        ctx: &HostCtx,
+        wallpaper: &Wallpaper,
+        np: Option<&widgets::Snapshot>,
+        theme: crate::widgetkit::Theme,
+        width: u32,
+        height: u32,
+    ) -> Response {
+        let Some(resolved) = Self::resolved(ctx.config) else {
+            return Response::Err {
+                message: "lock screen is not enabled".to_string(),
+            };
+        };
+        match self
+            .preview
+            .render(self.kind, wallpaper, &resolved, np, theme, width, height)
+        {
+            Ok(path) => Response::LockPreview {
+                path: path.to_string_lossy().into_owned(),
+            },
+            Err(message) => Response::Err { message },
+        }
+    }
+
+    /// `StatusReply.lockscreen`.
+    fn status(&self, ctx: &HostCtx, config: &Config) -> LockStatus {
+        // Live video and Fresco's own widgets are available only where a
+        // real surface exists to draw them on today — see
+        // `docs/plan-lock-screen.md` §4: COSMIC needs the show-on-lock layer
+        // specifically (not just "is COSMIC"), and GNOME/Cinnamon/MATE/Xfce/
+        // Deepin are still-frame-only until later waves.
+        let capable = matches!(
+            self.kind,
+            HostKind::Cosmic { live: true } | HostKind::Wlroots | HostKind::X11Wm | HostKind::Kde
+        );
+        LockStatus {
+            enabled: config.lockscreen.as_ref().is_some_and(|l| l.enabled),
+            host: self.kind.id().to_string(),
+            live_video: capable,
+            widgets: capable,
+            locked: self.locked,
+            setup: self.host.setup_state(ctx),
+            notes: self.host.notes(ctx),
+        }
+    }
+}
 
 /// A slideshow's dwell bookkeeping: which image is up and when the next one is
 /// due. The animation between them belongs to [`transition::Anim`], which any
@@ -261,6 +583,20 @@ impl PlayerHandle {
         match self {
             PlayerHandle::X11(p) => p.set_paused(paused),
             PlayerHandle::Wayland(p) => p.set_paused(paused),
+        }
+    }
+    /// Lock-screen dim (`LockRuntime`'s `Desktop`-target policy in
+    /// `run_wayland_layershell` — see `docs/plan-lock-screen.md` §3.1's
+    /// `dim`). Wayland only: COSMIC, the one host whose lock targets are ever
+    /// `Desktop`, always runs on this backend. Mirrors
+    /// `raise_demuxer_cache`'s own asymmetric-by-design shape (that one is
+    /// X11-only; this one is Wayland-only), not a widget that silently no-ops
+    /// on one backend the way that method's own doc comment warns against —
+    /// there is nothing for this to do on X11 because nothing on X11 ever
+    /// requests it.
+    fn set_brightness(&self, brightness: i32) {
+        if let PlayerHandle::Wayland(p) = self {
+            p.set_brightness(brightness);
         }
     }
     /// Draw an ASS overlay over the wallpaper; empty `ass` clears it.
@@ -493,6 +829,17 @@ pub struct Daemon {
     /// [`HEARTBEAT_RECHECK_INTERVAL`]. The heartbeat itself self-throttles to
     /// roughly daily, so this only needs to be "often enough", not precise.
     last_heartbeat_check: Instant,
+    /// Lock-screen host detection, state monitor and widget engine — see
+    /// [`LockRuntime`]. X11 has no `Desktop` target of its own (no host in
+    /// `docs/plan-lock-screen.md`'s table ever names one on X11), so on this
+    /// backend a lock only ever pauses the desktop player for power and
+    /// answers `Request::Lock*`/`Status`; see [`Daemon::reconcile_lock`].
+    lock: LockRuntime,
+    /// mpv `pause` this backend applied for the lock screen's power policy,
+    /// remembered so unlock restores exactly what the user had — never
+    /// un-pausing a video the user paused themself. `None` = not currently
+    /// applied.
+    lock_paused: Option<bool>,
 }
 
 impl Daemon {
@@ -534,7 +881,94 @@ impl Daemon {
             // Due immediately at startup would just repeat `run()`'s own
             // heartbeat call a moment later; start the clock instead.
             last_heartbeat_check: Instant::now(),
+            lock: LockRuntime::new(),
+            lock_paused: None,
         })
+    }
+
+    /// Reconcile the lock-screen state on every tick: X11 has no `Desktop`
+    /// target (see [`Daemon::lock`]'s doc comment), so the whole of this
+    /// backend's reaction to a lock/unlock transition is pausing the desktop
+    /// player for power while locked and resuming it on unlock — "unless a
+    /// target draws into it", which on X11 never happens today, but the
+    /// check is here rather than assumed so a future X11 `Desktop` target
+    /// would not silently get paused out from under it.
+    fn reconcile_lock(&mut self, now: Instant) {
+        let Some(now_locked) = self.lock.poll(now) else {
+            return;
+        };
+        if now_locked {
+            let Some(resolved) = LockRuntime::resolved(&self.config) else {
+                return;
+            };
+            let cleared = self.widgets.clear_for_lock(
+                resolved
+                    .widgets
+                    .contains(&crate::lockscreen::LockWidget::Lyrics),
+                resolved
+                    .widgets
+                    .contains(&crate::lockscreen::LockWidget::Visualizer),
+            );
+            self.dispatch_widget_updates(cleared);
+            let geoms = self.output_geoms_all();
+            let ctx = self.lock.ctx(&self.config, &geoms);
+            let theme = lock_widget_theme(&self.config);
+            // X11 never has a `Desktop` target of its own (no host ever
+            // names one there), but `begin_lock` still starts the engine for
+            // `Sockets`/`LayerFiles` — an X11 WM saver or the MATE/Xfce
+            // screensaver theme, once wave 2b's hosts land, still needs
+            // widgets pushed somewhere.
+            self.widgets.set_lock_album_art(
+                resolved
+                    .widgets
+                    .contains(&crate::lockscreen::LockWidget::AlbumArt),
+            );
+            let targets = self.lock.begin_lock(&resolved, &ctx, theme);
+            if targets != lock::hosts::LockTargets::Desktop {
+                self.lock_paused = Some(self.user_paused || self.battery_paused);
+                for r in &self.renderers {
+                    r.player.set_paused(true);
+                }
+            }
+        } else {
+            let cleared = self.lock.end_lock();
+            self.dispatch_widget_updates(cleared);
+            self.widgets.set_lock_album_art(false);
+            if let Some(prev) = self.lock_paused.take() {
+                for r in &self.renderers {
+                    r.player.set_paused(prev);
+                }
+            }
+            self.widgets.invalidate();
+        }
+    }
+
+    /// Advance the lock engine while locked — the `Sockets`/`LayerFiles`
+    /// targets do their own I/O and return nothing; `Desktop` never occurs on
+    /// X11 (see [`Daemon::reconcile_lock`]), so there is nothing to dispatch
+    /// here today, but the tick still has to happen for those two targets'
+    /// content (clock, battery, media) to ever update while locked.
+    fn tick_lock_engine(&mut self) {
+        let geoms = self.output_geoms_all();
+        let np = self.widgets.now_playing();
+        let Some(engine) = &mut self.lock.engine else {
+            return;
+        };
+        engine.set_outputs(&geoms);
+        let updates = engine.tick(np.as_ref());
+        self.dispatch_widget_updates(updates);
+    }
+
+    /// Dispatch a batch of lock-engine `WidgetUpdate`s through the same
+    /// per-output routing `push_widgets`/`clear_widgets` already use.
+    fn dispatch_widget_updates(&self, updates: Vec<widgets::WidgetUpdate>) {
+        for u in &updates {
+            for r in &self.renderers {
+                if u.is_for(&r.window.connector) {
+                    dispatch_widget(&r.player, u);
+                }
+            }
+        }
     }
 
     /// Push any widget overlay whose content changed onto the renderer that
@@ -610,6 +1044,7 @@ impl Daemon {
                     connector: c.clone(),
                     w,
                     h,
+                    scale_milli: 1000,
                 }
             })
             .collect()
@@ -746,6 +1181,7 @@ impl Daemon {
             // back first, so the "original" `apply_key` saves is theirs and
             // not a Fresco frame that Stop would then leave behind.
             overview::restore();
+            cosmic_bg::restore();
             if !caja_mirror::apply_key() {
                 self.fall_back_to_restack(
                     "the MATE background settings (org.mate.background) cannot be changed",
@@ -783,6 +1219,7 @@ impl Daemon {
         self.dde_mode = dde::Mode::Restack;
         caja_mirror::restore_background();
         overview::apply(&self.config.wallpaper);
+        cosmic_bg::apply(&self.config);
     }
 
     // The X11 primitives (conn/screen/atoms/monitor) plus wallpaper, render
@@ -828,6 +1265,7 @@ impl Daemon {
             log::warn!("initial renderer build failed: {e:#}");
         }
         overview::apply(&self.config.wallpaper);
+        cosmic_bg::apply(&self.config);
         log::info!("frescod started with {} renderer(s)", self.renderers.len());
         crate::telemetry::heartbeat(
             Some("x11"),
@@ -849,6 +1287,7 @@ impl Daemon {
                 // happens here instead of before the reply went out.
                 if std::mem::take(&mut self.overview_pending) {
                     overview::apply(&self.config.wallpaper);
+                    cosmic_bg::apply(&self.config);
                 }
                 if is_stop {
                     self.shutdown();
@@ -906,7 +1345,22 @@ impl Daemon {
             }
             self.check_startup_renderers(now);
             self.check_cold_boot_stall(now);
-            self.push_widgets();
+            self.reconcile_lock(now);
+            // While locked, the desktop widget engine is frozen rather than
+            // ticked: `clear_for_lock` may have left the clock/disc believing
+            // they are "due" (cleared, not merely hidden), and calling
+            // `push_widgets` here would immediately redraw and re-push them
+            // onto the very surface the lock screen is supposed to own —
+            // undoing the clear on the next tick. Lyrics/visualiser
+            // overlays kept in place (see `clear_for_lock`'s caller) are
+            // therefore a frozen last frame while locked, not a live feed;
+            // `reconcile_lock`'s unlock path calls `invalidate()` to bring
+            // everything back the moment it's safe to.
+            if self.lock.locked {
+                self.tick_lock_engine();
+            } else {
+                self.push_widgets();
+            }
             let animating = self.advance_transitions(now);
 
             // Smart Sleep: the engine knows when the next lyric line, minute
@@ -934,6 +1388,7 @@ impl Daemon {
                 let cfg = self.config.clone();
                 apply_widget_config(&mut self.widgets, &cfg);
                 self.widgets.invalidate();
+                self.lock.on_apply(&self.config);
                 match self.rebuild() {
                     Ok(_) => {
                         // See `overview_pending`'s doc comment: run() applies
@@ -962,7 +1417,54 @@ impl Daemon {
                 notifier::run_updater_async();
                 Response::Ok
             }
+            Request::Lock => {
+                let geoms = self.output_geoms_all();
+                let ctx = self.lock.ctx(&self.config, &geoms);
+                self.lock.lock(&ctx)
+            }
+            Request::LockPreview { width, height } => {
+                let geoms = self.output_geoms_all();
+                let ctx = self.lock.ctx(&self.config, &geoms);
+                let np = self.widgets.now_playing();
+                let theme = lock_widget_theme(&self.config);
+                self.lock.lock_preview(
+                    &ctx,
+                    &self.config.wallpaper,
+                    np.as_ref(),
+                    theme,
+                    width,
+                    height,
+                )
+            }
+            Request::LockNotify { locked, sockets } => {
+                self.lock.lock_notify(locked, sockets, Instant::now());
+                Response::Ok
+            }
+            Request::LockSetup => {
+                let geoms = self.output_geoms_all();
+                let ctx = self.lock.ctx(&self.config, &geoms);
+                self.lock.lock_setup(&ctx)
+            }
+            Request::LockUndo => {
+                let geoms = self.output_geoms_all();
+                let ctx = self.lock.ctx(&self.config, &geoms);
+                self.lock.lock_undo(&ctx)
+            }
         }
+    }
+
+    /// Every currently known output, for [`HostCtx::outputs`] — unlike
+    /// [`Daemon::output_geoms`], not filtered to a widget's own target list.
+    fn output_geoms_all(&self) -> Vec<widgets::OutputGeom> {
+        self.monitors
+            .iter()
+            .map(|m| widgets::OutputGeom {
+                connector: m.connector.clone(),
+                w: u32::from(m.width),
+                h: u32::from(m.height),
+                scale_milli: m.scale_milli,
+            })
+            .collect()
     }
 
     fn status(&self) -> StatusReply {
@@ -978,6 +1480,8 @@ impl Daemon {
             .map(|r| format!("failed to load media on {}", r.window.connector));
         let audio = self.renderers.first().and_then(|r| r.player.audio_status());
         let video = self.renderers.first().and_then(|r| r.player.video_status());
+        let geoms = self.output_geoms_all();
+        let ctx = self.lock.ctx(&self.config, &geoms);
         StatusReply {
             running: true,
             paused: self.user_paused || self.battery_paused,
@@ -996,6 +1500,7 @@ impl Daemon {
             dropped_frames: video.map(|(_, _, _, n)| n),
             monitors_info: monitors_info_from(&self.monitors),
             gave_up: Vec::new(), // X11 backend has no give-up fallback
+            lockscreen: Some(self.lock.status(&ctx, &self.config)),
         }
     }
 
@@ -1137,7 +1642,7 @@ impl Daemon {
             }
             return;
         }
-        let discharging = on_battery();
+        let discharging = crate::battery::on_battery();
         if discharging != self.battery_paused {
             self.battery_paused = discharging;
             self.reconcile_pause();
@@ -1216,6 +1721,7 @@ impl Daemon {
         self.config.wallpaper.crop = want.crop;
         self.sched.applied = Some(path);
         overview::apply(&self.config.wallpaper);
+        cosmic_bg::apply(&self.config);
     }
 
     /// Re-seat clones of the same video on one clock (see SYNC_INTERVAL): the
@@ -1397,7 +1903,9 @@ impl Daemon {
     }
 
     fn shutdown(&mut self) {
+        self.lock.end_lock(); // drop the engine and any LayerFiles/socket state
         overview::restore();
+        cosmic_bg::restore();
         // Put the user's original DDE wallpaper back (no-op off DDE / when
         // nothing was saved).
         if crate::capability::is_deepin_dde() {
@@ -1523,18 +2031,6 @@ fn list_images(folder: &std::path::Path) -> Vec<PathBuf> {
         .collect();
     v.sort();
     v
-}
-
-/// Any power-supply reporting "Discharging" means we're on battery.
-fn on_battery() -> bool {
-    let Ok(dir) = std::fs::read_dir("/sys/class/power_supply") else {
-        return false;
-    };
-    dir.flatten().any(|entry| {
-        std::fs::read_to_string(entry.path().join("status"))
-            .map(|s| s.trim() == "Discharging")
-            .unwrap_or(false)
-    })
 }
 
 /// (cpu_percent, rss_megabytes) for the daemon plus any renderer child
@@ -1758,6 +2254,7 @@ fn run_x11() -> Result<()> {
         // Safety net: if a prior run was killed (not Stopped) it may have left
         // our static frame as the background — put the user's original back.
         overview::restore();
+        cosmic_bg::restore();
         // Same for DDE: a crashed run may have left the transparent wallpaper
         // applied with the original saved on disk — restore it (no-op
         // otherwise).
@@ -1783,13 +2280,25 @@ fn run_gnome_static() -> Result<()> {
     let mut config = Config::load().unwrap_or_default();
     if !config.enabled {
         overview::restore();
+        cosmic_bg::restore();
         log::info!("wallpaper disabled (enabled=false) — exiting");
         return Ok(());
     }
     let commands = control::start_server()?;
     overview::apply(&config.wallpaper);
+    cosmic_bg::apply(&config);
     log::info!("frescod started (GNOME Wayland static-frame mode)");
     crate::telemetry::heartbeat(Some("gnome-static"), None, None);
+
+    // GNOME is still-frame-only (`live_video: false, widgets: false` -- see
+    // `LockRuntime::status`), so there is no live engine here for a lock/
+    // unlock transition to swap -- `LockRuntime` in this loop exists only to
+    // answer `Request::Lock*`/`Status.lockscreen` correctly. Polling it is
+    // therefore piggybacked on whatever else already wakes this loop
+    // (a request, or the heartbeat timeout) rather than adding a fast tick
+    // cadence of its own, which would work against this mode's whole point
+    // ("blocks on the control channel between commands -> ~0% CPU").
+    let mut lock_rt = LockRuntime::new();
 
     // `recv_timeout` rather than a plain blocking `recv`: this mode otherwise
     // never wakes on its own, so a daemon left running for days without an
@@ -1800,26 +2309,59 @@ fn run_gnome_static() -> Result<()> {
         let (req, reply) = match commands.recv_timeout(HEARTBEAT_RECHECK_INTERVAL) {
             Ok(pair) => pair,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                lock_rt.poll(Instant::now());
                 crate::telemetry::heartbeat(Some("gnome-static"), None, None);
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        lock_rt.poll(Instant::now());
         let is_stop = matches!(req, Request::Stop);
         let is_apply = matches!(req, Request::Apply);
         let resp = match req {
             Request::Apply => {
                 config = Config::load().unwrap_or_else(|_| config.clone());
+                lock_rt.on_apply(&config);
                 Response::Ok
             }
             // A static frame has nothing to pause.
             Request::Pause | Request::Resume => Response::Ok,
-            Request::Status => Response::Status(static_status(&config)),
+            Request::Status => {
+                let ctx = lock_rt.ctx(&config, &[]);
+                Response::Status(static_status(&config, &lock_rt.status(&ctx, &config)))
+            }
             Request::Update => {
                 notifier::run_updater_async();
                 Response::Ok
             }
             Request::Stop => Response::Ok,
+            // GNOME static-frame mode has no live surface and no `Desktop`
+            // target host, so `Request::Lock` and friends are handled purely
+            // through `LockRuntime` — `loginctl lock-session` for `Lock`, a
+            // still-frame `compose_still` preview, and `Status.lockscreen`
+            // reporting `live_video: false, widgets: false` (GNOME is not in
+            // the capable-host set — see `LockRuntime::status`).
+            Request::Lock => {
+                let ctx = lock_rt.ctx(&config, &[]);
+                lock_rt.lock(&ctx)
+            }
+            Request::LockPreview { width, height } => {
+                let ctx = lock_rt.ctx(&config, &[]);
+                let theme = lock_widget_theme(&config);
+                lock_rt.lock_preview(&ctx, &config.wallpaper, None, theme, width, height)
+            }
+            Request::LockNotify { locked, sockets } => {
+                lock_rt.lock_notify(locked, sockets, Instant::now());
+                Response::Ok
+            }
+            Request::LockSetup => {
+                let ctx = lock_rt.ctx(&config, &[]);
+                lock_rt.lock_setup(&ctx)
+            }
+            Request::LockUndo => {
+                let ctx = lock_rt.ctx(&config, &[]);
+                lock_rt.lock_undo(&ctx)
+            }
         };
         let _ = reply.send(resp);
         // The overview redecode (ffmpegthumbnailer at full size) happens
@@ -1830,8 +2372,10 @@ fn run_gnome_static() -> Result<()> {
         if is_apply {
             if config.enabled {
                 overview::apply(&config.wallpaper);
+                cosmic_bg::apply(&config);
             } else {
                 overview::restore();
+                cosmic_bg::restore();
             }
         }
         if is_stop {
@@ -1839,14 +2383,16 @@ fn run_gnome_static() -> Result<()> {
         }
     }
 
+    lock_rt.end_lock(); // drop any LayerFiles/socket state (no live engine here otherwise)
     overview::restore();
+    cosmic_bg::restore();
     std::fs::remove_file(crate::ipc::socket_path()).ok();
     log::info!("frescod stopped");
     Ok(())
 }
 
 /// Minimal status for the GNOME static-frame fallback mode.
-fn static_status(config: &Config) -> StatusReply {
+fn static_status(config: &Config, lockscreen: &LockStatus) -> StatusReply {
     let (cpu, rss) = proc_stats(&[]);
     let wallpaper = config
         .wallpaper
@@ -1871,6 +2417,7 @@ fn static_status(config: &Config) -> StatusReply {
         dropped_frames: None,
         monitors_info: Vec::new(),
         gave_up: Vec::new(),
+        lockscreen: Some(lockscreen.clone()),
     }
 }
 
@@ -1910,6 +2457,9 @@ fn run_wayland_layershell() -> Result<()> {
     setup_vaapi_env();
     let mut config = Config::load().unwrap_or_default();
     if !config.enabled {
+        // Safety net, same as `run_x11`'s: a prior run killed rather than
+        // Stopped may have left cosmic-bg pointed at our still frame.
+        cosmic_bg::restore();
         log::info!("wallpaper disabled (enabled=false) — exiting");
         return Ok(());
     }
@@ -1927,6 +2477,7 @@ fn run_wayland_layershell() -> Result<()> {
             y: 0,
             width: 0,
             height: 0,
+            scale_milli: 1000,
         }]
     });
     log::info!(
@@ -1989,6 +2540,13 @@ fn run_wayland_layershell() -> Result<()> {
     let mut widget_engine = widgets::WidgetEngine::new(config.widgets.as_ref(), config.accent);
     apply_widget_config(&mut widget_engine, &config);
 
+    // Lock-screen host detection, state monitor and widget engine (see
+    // `LockRuntime`) — COSMIC is the one host with a `Desktop` target today,
+    // and this is the one run loop that ever drives it.
+    let mut lock_rt = LockRuntime::new();
+    let mut show_on_lock = wants_show_on_lock(&config, lock_rt.kind);
+    let mut lock_dim_applied = 0i32;
+
     // One supervised mpvpaper per output, keyed by connector name.
     let mut outputs: BTreeMap<String, WlOutput> = BTreeMap::new();
     for m in &monitors {
@@ -2001,9 +2559,15 @@ fn run_wayland_layershell() -> Result<()> {
         }
         let effective_ps = wallpaper.effective_power_saving(config.power_saving);
         let mut out = WlOutput::new(m.connector.clone(), wallpaper, config.scaling, effective_ps);
+        out.set_show_on_lock(show_on_lock);
         out.respawn(false, false);
         outputs.insert(m.connector.clone(), out);
     }
+    // COSMIC only: `overview` doesn't apply here (COSMIC has none of the
+    // GNOME/Cinnamon/MATE schemas), but its lock screen has the exact same
+    // "can't see the live wallpaper" problem GNOME's overview has — see
+    // `cosmic_bg`'s module doc. No-op on every other layer-shell compositor.
+    cosmic_bg::apply(&config);
     log::info!(
         "frescod started (Wayland layer-shell / mpvpaper, {} output(s))",
         outputs.len()
@@ -2019,8 +2583,13 @@ fn run_wayland_layershell() -> Result<()> {
         // Smart Sleep: `recv_timeout` is exactly the interruptible wait the
         // engine's docs ask for, so clamping it to the widget deadline costs
         // nothing and an IPC request still lands immediately. It only ever
-        // shortens the wait — see `widget_wait`.
-        let tick = widget_wait(base, widget_engine.next_deadline(), Instant::now());
+        // shortens the wait — see `widget_wait`. The lock engine's own
+        // deadline (clock/battery while locked) is folded in the same way, so
+        // a locked session with an active clock still wakes on the minute.
+        let now0 = Instant::now();
+        let lock_deadline = lock_rt.engine.as_ref().and_then(|e| e.next_deadline(now0));
+        let deadline = min_instant(widget_engine.next_deadline(), lock_deadline);
+        let tick = widget_wait(base, deadline, now0);
         match commands.recv_timeout(tick) {
             Ok((req, reply)) => {
                 let is_stop = matches!(req, Request::Stop);
@@ -2041,6 +2610,12 @@ fn run_wayland_layershell() -> Result<()> {
                         // content itself (e.g. the lyric line) is unchanged.
                         apply_widget_config(&mut widget_engine, &config);
                         widget_engine.invalidate();
+                        lock_rt.on_apply(&config);
+                        // MPVPAPER_SHOW_ON_LOCK is read once at mpvpaper's own
+                        // startup, so a change here can only take effect
+                        // through a respawn — `WlOutput::set_show_on_lock`
+                        // reports exactly that below, per output.
+                        show_on_lock = wants_show_on_lock(&config, lock_rt.kind);
                         let paused = user_paused || battery_paused;
                         // A display plugged in after startup must be reachable
                         // without a daemon restart (interim until the native
@@ -2071,7 +2646,16 @@ fn run_wayland_layershell() -> Result<()> {
                                 let effective_ps = wp.effective_power_saving(config.power_saving);
                                 match (outputs.get_mut(&m.connector), has) {
                                     (Some(o), true) => {
-                                        o.apply_wallpaper(wp, config.scaling, effective_ps, paused)
+                                        o.apply_wallpaper(wp, config.scaling, effective_ps, paused);
+                                        // `apply_wallpaper` may already have
+                                        // respawned for an unrelated reason;
+                                        // a second one here only fires when
+                                        // the flag actually changed and the
+                                        // first respawn (if any) hasn't
+                                        // already carried the new value.
+                                        if o.set_show_on_lock(show_on_lock) {
+                                            o.respawn(paused, false);
+                                        }
                                     }
                                     (Some(_), false) => {
                                         outputs.remove(&m.connector);
@@ -2083,6 +2667,7 @@ fn run_wayland_layershell() -> Result<()> {
                                             config.scaling,
                                             effective_ps,
                                         );
+                                        o.set_show_on_lock(show_on_lock);
                                         o.respawn(paused, false);
                                         outputs.insert(m.connector.clone(), o);
                                     }
@@ -2091,6 +2676,16 @@ fn run_wayland_layershell() -> Result<()> {
                             }
                         } else {
                             outputs.clear(); // kills every mpvpaper
+                        }
+                        // Same "reply first, sync cosmic-bg after" trade-off
+                        // as the X11/GNOME-static paths would use, but this
+                        // loop already does the whole reconciliation above
+                        // inline before replying, so there is no separate
+                        // deferred slot to piggyback on here.
+                        if config.enabled {
+                            cosmic_bg::apply(&config);
+                        } else {
+                            cosmic_bg::restore();
                         }
                         Response::Ok
                     }
@@ -2102,16 +2697,54 @@ fn run_wayland_layershell() -> Result<()> {
                         user_paused = false;
                         Response::Ok
                     }
-                    Request::Status => Response::Status(wayland_status(
-                        &monitors,
-                        &outputs,
-                        user_paused || battery_paused,
-                    )),
+                    Request::Status => {
+                        let geoms = wayland_all_output_geoms(&monitors);
+                        let ctx = lock_rt.ctx(&config, &geoms);
+                        Response::Status(wayland_status(
+                            &monitors,
+                            &outputs,
+                            user_paused || battery_paused,
+                            lock_rt.status(&ctx, &config),
+                        ))
+                    }
                     Request::Update => {
                         notifier::run_updater_async();
                         Response::Ok
                     }
                     Request::Stop => Response::Ok,
+                    Request::Lock => {
+                        let geoms = wayland_all_output_geoms(&monitors);
+                        let ctx = lock_rt.ctx(&config, &geoms);
+                        lock_rt.lock(&ctx)
+                    }
+                    Request::LockPreview { width, height } => {
+                        let geoms = wayland_all_output_geoms(&monitors);
+                        let ctx = lock_rt.ctx(&config, &geoms);
+                        let np = widget_engine.now_playing();
+                        let theme = lock_widget_theme(&config);
+                        lock_rt.lock_preview(
+                            &ctx,
+                            &config.wallpaper,
+                            np.as_ref(),
+                            theme,
+                            width,
+                            height,
+                        )
+                    }
+                    Request::LockNotify { locked, sockets } => {
+                        lock_rt.lock_notify(locked, sockets, Instant::now());
+                        Response::Ok
+                    }
+                    Request::LockSetup => {
+                        let geoms = wayland_all_output_geoms(&monitors);
+                        let ctx = lock_rt.ctx(&config, &geoms);
+                        lock_rt.lock_setup(&ctx)
+                    }
+                    Request::LockUndo => {
+                        let geoms = wayland_all_output_geoms(&monitors);
+                        let ctx = lock_rt.ctx(&config, &geoms);
+                        lock_rt.lock_undo(&ctx)
+                    }
                 };
                 let _ = reply.send(resp);
                 if is_stop {
@@ -2130,6 +2763,89 @@ fn run_wayland_layershell() -> Result<()> {
             // throttles to roughly once a day via its marker file, so a
             // daemon that runs for days without a restart still checks in.
             crate::telemetry::heartbeat(Some("wayland"), None, Some(outputs.len() as u32));
+        }
+
+        // Lock screen: react to a lock/unlock transition before anything else
+        // this tick touches the desktop widgets or the players, so nothing
+        // desktop-only is ever pushed after the screen is believed locked.
+        if let Some(now_locked) = lock_rt.poll(now) {
+            if now_locked {
+                if let Some(resolved) = LockRuntime::resolved(&config) {
+                    let cleared = widget_engine.clear_for_lock(
+                        resolved
+                            .widgets
+                            .contains(&crate::lockscreen::LockWidget::Lyrics),
+                        resolved
+                            .widgets
+                            .contains(&crate::lockscreen::LockWidget::Visualizer),
+                    );
+                    dispatch_wayland_lock_updates(cleared, &outputs);
+                    widget_engine.set_lock_album_art(
+                        resolved
+                            .widgets
+                            .contains(&crate::lockscreen::LockWidget::AlbumArt),
+                    );
+                    let geoms = wayland_all_output_geoms(&monitors);
+                    let ctx = lock_rt.ctx(&config, &geoms);
+                    let theme = lock_widget_theme(&config);
+                    lock_rt.begin_lock(&resolved, &ctx, theme);
+                }
+            } else {
+                let cleared = lock_rt.end_lock();
+                dispatch_wayland_lock_updates(cleared, &outputs);
+                widget_engine.set_lock_album_art(false);
+                widget_engine.invalidate();
+                // Restore whatever the lock's own live-video/dim policy
+                // touched — `reconcile_pause`'s own change-gating (below,
+                // every tick) picks this up the moment `lock_rt.locked` is
+                // false, and this only needs to reset the dim, which has no
+                // equivalent "just reconcile it" path of its own.
+                if lock_dim_applied != 0 {
+                    lock_dim_applied = 0;
+                    for o in outputs.values() {
+                        if let Some(p) = o.player.as_ref() {
+                            p.set_brightness(0);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Advance the lock engine's own content (clock/battery/media) while
+        // locked. `Desktop` returns updates to dispatch here, exactly like
+        // the desktop widget engine; `Sockets`/`LayerFiles` do their own I/O
+        // and always return an empty `Vec`.
+        if lock_rt.locked {
+            if let Some(engine) = &mut lock_rt.engine {
+                // Geometry before the tick — same rule as the desktop widget
+                // engine's own `set_outputs`: a bitmap widget sizes and
+                // places itself during `tick`, so telling the engine about a
+                // mode change afterwards places the next frame against the
+                // stale one.
+                engine.set_outputs(&wayland_all_output_geoms(&monitors));
+                let np = widget_engine.now_playing();
+                let updates = engine.tick(np.as_ref());
+                dispatch_wayland_lock_updates(updates, &outputs);
+            }
+            // COSMIC's `Desktop` target only: the live-video/dim policy is a
+            // property of the desktop's own mpvpaper, so it is applied here
+            // directly rather than through `LockEngine` (which never touches
+            // a player handle at all — see its module docs). Change-gated,
+            // same discipline `reconcile_pause` already uses, so an unlocked
+            // tick with nothing to do costs one comparison.
+            if lock_rt.desktop_target {
+                if let Some(resolved) = LockRuntime::resolved(&config) {
+                    let want_dim = -((resolved.dim * 100.0).round() as i32);
+                    if want_dim != lock_dim_applied {
+                        lock_dim_applied = want_dim;
+                        for o in outputs.values() {
+                            if let Some(p) = o.player.as_ref() {
+                                p.set_brightness(want_dim);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Slideshow engine (shared with the X11 path via advance_slideshow).
@@ -2182,7 +2898,7 @@ fn run_wayland_layershell() -> Result<()> {
             }
 
             if config.pause_on_battery {
-                let discharging = on_battery();
+                let discharging = crate::battery::on_battery();
                 if discharging != battery_paused {
                     battery_paused = discharging;
                     log::info!("battery pause = {discharging}");
@@ -2297,16 +3013,24 @@ fn run_wayland_layershell() -> Result<()> {
         }
 
         // Refresh fullscreen state on a coarse cadence, then reconcile every
-        // output: paused = user || battery || fullscreen-on-this-output. This is
-        // the single place pause is applied (reconcile_pause is change-gated), so
-        // the three sources never fight over the player's pause property.
+        // output: paused = user || battery || fullscreen-on-this-output ||
+        // locked-and-the-lock-screen's-live-video-policy-says-no. This is the
+        // single place pause is applied (reconcile_pause is change-gated), so
+        // the four sources never fight over the player's pause property, and
+        // unlocking naturally resumes unless `user_paused`/`battery_paused`
+        // still apply — nothing here has to remember and restore a "previous"
+        // pause value by hand.
         if let Some(w) = fs_watch.as_mut() {
             if now.duration_since(last_fs_poll) >= FS_POLL {
                 last_fs_poll = now;
                 hidden = w.fullscreen_connectors();
             }
         }
-        let base_paused = user_paused || battery_paused;
+        let lock_forces_pause = lock_rt.locked
+            && lock_rt.desktop_target
+            && LockRuntime::resolved(&config)
+                .is_some_and(|r| !r.live_video.plays(crate::battery::on_battery()));
+        let base_paused = user_paused || battery_paused || lock_forces_pause;
         for (connector, o) in &outputs {
             o.reconcile_pause(base_paused || hidden.contains(connector));
         }
@@ -2319,11 +3043,19 @@ fn run_wayland_layershell() -> Result<()> {
         if generations != last_generations {
             last_generations = generations;
             widget_engine.invalidate();
+            // A respawned mpvpaper has no overlays for the lock engine's
+            // `Desktop` target either — same reasoning, same fix.
+            if let Some(engine) = &mut lock_rt.engine {
+                engine.invalidate();
+            }
         }
 
         // Widgets: only overlays whose content actually changed come back, so
-        // this is a cheap no-op on almost every pass.
-        if widget_engine.is_active() {
+        // this is a cheap no-op on almost every pass. Skipped while locked —
+        // see the X11 loop's `run` for why ticking the desktop engine here
+        // would undo `clear_for_lock`'s work the moment the clock (or disc)
+        // next becomes "due".
+        if widget_engine.is_active() && !lock_rt.locked {
             // Every display unless a connector is configured — see the X11
             // `push_widgets` note; the two backends must agree.
             let want = widget_engine.monitor().map(str::to_string);
@@ -2354,7 +3086,9 @@ fn run_wayland_layershell() -> Result<()> {
         }
     }
 
+    lock_rt.end_lock(); // drop the engine and any LayerFiles/socket state
     outputs.clear(); // kill every mpvpaper before we exit
+    cosmic_bg::restore();
     std::fs::remove_file(crate::ipc::socket_path()).ok();
     log::info!("frescod stopped");
     Ok(())
@@ -2389,9 +3123,45 @@ fn wayland_output_geoms(
                 connector: c.clone(),
                 w,
                 h,
+                scale_milli: 1000,
             }
         })
         .collect()
+}
+
+/// Every currently known output, for [`HostCtx::outputs`] — unlike
+/// [`wayland_output_geoms`], not filtered to a widget's own target list or
+/// looked up against a live OSD size (`HostCtx` only needs geometry, not
+/// exact render-surface pixels).
+fn wayland_all_output_geoms(monitors: &[Monitor]) -> Vec<widgets::OutputGeom> {
+    monitors
+        .iter()
+        .map(|m| widgets::OutputGeom {
+            connector: m.connector.clone(),
+            w: u32::from(m.width),
+            h: u32::from(m.height),
+            scale_milli: m.scale_milli,
+        })
+        .collect()
+}
+
+/// Dispatch a batch of lock-engine `WidgetUpdate`s to whichever mpvpaper
+/// processes are still up — the Wayland twin of the X11 loop's
+/// `Daemon::dispatch_widget_updates`.
+fn dispatch_wayland_lock_updates(
+    updates: Vec<widgets::WidgetUpdate>,
+    outputs: &std::collections::BTreeMap<String, WlOutput>,
+) {
+    for u in &updates {
+        for (c, o) in outputs {
+            if !u.is_for(c) {
+                continue;
+            }
+            if let Some(p) = o.player.as_ref() {
+                dispatch_widget(p, u);
+            }
+        }
+    }
 }
 
 /// Blank every widget overlay on every mpvpaper that is still up.
@@ -2481,6 +3251,12 @@ struct WlOutput {
     scaling: Scaling,
     /// Effective power-saving level for this output; applied at spawn.
     power_saving: PowerSaving,
+    /// Whether the next (re)spawn should ask mpvpaper to mark its surface
+    /// show-on-lock — see [`WaylandPlayer::spawn`]'s doc comment. `false`
+    /// until [`WlOutput::set_show_on_lock`] says otherwise; read only at
+    /// spawn time, since it becomes an environment variable on the child
+    /// process and cannot be changed on an already-running one.
+    show_on_lock: bool,
     player: Option<PlayerHandle>,
     slideshow: Option<Slideshow>,
     /// This output's transition. Per output, never shared: outputs run
@@ -2607,6 +3383,7 @@ impl WlOutput {
             wallpaper,
             scaling,
             power_saving,
+            show_on_lock: false,
             player: None,
             slideshow: None,
             restarts: 0,
@@ -2659,6 +3436,19 @@ impl WlOutput {
         candidates.into_iter().find(|p| p.exists())
     }
 
+    /// Set whether the next (re)spawn should mark mpvpaper's surface
+    /// show-on-lock. Returns `true` when this actually changed the flag — the
+    /// caller must force a respawn in that case (see the field's doc
+    /// comment); returning `false` when it didn't means an in-place
+    /// `loadfile`-only update (or no update at all) is still fine.
+    fn set_show_on_lock(&mut self, v: bool) -> bool {
+        if self.show_on_lock == v {
+            return false;
+        }
+        self.show_on_lock = v;
+        true
+    }
+
     /// (Re)spawn the mpvpaper for this output. `paused` applies the current pause
     /// state; `static_frame` spawns then pauses (holds frame one) — the no-black
     /// per-output fallback when live playback keeps failing.
@@ -2693,6 +3483,7 @@ impl WlOutput {
             self.scaling,
             self.power_saving,
             &file,
+            self.show_on_lock,
         ) {
             Ok(p) => {
                 let handle = PlayerHandle::Wayland(p);
@@ -3263,6 +4054,7 @@ fn wayland_status(
     monitors: &[Monitor],
     outputs: &std::collections::BTreeMap<String, WlOutput>,
     paused: bool,
+    lockscreen: LockStatus,
 ) -> StatusReply {
     let child_pids: Vec<u32> = outputs
         .values()
@@ -3311,6 +4103,7 @@ fn wayland_status(
         dropped_frames: video.map(|(_, _, _, n)| n),
         monitors_info: monitors_info_from(monitors),
         gave_up,
+        lockscreen: Some(lockscreen),
     }
 }
 
@@ -3490,6 +4283,16 @@ fn which(bin: &str) -> bool {
 /// The floor is a spin guard: `next_deadline` reports "now" for a widget that
 /// is due, and a due widget is pushed by the very next `tick()`, but a zero
 /// wait on a widget that somehow stayed due would be a busy loop.
+/// The earlier of two optional deadlines — `None` only when both are.
+fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 fn widget_wait(base: Duration, deadline: Option<Instant>, now: Instant) -> Duration {
     match deadline {
         Some(d) => base
@@ -3584,6 +4387,31 @@ fn widget_anchor(a: crate::config::LyricAnchor) -> crate::lyrics::Anchor {
         C::BottomCenter => A::BottomCenter,
         C::BottomRight => A::BottomRight,
     }
+}
+
+/// Whether the Wayland layer-shell loop should spawn mpvpaper with
+/// `MPVPAPER_SHOW_ON_LOCK=1` — see [`WaylandPlayer::spawn`]'s doc comment.
+/// Only meaningful for `HostKind::Cosmic { live: true }`, and gated behind
+/// the user's own opt-in besides (`[lockscreen].enabled`): unpatched mpvpaper
+/// ignores the env var either way, so the only cost of this being `true` on
+/// a host/mpvpaper build that doesn't understand it is one inert environment
+/// variable on the child process.
+fn wants_show_on_lock(config: &Config, host: HostKind) -> bool {
+    config.lockscreen.as_ref().is_some_and(|l| l.enabled)
+        && matches!(host, HostKind::Cosmic { live: true })
+}
+
+/// The palette the lock engine/preview should draw in for `config` — the
+/// exact same rule the desktop widget engine's own
+/// [`apply_widget_config`]/[`widgets::WidgetEngine::set_config`] use, pulled
+/// out so `LockRuntime::lock_preview` and `LockRuntime::begin_lock`'s callers
+/// (all three run loops) can never pick a different one for the same config.
+fn lock_widget_theme(config: &Config) -> crate::widgetkit::Theme {
+    let theme_cfg = config
+        .widgets
+        .as_ref()
+        .map_or_else(crate::config::WidgetTheme::default, |w| w.theme);
+    crate::widgetkit::Theme::for_accent(widgets::widget_mode(theme_cfg), config.accent)
 }
 
 /// Push every widget setting from `config` into `engine`, in one place so the

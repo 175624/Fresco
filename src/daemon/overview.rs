@@ -258,7 +258,12 @@ pub fn restore() {
 
 /// Produce a full-size still PNG for the active wallpaper. Uses a fresh
 /// timestamped filename each call so GNOME reliably reloads the new image.
-fn render_still(w: &Wallpaper) -> Option<PathBuf> {
+///
+/// `pub(super)`, not private: `daemon::cosmic_bg` reuses this exact rendering
+/// (COSMIC's lock screen has the same "can't see the live wallpaper" problem
+/// GNOME's overview/lock screen has — see that module's doc comment) rather
+/// than duplicating the ffmpeg/ffmpegthumbnailer logic. No behavior change.
+pub(super) fn render_still(w: &Wallpaper) -> Option<PathBuf> {
     let src = match w.kind {
         Kind::Slideshow => {
             let s = w.slideshow.as_ref()?;

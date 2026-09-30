@@ -151,6 +151,7 @@ mod tests {
             y,
             width: w,
             height: h,
+            scale_milli: 1000,
         }
     }
 

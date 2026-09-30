@@ -25,6 +25,11 @@ optdepends=(
   'libpulse: system-audio capture fallback for the audio visualiser (parec)'
   'ffmpeg: rotated thumbnails and library media metadata (ffprobe)'
   'xdg-utils: opening help and tutorial links in your browser'
+  # Lock-screen aesthetics (docs/plan-lock-screen.md): each host's own locker,
+  # needed by exactly one of them, so none of these are hard dependencies.
+  'xsecurelock: X11 lock screen with the live wallpaper and widgets (fresco lock)'
+  'swaylock-plugin: wlroots lock screen with the live wallpaper and widgets (fresco lock)'
+  'qt6-multimedia: video playback in the KDE Plasma lock-screen wallpaper'
 )
 source=("$url/releases/download/v$pkgver/fresco_${pkgver}-1_amd64.deb")
 sha256sums=('SKIP')  # pin per release: curl -L <asset-url> | sha256sum
@@ -42,6 +47,10 @@ package() {
   fi
   # The .deb already ships the hicolor fixed-size PNG icons (48–512px) plus the
   # scalable SVG, so extracting data.tar above installs them — nothing extra.
+  # Same for the lock-screen aesthetics files (usr/lib/fresco/saver_fresco,
+  # usr/share/applications/screensavers/fresco.desktop, and the KDE Plasma
+  # wallpaper plugin under usr/share/plasma/wallpapers/ and usr/share/fresco/) —
+  # see Cargo.toml's [package.metadata.deb] assets, which data.tar mirrors.
   # Debian's libmpv soname differs from Arch's; the app dlopens libmpv.so.2
   # then .so.1 then .so, and Arch's mpv package provides libmpv.so.2 — fine.
   install -Dm644 "$pkgdir/usr/share/doc/fresco/copyright" \

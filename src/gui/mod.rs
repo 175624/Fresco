@@ -3,6 +3,7 @@ mod daemon_ctl;
 mod gallery;
 mod hover_preview;
 mod library;
+mod lockscreen;
 mod preview;
 mod status;
 mod theme;
