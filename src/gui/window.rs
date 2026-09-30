@@ -580,6 +580,7 @@ fn build_library_view(
     menu_btn.set_popover(Some(&build_menu_popover(window, state.clone())));
     header.pack_end(&menu_btn);
     root.append(&header);
+    root.append(&service_notice(&state));
 
     // ── "What's new" banner (shown once per version after an update) ──
     if let Some(banner) = super::updates::build_update_banner(window, state.clone()) {
@@ -3153,6 +3154,14 @@ fn stop_wallpaper(state: &Rc<RefCell<AppState>>) {
         s.config.monitors.clear();
         s.config.save().ok();
     }
+    // Stop takes the daemon down, and the scheduler with it; say so instead of
+    // letting a configured schedule silently stop switching.
+    if schedule_active(&state.borrow().config) {
+        show_toast(
+            state,
+            t!("The day/night schedule won't switch until you start Fresco again"),
+        );
+    }
     // Fire-and-forget, like the status pill's pause/resume: config already
     // says "off" on disk and callers already update the UI optimistically
     // (toast + refresh), so there's nothing worth blocking the GTK thread on
@@ -5432,22 +5441,61 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
             enable.set_selected(1);
             day_time.set_text(&sch.day_start);
             night_time.set_text(&sch.night_start);
-            let find = |w: Option<&crate::config::Wallpaper>| -> u32 {
-                w.and_then(|w| w.path.as_ref())
-                    .and_then(|p| {
-                        candidates
-                            .iter()
-                            .position(|(i, _)| st.entries[*i].path.as_deref() == Some(p.as_path()))
-                    })
-                    .map(|i| i as u32)
-                    .unwrap_or(0)
+            // A stored wallpaper that left the library must show as unselected,
+            // not as the first library item: the next edit would otherwise
+            // save that stranger over the user's schedule.
+            let find = |w: Option<&crate::config::Wallpaper>| -> Option<u32> {
+                let p = w.and_then(|w| w.path.as_deref())?;
+                crate::schedule::library_position(
+                    candidates
+                        .iter()
+                        .map(|(i, _)| st.entries[*i].path.as_deref()),
+                    p,
+                )
+                .map(|i| i as u32)
             };
-            day_row.set_selected(find(sch.day.as_ref()));
-            night_row.set_selected(find(sch.night.as_ref()));
+            for (row, w) in [
+                (&day_row, sch.day.as_ref()),
+                (&night_row, sch.night.as_ref()),
+            ] {
+                match find(w) {
+                    Some(i) => row.set_selected(i),
+                    None => {
+                        row.set_selected(gtk4::INVALID_LIST_POSITION);
+                        row.set_subtitle(t!("No longer in your library — pick another wallpaper"));
+                    }
+                }
+            }
         } else {
             day_time.set_text("07:00");
             night_time.set_text("19:00");
         }
+    }
+
+    // "Service not running" warning + the "Next switch" hint (see below).
+    let service_row = ServiceRow::new(state.clone());
+    let refresh_hint: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let enable = enable.clone();
+        let candidates = candidates.clone();
+        Rc::new(move || enable.set_subtitle(&next_switch_subtitle(&state, &candidates)))
+    };
+    refresh_hint();
+    // Once a minute the hint's time may pass; stop when the dialog closes.
+    {
+        let tick = refresh_hint.clone();
+        let id = Rc::new(RefCell::new(Some(glib::timeout_add_seconds_local(
+            60,
+            move || {
+                tick();
+                glib::ControlFlow::Continue
+            },
+        ))));
+        enable.connect_unmap(move |_| {
+            if let Some(id) = id.borrow_mut().take() {
+                id.remove();
+            }
+        });
     }
 
     let write = {
@@ -5458,8 +5506,23 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
         let day_time = day_time.clone();
         let night_time = night_time.clone();
         let candidates = candidates.clone();
+        let service_row = service_row.clone();
+        let refresh_hint = refresh_hint.clone();
         move || {
             let on = enable.selected() == 1;
+            // A fresh pick replaces the "no longer in your library" note.
+            for row in [&day_row, &night_row] {
+                if row.selected() != gtk4::INVALID_LIST_POSITION {
+                    row.set_subtitle("");
+                }
+            }
+            for e in [&day_time, &night_time] {
+                if on && crate::schedule::parse_hhmm(&e.text()).is_none() {
+                    e.add_css_class("error");
+                } else {
+                    e.remove_css_class("error");
+                }
+            }
             let config = {
                 let mut s = state.borrow_mut();
                 if !on {
@@ -5476,13 +5539,22 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
                     {
                         return; // incomplete/invalid times — wait for a valid edit
                     }
-                    let pick = |row: &adw::ComboRow| -> Option<crate::config::Wallpaper> {
+                    // An unselected combo (stored wallpaper left the library)
+                    // keeps what is stored rather than being overwritten.
+                    let pick = |row: &adw::ComboRow,
+                                stored: Option<&crate::config::Wallpaper>|
+                     -> Option<crate::config::Wallpaper> {
                         candidates
                             .get(row.selected() as usize)
                             .and_then(|(i, _)| s.entries.get(*i))
                             .map(|e| e.to_wallpaper())
+                            .or_else(|| stored.cloned())
                     };
-                    let (Some(day), Some(night)) = (pick(&day_row), pick(&night_row)) else {
+                    let old = s.config.schedule.as_ref();
+                    let (Some(day), Some(night)) = (
+                        pick(&day_row, old.and_then(|o| o.day.as_ref())),
+                        pick(&night_row, old.and_then(|o| o.night.as_ref())),
+                    ) else {
                         return;
                     };
                     s.config.schedule = Some(crate::config::Schedule {
@@ -5500,8 +5572,23 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
                     Some(s.config.clone())
                 }
             };
+            refresh_hint();
+            service_row.refresh();
             if let Some(config) = config {
-                daemon_ctl::apply_async(&config, |_| {});
+                let state = state.clone();
+                let service_row = service_row.clone();
+                daemon_ctl::apply_async(&config, move |outcome| {
+                    if !outcome.superseded {
+                        if let Err(e) = outcome.result {
+                            log::error!("failed to apply the day/night schedule: {e}");
+                            show_toast(
+                                &state,
+                                t!("Couldn’t apply the schedule. Check ~/.local/state/fresco/frescod.log"),
+                            );
+                        }
+                    }
+                    service_row.refresh();
+                });
             }
         }
     };
@@ -5517,12 +5604,137 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
     let w = write;
     night_time.connect_changed(move |_| w());
 
+    group.add(&service_row.row);
     group.add(&enable);
     group.add(&day_row);
     group.add(&night_row);
     group.add(&day_time_row);
     group.add(&night_time_row);
     page.add(&group);
+    service_row.refresh();
+}
+
+/// Whether a schedule exists and is live (enabled and not paused).
+fn schedule_active(config: &Config) -> bool {
+    config.schedule.is_some() && !config.schedule_paused
+}
+
+/// "Next switch at HH:MM: name" for the Day/night row, or empty when there is
+/// nothing to switch to (no schedule, paused, or unusable times).
+fn next_switch_subtitle(state: &Rc<RefCell<AppState>>, candidates: &[(usize, String)]) -> String {
+    use chrono::Offset as _;
+    let s = state.borrow();
+    let Some(sch) = s
+        .config
+        .schedule
+        .as_ref()
+        .filter(|_| schedule_active(&s.config))
+    else {
+        return String::new();
+    };
+    let now = chrono::Local::now();
+    let off = now.offset().fix().local_minus_utc() / 60;
+    let Some((at, w)) = crate::schedule::next_switch(sch, now.naive_local(), off) else {
+        return String::new();
+    };
+    let name = candidates
+        .iter()
+        .find(|(i, _)| s.entries[*i].path.as_deref() == w.path.as_deref())
+        .map(|(_, n)| n.clone())
+        .or_else(|| {
+            w.path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    crate::schedule::next_switch_hint(at, &name)
+}
+
+/// Start the background service on the user's request (the "Start" buttons):
+/// enable, point the wallpaper at what the schedule wants now, and apply —
+/// `apply_blocking` spawns the daemon when it is down. Toasts the outcome and
+/// then calls `done` so the caller can re-check liveness.
+fn start_schedule_service(state: &Rc<RefCell<AppState>>, done: impl FnOnce() + 'static) {
+    let config = {
+        let mut s = state.borrow_mut();
+        s.config.enabled = true;
+        sync_wallpaper_to_schedule(&mut s.config);
+        s.config.save().ok();
+        s.config.clone()
+    };
+    let state = state.clone();
+    daemon_ctl::apply_async(&config, move |outcome| {
+        if !outcome.superseded {
+            match outcome.result {
+                Ok(()) => show_toast(&state, t!("Fresco’s background service started")),
+                Err(e) => {
+                    log::error!("failed to start the background service: {e}");
+                    show_toast(
+                        &state,
+                        t!("Couldn’t start the background service. Check ~/.local/state/fresco/frescod.log"),
+                    );
+                }
+            }
+        }
+        done();
+    });
+}
+
+/// The main window's dismissible "service not running" notice (hooked into
+/// the status poll in status.rs).
+fn service_notice(state: &Rc<RefCell<AppState>>) -> gtk4::Widget {
+    let active: Rc<dyn Fn() -> bool> = {
+        let state = state.clone();
+        Rc::new(move || schedule_active(&state.borrow().config))
+    };
+    let start: Rc<dyn Fn()> = {
+        let state = state.clone();
+        Rc::new(move || start_schedule_service(&state, super::status::refresh_service_notice))
+    };
+    super::status::build_service_notice(active, start)
+}
+
+/// Warning row for the Advanced Day/Night group: shown while a live schedule
+/// has no running daemon to act on it. Liveness is probed off the GTK thread.
+#[derive(Clone)]
+struct ServiceRow {
+    row: adw::ActionRow,
+    state: Rc<RefCell<AppState>>,
+}
+
+impl ServiceRow {
+    fn new(state: Rc<RefCell<AppState>>) -> Self {
+        let row = adw::ActionRow::new();
+        row.set_title(t!(
+            "Fresco's background service isn't running, so the schedule can't switch wallpapers."
+        ));
+        row.set_title_lines(3);
+        row.add_prefix(&gtk4::Image::from_icon_name("dialog-warning-symbolic"));
+        let start = gtk4::Button::with_label(t!("Start"));
+        start.set_valign(gtk4::Align::Center);
+        row.add_suffix(&start);
+        row.set_visible(false);
+        let this = Self { row, state };
+        {
+            let this = this.clone();
+            start.connect_clicked(move |_| {
+                let again = this.clone();
+                start_schedule_service(&this.state, move || again.refresh());
+            });
+        }
+        this
+    }
+
+    fn refresh(&self) {
+        if !schedule_active(&self.state.borrow().config) {
+            self.row.set_visible(false);
+            return;
+        }
+        let row = self.row.clone();
+        super::status::probe_daemon(move |alive| row.set_visible(!alive));
+        super::status::refresh_service_notice();
+    }
 }
 
 /// Point `config.wallpaper` at whatever the schedule wants RIGHT NOW, so
