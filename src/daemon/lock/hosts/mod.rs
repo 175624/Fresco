@@ -392,6 +392,45 @@ impl LockHost for CosmicHost {
     }
 }
 
+/// What Fresco can put on a host's lock screen — the source of the
+/// `Live video` / `Widgets` / `Still frame` tags the settings page shows
+/// ([`crate::ipc::LockStatus`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockCaps {
+    /// The wallpaper keeps playing as video behind the lock screen.
+    pub live_video: bool,
+    /// Fresco's own widgets are drawn on the lock screen.
+    pub widgets: bool,
+    /// At least a still frame of the wallpaper is what the lock screen shows.
+    /// True wherever `live_video` is, since those hosts fall back to a still
+    /// on battery; the point of the flag is the hosts where it is *all* there
+    /// is.
+    pub still_frame: bool,
+}
+
+/// The capability matrix, per host. Live video and widgets need a real
+/// surface to draw on — see `docs/plan-lock-screen.md` §4: COSMIC needs the
+/// show-on-lock layer specifically (not just "is COSMIC"). The still-frame
+/// hosts are the ones where a daemon module hands the desktop's own locker a
+/// picture: `cosmic_bg` (COSMIC), `overview` (GNOME), `cinnamon_bg`/`overview`
+/// (Cinnamon) and `dde_lock` (Deepin). MATE and Xfce are not listed: nothing
+/// in Fresco sets what their lockers show.
+pub fn capabilities(kind: HostKind) -> LockCaps {
+    let live = matches!(
+        kind,
+        HostKind::Cosmic { live: true } | HostKind::Wlroots | HostKind::X11Wm | HostKind::Kde
+    );
+    LockCaps {
+        live_video: live,
+        widgets: live,
+        still_frame: live
+            || matches!(
+                kind,
+                HostKind::Cosmic { .. } | HostKind::Gnome | HostKind::Cinnamon | HostKind::Deepin
+            ),
+    }
+}
+
 /// Construct the [`LockHost`] for an already-[`classify`]d [`HostKind`].
 pub fn host_for(kind: HostKind) -> Box<dyn LockHost> {
     match kind {
@@ -670,5 +709,37 @@ mod tests {
             host_for(HostKind::Kde).targets_while_locked(&c),
             LockTargets::LayerFiles(PathBuf::from("/run/user/1000/fresco/lock"))
         );
+    }
+
+    #[test]
+    fn capabilities_matrix_per_host() {
+        let caps = |live_video, widgets, still_frame| LockCaps {
+            live_video,
+            widgets,
+            still_frame,
+        };
+        // Live hosts: everything, a still included.
+        for kind in [
+            HostKind::Cosmic { live: true },
+            HostKind::Kde,
+            HostKind::Wlroots,
+            HostKind::X11Wm,
+        ] {
+            assert_eq!(capabilities(kind), caps(true, true, true), "{kind:?}");
+        }
+        // Still-frame hosts: a daemon module hands their locker a picture.
+        // Deepin is one since issue #37 (`dde_lock`).
+        for kind in [
+            HostKind::Cosmic { live: false },
+            HostKind::Gnome,
+            HostKind::Cinnamon,
+            HostKind::Deepin,
+        ] {
+            assert_eq!(capabilities(kind), caps(false, false, true), "{kind:?}");
+        }
+        // Nothing sets what these lockers show.
+        for kind in [HostKind::Mate, HostKind::Xfce, HostKind::Unsupported] {
+            assert_eq!(capabilities(kind), caps(false, false, false), "{kind:?}");
+        }
     }
 }

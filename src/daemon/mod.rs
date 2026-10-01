@@ -6,6 +6,7 @@ pub mod cinnamon_bg;
 mod control;
 mod cosmic_bg;
 mod dde;
+mod dde_lock;
 mod fullscreen;
 mod lock;
 mod signals;
@@ -416,19 +417,16 @@ impl LockRuntime {
     /// `StatusReply.lockscreen`.
     fn status(&self, ctx: &HostCtx, config: &Config) -> LockStatus {
         // Live video and Fresco's own widgets are available only where a
-        // real surface exists to draw them on today — see
-        // `docs/plan-lock-screen.md` §4: COSMIC needs the show-on-lock layer
-        // specifically (not just "is COSMIC"), and GNOME/Cinnamon/MATE/Xfce/
-        // Deepin are still-frame-only until later waves.
-        let capable = matches!(
-            self.kind,
-            HostKind::Cosmic { live: true } | HostKind::Wlroots | HostKind::X11Wm | HostKind::Kde
-        );
+        // real surface exists to draw them on today; GNOME/Cinnamon/Deepin
+        // (and COSMIC without show-on-lock) get a still frame. The matrix
+        // lives in `lock::hosts::capabilities`.
+        let caps = lock::hosts::capabilities(self.kind);
         LockStatus {
             enabled: config.lockscreen.as_ref().is_some_and(|l| l.enabled),
             host: self.kind.id().to_string(),
-            live_video: capable,
-            widgets: capable,
+            live_video: caps.live_video,
+            widgets: caps.widgets,
+            still_frame: caps.still_frame,
             locked: self.locked,
             setup: self.host.setup_state(ctx),
             notes: self.host.notes(ctx),
@@ -1285,6 +1283,7 @@ impl Daemon {
         }
         overview::apply(&self.config.wallpaper);
         cosmic_bg::apply(&self.config);
+        dde_lock::apply(&self.config);
         log::info!("frescod started with {} renderer(s)", self.renderers.len());
         crate::telemetry::heartbeat(
             Some("x11"),
@@ -1307,6 +1306,7 @@ impl Daemon {
                 if std::mem::take(&mut self.overview_pending) {
                     overview::apply(&self.config.wallpaper);
                     cosmic_bg::apply(&self.config);
+                    dde_lock::apply(&self.config);
                 }
                 if is_stop {
                     self.shutdown();
@@ -1744,6 +1744,7 @@ impl Daemon {
         self.sched.applied = Some(path);
         overview::apply(&self.config.wallpaper);
         cosmic_bg::apply(&self.config);
+        dde_lock::apply(&self.config);
     }
 
     /// Re-seat clones of the same video on one clock (see SYNC_INTERVAL): the
@@ -1928,6 +1929,7 @@ impl Daemon {
         self.lock.end_lock(); // drop the engine and any LayerFiles/socket state
         overview::restore();
         cosmic_bg::restore();
+        dde_lock::restore();
         // MATE: stop copying Caja's icons (closing the thread's connection
         // undoes the redirect, so Caja renders on screen again), then swap the
         // key colour back for the user's own background. After
@@ -2301,6 +2303,8 @@ fn run_x11() -> Result<()> {
         // our static frame as the background — put the user's original back.
         overview::restore();
         cosmic_bg::restore();
+        // And the Deepin lock-screen background (no-op off Deepin).
+        dde_lock::restore();
         // Same for DDE: a crashed run may have left the transparent wallpaper
         // applied with the original saved on disk — restore it (no-op
         // otherwise).
@@ -2506,6 +2510,7 @@ fn run_wayland_layershell() -> Result<()> {
         // Safety net, same as `run_x11`'s: a prior run killed rather than
         // Stopped may have left cosmic-bg pointed at our still frame.
         cosmic_bg::restore();
+        dde_lock::restore();
         log::info!("wallpaper disabled (enabled=false) — exiting");
         return Ok(());
     }
@@ -2614,6 +2619,10 @@ fn run_wayland_layershell() -> Result<()> {
     // "can't see the live wallpaper" problem GNOME's overview has — see
     // `cosmic_bg`'s module doc. No-op on every other layer-shell compositor.
     cosmic_bg::apply(&config);
+    // Deepin (Treeland) only, and only with the lock feature on: its lock
+    // screen draws the user's greeter background, not our surface — see
+    // `dde_lock`'s module doc. No-op on every other compositor.
+    dde_lock::apply(&config);
     log::info!(
         "frescod started (Wayland layer-shell / mpvpaper, {} output(s))",
         outputs.len()
@@ -2730,8 +2739,10 @@ fn run_wayland_layershell() -> Result<()> {
                         // deferred slot to piggyback on here.
                         if config.enabled {
                             cosmic_bg::apply(&config);
+                            dde_lock::apply(&config);
                         } else {
                             cosmic_bg::restore();
+                            dde_lock::restore();
                         }
                         Response::Ok
                     }
@@ -3135,6 +3146,7 @@ fn run_wayland_layershell() -> Result<()> {
     lock_rt.end_lock(); // drop the engine and any LayerFiles/socket state
     outputs.clear(); // kill every mpvpaper before we exit
     cosmic_bg::restore();
+    dde_lock::restore();
     std::fs::remove_file(crate::ipc::socket_path()).ok();
     log::info!("frescod stopped");
     Ok(())

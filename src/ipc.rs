@@ -108,10 +108,17 @@ pub struct LockStatus {
     /// `"unsupported"`. See `daemon::lock::hosts::HostKind::id`.
     pub host: String,
     /// Whether this host can show the wallpaper as live video while locked
-    /// — false means still-frame only (GNOME, Cinnamon, MATE, Xfce, Deepin).
+    /// — false means no live surface (GNOME, Cinnamon, MATE, Xfce, Deepin);
+    /// [`LockStatus::still_frame`] says whether a still is shown instead.
     pub live_video: bool,
     /// Whether this host can show Fresco's own widgets while locked.
     pub widgets: bool,
+    /// Whether the lock screen shows (at least) a still frame of the
+    /// wallpaper — what the hosts with neither of the above get. Deepin
+    /// since issue #37. `#[serde(default)]` so a reply from an older daemon
+    /// reads as `false` rather than failing to parse.
+    #[serde(default)]
+    pub still_frame: bool,
     /// Whether the session is locked right now.
     pub locked: bool,
     pub setup: LockSetupState,
@@ -571,14 +578,24 @@ mod tests {
             host: "cosmic".into(),
             live_video: true,
             widgets: true,
+            still_frame: true,
             locked: false,
             setup: LockSetupState::NotNeeded,
             notes: vec!["cosmic-greeter's own panel stays put for now".into()],
         };
         assert_eq!(
             serde_json::to_string(&status).unwrap(),
-            r#"{"enabled":true,"host":"cosmic","live_video":true,"widgets":true,"locked":false,"setup":"notneeded","notes":["cosmic-greeter's own panel stays put for now"]}"#
+            r#"{"enabled":true,"host":"cosmic","live_video":true,"widgets":true,"still_frame":true,"locked":false,"setup":"notneeded","notes":["cosmic-greeter's own panel stays put for now"]}"#
         );
+    }
+
+    /// A status from a daemon that predates `still_frame` still parses, and
+    /// reads as "no still frame" rather than guessing.
+    #[test]
+    fn lock_status_without_still_frame_parses_as_false() {
+        let old = r#"{"enabled":true,"host":"deepin","live_video":false,"widgets":false,"locked":false,"setup":"notneeded","notes":[]}"#;
+        let status: LockStatus = serde_json::from_str(old).unwrap();
+        assert!(!status.still_frame);
     }
 
     // -- lock screen: round-trips -------------------------------------------
@@ -648,6 +665,7 @@ mod tests {
                 host: "wlroots".into(),
                 live_video: false,
                 widgets: false,
+                still_frame: false,
                 locked: true,
                 setup: LockSetupState::Unavailable,
                 notes: Vec::new(),

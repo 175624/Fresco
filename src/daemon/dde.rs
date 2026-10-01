@@ -119,7 +119,7 @@ fn solid_png(side: u32, rgb: [u8; 3]) -> Vec<u8> {
 
 /// (dest, object path, interface) for DDE's session Appearance service.
 /// Deepin 25 first, then the legacy pre-25 names.
-const SERVICES: [(&str, &str, &str); 2] = [
+pub(super) const SERVICES: [(&str, &str, &str); 2] = [
     (
         "org.deepin.dde.Appearance1",
         "/org/deepin/dde/Appearance1",
@@ -174,7 +174,7 @@ pub struct SavedWallpapers {
     pub monitors: BTreeMap<String, String>,
 }
 
-fn state_dir() -> PathBuf {
+pub(super) fn state_dir() -> PathBuf {
     dirs::state_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(std::env::temp_dir)
@@ -209,10 +209,34 @@ fn key_uri() -> Option<String> {
     Some(format!("file://{}", path.display()))
 }
 
-/// Run `gdbus call --session` and return stdout on success.
-fn gdbus_call(dest: &str, path: &str, iface_method: &str, args: &[&str]) -> Option<String> {
+/// Which D-Bus daemon a `gdbus` call goes to. DDE's Appearance service is on
+/// the session bus; its Accounts service — the store of record for the lock
+/// screen's background, see `dde_lock` — is on the system bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Bus {
+    Session,
+    System,
+}
+
+/// Run `gdbus call` on `bus` and return stdout on success. `timeout` is
+/// gdbus's own `--timeout` in seconds; `None` keeps its 25 s default.
+fn gdbus_run(
+    bus: Bus,
+    timeout: Option<u32>,
+    dest: &str,
+    path: &str,
+    iface_method: &str,
+    args: &[&str],
+) -> Option<String> {
     let mut cmd = Command::new("gdbus");
-    cmd.args(["call", "--session", "--dest", dest, "--object-path", path])
+    cmd.arg("call").arg(match bus {
+        Bus::Session => "--session",
+        Bus::System => "--system",
+    });
+    if let Some(secs) = timeout {
+        cmd.args(["--timeout", &secs.to_string()]);
+    }
+    cmd.args(["--dest", dest, "--object-path", path])
         .args(["--method", iface_method])
         .args(args);
     let out = cmd.output().ok()?;
@@ -222,16 +246,57 @@ fn gdbus_call(dest: &str, path: &str, iface_method: &str, args: &[&str]) -> Opti
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run `gdbus call --session` and return stdout on success.
+fn gdbus_call(dest: &str, path: &str, iface_method: &str, args: &[&str]) -> Option<String> {
+    gdbus_run(Bus::Session, None, dest, path, iface_method, args)
+}
+
+/// Bound for [`gdbus_call_on`].
+const GDBUS_TIMEOUT_SECS: u32 = 5;
+
+/// [`gdbus_call`] on either bus, with a bounded wait: for callers that run on
+/// the daemon's main loop and must not sit out gdbus's 25 s default when a
+/// service is wedged.
+pub(super) fn gdbus_call_on(
+    bus: Bus,
+    dest: &str,
+    path: &str,
+    iface_method: &str,
+    args: &[&str],
+) -> Option<String> {
+    gdbus_run(
+        bus,
+        Some(GDBUS_TIMEOUT_SECS),
+        dest,
+        path,
+        iface_method,
+        args,
+    )
+}
+
 /// Leniently pull the first single- or double-quoted string out of gdbus
-/// output like `('file:///usr/share/wallpapers/a.jpg',)`.
-fn parse_first_string(out: &str) -> Option<String> {
+/// output like `('file:///usr/share/wallpapers/a.jpg',)` or, for a property
+/// read, `(<'file:///a.jpg'>,)`. Backslash escapes inside the string are
+/// undone, the way GVariant's text format writes them.
+pub(super) fn parse_first_string(out: &str) -> Option<String> {
     let out = out.trim();
     let (open, rest) = out
         .char_indices()
         .find(|&(_, c)| c == '\'' || c == '"')
         .map(|(i, c)| (c, &out[i + 1..]))?;
-    let end = rest.find(open)?;
-    Some(rest[..end].to_string())
+    let mut value = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            c if c == open => return Some(value),
+            '\\' => match chars.next()? {
+                'n' => value.push('\n'),
+                't' => value.push('\t'),
+                other => value.push(other),
+            },
+            c => value.push(c),
+        }
+    }
 }
 
 /// Ask DDE for the current wallpaper of `monitor`, trying each service.
@@ -1079,6 +1144,23 @@ mod tests {
         );
         assert_eq!(parse_first_string("()"), None);
         assert_eq!(parse_first_string(""), None);
+    }
+
+    #[test]
+    fn parses_property_variant_output_and_undoes_escapes() {
+        // `org.freedesktop.DBus.Properties.Get` wraps the value in a variant.
+        assert_eq!(
+            parse_first_string("(<'file:///usr/share/backgrounds/a.jpg'>,)\n"),
+            Some("file:///usr/share/backgrounds/a.jpg".to_string())
+        );
+        assert_eq!(parse_first_string("(<''>,)"), Some(String::new()));
+        // GVariant text escapes an apostrophe and a backslash with `\`.
+        assert_eq!(
+            parse_first_string(r"('/home/o\'neil/a\\b.png',)"),
+            Some(r"/home/o'neil/a\b.png".to_string())
+        );
+        // An unterminated string is not a value.
+        assert_eq!(parse_first_string("('file:///a.png"), None);
     }
 
     #[test]

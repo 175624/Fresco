@@ -1046,6 +1046,7 @@ mod lock_tests {
             host: "wlroots".into(),
             live_video: true,
             widgets: true,
+            still_frame: true,
             locked,
             setup: crate::ipc::LockSetupState::NotNeeded,
             notes: Vec::new(),
