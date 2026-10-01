@@ -1085,6 +1085,13 @@ impl Daemon {
             if wallpaper.effective_path().is_none() && wallpaper.kind != Kind::Slideshow {
                 continue; // nothing configured for this monitor
             }
+            if slideshow_has_no_images(&wallpaper) {
+                log::warn!(
+                    "[{}] slideshow has no images to show; leaving the native wallpaper",
+                    monitor.connector
+                );
+                continue;
+            }
             match Self::make_renderer(
                 &self.conn,
                 &screen,
@@ -1534,7 +1541,7 @@ impl Daemon {
             Kind::Slideshow => w
                 .slideshow
                 .as_ref()
-                .map(|s| format!("Slideshow ({} images)", slideshow_images(s).len())),
+                .map(|s| slideshow_status_label(slideshow_images(s).len())),
         }
     }
 
@@ -2025,37 +2032,37 @@ fn build_slideshow(wallpaper: &Wallpaper, player: &PlayerHandle) -> Option<Slide
 }
 
 /// Resolve a slideshow's image list: explicit hand-picked `paths`, else a scan
-/// of its `folder`.
+/// of its `folder` (subfolders too when the slideshow says so). The scan and
+/// its extension rules live in [`crate::media`], shared with the GUI so the
+/// card, the editor preview and the health check agree with what plays here.
 fn slideshow_images(s: &crate::config::Slideshow) -> Vec<PathBuf> {
     if !s.paths.is_empty() {
         s.paths.clone()
     } else if let Some(folder) = &s.folder {
-        list_images(folder)
+        crate::media::slideshow_frames(folder, s.recursive)
     } else {
         Vec::new()
     }
 }
 
-/// List image files in a folder, sorted by name.
-fn list_images(folder: &std::path::Path) -> Vec<PathBuf> {
-    let Ok(dir) = std::fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    let mut v: Vec<PathBuf> = dir
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            matches!(
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_lowercase)
-                    .as_deref(),
-                Some("jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "gif")
-            )
-        })
-        .collect();
-    v.sort();
-    v
+/// True for a slideshow wallpaper that resolves to no image at all: an empty
+/// folder, or (issue #36) a folder holding only videos. Nothing can be drawn
+/// for it, so the X11 backend skips the output rather than opening a black
+/// window that looks like a wallpaper in use.
+fn slideshow_has_no_images(w: &Wallpaper) -> bool {
+    w.kind == Kind::Slideshow
+        && w.slideshow
+            .as_ref()
+            .is_none_or(|s| slideshow_images(s).is_empty())
+}
+
+/// The status-pill text for a slideshow. "(0 images)" read as if something
+/// were running; say plainly that nothing was found.
+fn slideshow_status_label(images: usize) -> String {
+    match images {
+        0 => "Slideshow (no images found)".to_string(),
+        n => format!("Slideshow ({n} images)"),
+    }
 }
 
 /// (cpu_percent, rss_megabytes) for the daemon plus any renderer child
@@ -4956,6 +4963,66 @@ mod tests {
         assert_eq!(parse_stat_ticks(stat), Some(742));
         assert_eq!(parse_stat_ticks(""), None);
         assert_eq!(parse_stat_ticks("no parens here"), None);
+    }
+
+    fn slideshow_wallpaper(folder: &std::path::Path, recursive: bool) -> Wallpaper {
+        Wallpaper {
+            kind: Kind::Slideshow,
+            slideshow: Some(crate::config::Slideshow {
+                folder: Some(folder.to_path_buf()),
+                paths: Vec::new(),
+                interval_s: 30,
+                recursive,
+                transition: Default::default(),
+            }),
+            ..Wallpaper::default()
+        }
+    }
+
+    /// Issue #36: a folder of only videos is a slideshow with nothing to show.
+    /// It must say so (not "(0 images)") and must be recognised as empty so the
+    /// X11 backend does not open a black window for it.
+    #[test]
+    fn a_video_only_folder_is_an_empty_slideshow() {
+        let dir = std::env::temp_dir().join(format!("fresco-daemon-ss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("b.mkv"), b"x").unwrap();
+
+        let w = slideshow_wallpaper(&dir, false);
+        assert!(super::slideshow_has_no_images(&w));
+        assert_eq!(
+            super::slideshow_status_label(0),
+            "Slideshow (no images found)"
+        );
+        assert_eq!(super::slideshow_status_label(3), "Slideshow (3 images)");
+
+        // The first image makes it playable again.
+        std::fs::write(dir.join("c.png"), b"x").unwrap();
+        assert!(!super::slideshow_has_no_images(&w));
+
+        // A non-slideshow wallpaper is never "an empty slideshow".
+        assert!(!super::slideshow_has_no_images(&Wallpaper::default()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A slideshow made with "Include subfolders" plays the subfolders; one
+    /// without stays flat, exactly as before the flag existed.
+    #[test]
+    fn a_recursive_slideshow_scans_subfolders_and_a_flat_one_does_not() {
+        let dir = std::env::temp_dir().join(format!("fresco-daemon-rec-{}", std::process::id()));
+        let sub = dir.join("2024");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("x.jpg"), b"x").unwrap();
+
+        assert!(super::slideshow_has_no_images(&slideshow_wallpaper(
+            &dir, false
+        )));
+        let deep = slideshow_wallpaper(&dir, true);
+        assert!(!super::slideshow_has_no_images(&deep));
+        let images = super::slideshow_images(deep.slideshow.as_ref().unwrap());
+        assert_eq!(images, vec![sub.join("x.jpg")]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Points `FRESCO_MPVPAPER` at a throwaway script that prints `body` in

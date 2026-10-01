@@ -25,6 +25,7 @@ pub mod lockscreen;
 pub mod lyrics;
 #[cfg(feature = "daemon")]
 pub mod lyrics_fetch;
+pub mod media;
 #[cfg(feature = "daemon")]
 pub mod mpris;
 pub mod schedule;
