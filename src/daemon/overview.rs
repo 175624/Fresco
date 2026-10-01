@@ -256,6 +256,23 @@ pub fn restore() {
     log::info!("overview background restored");
 }
 
+/// The media file [`render_still`] takes its frame from: a slideshow's first
+/// image, otherwise the wallpaper's own file — and only when it exists.
+///
+/// `pub(super)` so `daemon::cosmic_bg` can key its "this still is already
+/// rendered" cache on exactly the file `render_still` will read, without
+/// re-deriving the rule (and drifting from it).
+pub(super) fn still_source(w: &Wallpaper) -> Option<PathBuf> {
+    let src = match w.kind {
+        Kind::Slideshow => {
+            let s = w.slideshow.as_ref()?;
+            super::slideshow_images(s).into_iter().next()?
+        }
+        _ => w.effective_path()?.to_path_buf(),
+    };
+    src.exists().then_some(src)
+}
+
 /// Produce a full-size still PNG for the active wallpaper. Uses a fresh
 /// timestamped filename each call so GNOME reliably reloads the new image.
 ///
@@ -264,16 +281,7 @@ pub fn restore() {
 /// GNOME's overview/lock screen has — see that module's doc comment) rather
 /// than duplicating the ffmpeg/ffmpegthumbnailer logic. No behavior change.
 pub(super) fn render_still(w: &Wallpaper) -> Option<PathBuf> {
-    let src = match w.kind {
-        Kind::Slideshow => {
-            let s = w.slideshow.as_ref()?;
-            super::slideshow_images(s).into_iter().next()?
-        }
-        _ => w.effective_path()?.to_path_buf(),
-    };
-    if !src.exists() {
-        return None;
-    }
+    let src = still_source(w)?;
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).ok();
     // Drop previous frames so the cache doesn't grow.

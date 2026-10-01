@@ -2593,6 +2593,28 @@ fn run_wayland_layershell() -> Result<()> {
     let mut show_on_lock = wants_show_on_lock(&config, lock_rt.kind);
     let mut lock_dim_applied = 0i32;
 
+    // COSMIC only: `overview` doesn't apply here (COSMIC has none of the
+    // GNOME/Cinnamon/MATE schemas), but its lock screen has the exact same
+    // "can't see the live wallpaper" problem GNOME's overview has — see
+    // `cosmic_bg`'s module doc. No-op on every other layer-shell compositor.
+    //
+    // Synced BEFORE any mpvpaper exists, not after: when this changes
+    // `cosmic-bg`'s config (first run, or because shutdown restored the
+    // original), `cosmic-bg` recreates its surfaces, and cosmic-comp stacks a
+    // newer surface above an older one — so an mpvpaper started first would
+    // end up hidden behind a still picture (the 1.1.46 regression). Waiting
+    // here, only when something actually changed, means the surfaces below
+    // are created last and therefore on top.
+    let mut cosmic_reloads = cosmic_bg::ReloadTracker::default();
+    let synced = cosmic_bg::apply(&config);
+    if let Some(wait) = cosmic_reloads.note_before_spawn(&synced, Instant::now()) {
+        log::info!(
+            "cosmic-bg: configuration changed; waiting {} ms for it to redraw before starting the wallpaper",
+            wait.as_millis()
+        );
+        std::thread::sleep(wait);
+    }
+
     // One supervised mpvpaper per output, keyed by connector name.
     let mut outputs: BTreeMap<String, WlOutput> = BTreeMap::new();
     for m in &monitors {
@@ -2609,11 +2631,6 @@ fn run_wayland_layershell() -> Result<()> {
         out.respawn(false, false);
         outputs.insert(m.connector.clone(), out);
     }
-    // COSMIC only: `overview` doesn't apply here (COSMIC has none of the
-    // GNOME/Cinnamon/MATE schemas), but its lock screen has the exact same
-    // "can't see the live wallpaper" problem GNOME's overview has — see
-    // `cosmic_bg`'s module doc. No-op on every other layer-shell compositor.
-    cosmic_bg::apply(&config);
     log::info!(
         "frescod started (Wayland layer-shell / mpvpaper, {} output(s))",
         outputs.len()
@@ -2728,10 +2745,20 @@ fn run_wayland_layershell() -> Result<()> {
                         // loop already does the whole reconciliation above
                         // inline before replying, so there is no separate
                         // deferred slot to piggyback on here.
+                        //
+                        // Usually a no-op for `cosmic-bg`'s config (fixed
+                        // frame paths, rewritten only on change). When it
+                        // does change — a monitor override added or removed,
+                        // a switch between per-output and same-on-all —
+                        // `cosmic-bg` recreates its surfaces above the
+                        // mpvpaper ones just reconciled, and the tracker
+                        // schedules the respawn that puts them back on top.
                         if config.enabled {
-                            cosmic_bg::apply(&config);
+                            let synced = cosmic_bg::apply(&config);
+                            cosmic_reloads.note(&synced, Instant::now());
                         } else {
                             cosmic_bg::restore();
+                            cosmic_reloads.reset();
                         }
                         Response::Ok
                     }
@@ -2816,6 +2843,18 @@ fn run_wayland_layershell() -> Result<()> {
         // desktop-only is ever pushed after the screen is believed locked.
         if let Some(now_locked) = lock_rt.poll(now) {
             if now_locked {
+                // COSMIC's lock screen shows whatever `cosmic-bg` last drew,
+                // and a new wallpaper only reaches it through a `cosmic-bg`
+                // reload — which stacks new `cosmic-bg` surfaces above the
+                // video, so it is held back until the screen is locked and
+                // nobody is looking at the desktop (the respawn that fixes
+                // the stacking then happens behind the lock screen too).
+                // Skipped when mpvpaper itself is on the lock screen: the
+                // live video is what's shown, and respawning it would blink.
+                if matches!(lock_rt.kind, HostKind::Cosmic { .. }) && !show_on_lock {
+                    let synced = cosmic_bg::refresh_for_lock(&config, cosmic_reloads.frame_stale());
+                    cosmic_reloads.note(&synced, Instant::now());
+                }
                 if let Some(resolved) = LockRuntime::resolved(&config) {
                     let cleared = widget_engine.clear_for_lock(
                         resolved
@@ -2891,6 +2930,32 @@ fn run_wayland_layershell() -> Result<()> {
                         }
                     }
                 }
+            }
+        }
+
+        // `cosmic-bg` reloaded a settle period ago and recreated its surfaces
+        // on every output, above any mpvpaper that already existed (see the
+        // `cosmic_bg` module doc). A fresh mpvpaper surface is created newer,
+        // so respawning each running one puts the video back on top. Outputs
+        // with no player are skipped: whenever they are next spawned it will
+        // be after the settle, so they already land on top.
+        if cosmic_reloads.respawn_due(now) {
+            let paused = user_paused || battery_paused;
+            let mut respawned = 0;
+            for o in outputs.values_mut() {
+                if o.player.is_some() {
+                    let hold_frame = o.static_fallback;
+                    o.respawn(paused, hold_frame);
+                    respawned += 1;
+                }
+            }
+            if respawned > 0 {
+                log::info!(
+                    "cosmic-bg: restacked the wallpaper above its background ({respawned} output(s))"
+                );
+                // The lock dim lives on the player that just died; forget it
+                // so the lock block above re-applies it to the new ones.
+                lock_dim_applied = 0;
             }
         }
 
