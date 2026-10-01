@@ -166,6 +166,20 @@ pub fn is_cinnamon() -> bool {
     .any(|v| is_cinnamon_name(Some(v)))
 }
 
+/// Is this a real GNOME session (the desktop name says so)? The still-frame
+/// backend is GNOME's, but any Wayland compositor without layer-shell lands in
+/// it too (an older Cinnamon, say); GNOME-specific advice (log into an Xorg
+/// session, wait for a Fresco GNOME extension) must not be shown to those.
+pub fn is_gnome_session() -> bool {
+    [
+        std::env::var("XDG_CURRENT_DESKTOP").ok(),
+        std::env::var("XDG_SESSION_DESKTOP").ok(),
+    ]
+    .iter()
+    .flatten()
+    .any(|v| is_gnome(Some(v)))
+}
+
 fn is_cinnamon_name(desktop: Option<&str>) -> bool {
     desktop
         .map(|d| d.to_ascii_lowercase().contains("cinnamon"))
@@ -176,6 +190,152 @@ fn is_gnome(desktop: Option<&str>) -> bool {
     desktop
         .map(|d| d.to_ascii_lowercase().contains("gnome"))
         .unwrap_or(false)
+}
+
+/// Can this machine start a GNOME session on X11 instead of Wayland?
+///
+/// GNOME on Wayland is the one session where Fresco can only show a still
+/// frame (no `zwlr_layer_shell_v1`; see [`Capability::WaylandGnomeStatic`]),
+/// and the only way to a live wallpaper there *today* is to log out and pick
+/// an Xorg session on the greeter. Whether that choice exists depends on the
+/// distro: Ubuntu 22.04 / 24.04 still ship "Ubuntu on Xorg", but GNOME 49
+/// disabled its X11 session at build time and GNOME 50 removed the code, so
+/// Ubuntu 25.10+ and 26.04 LTS, Fedora 43 and newer ship no Xorg session at
+/// all. Telling the user to "log in on Xorg" when no such entry exists is
+/// worse than saying nothing, so the banner and `fresco doctor` ask first.
+///
+/// Reads the display manager's own session list — the `*.desktop` files under
+/// each `xsessions` directory — and never fails: an unreadable or missing
+/// directory is simply "none".
+pub fn gnome_x11_session_available() -> bool {
+    let dirs = xsession_dirs(std::env::var("XDG_DATA_DIRS").ok().as_deref());
+    dirs.iter().any(|dir| {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "desktop") {
+                return false;
+            }
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            std::fs::read_to_string(&path)
+                .map(|contents| xsession_is_gnome(&stem, &contents))
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// `xsessions` directories to scan: every `XDG_DATA_DIRS` entry (spec default
+/// `/usr/local/share:/usr/share` when unset or empty) plus `/usr/share`
+/// itself, which is where GDM looks regardless of the variable. Order is kept
+/// and duplicates dropped.
+fn xsession_dirs(xdg_data_dirs: Option<&str>) -> Vec<std::path::PathBuf> {
+    let raw = xdg_data_dirs
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("/usr/local/share:/usr/share");
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for base in raw.split(':').chain(std::iter::once("/usr/share")) {
+        let base = base.trim();
+        if base.is_empty() {
+            continue;
+        }
+        let dir = std::path::Path::new(base).join("xsessions");
+        if !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+    out
+}
+
+/// Is this `xsessions/<stem>.desktop` a GNOME Shell session on X11?
+///
+/// Pure over the file's name and contents so it is testable without a display
+/// manager. Only the `[Desktop Entry]` group counts, and plain `Name=` only
+/// (not the localized `Name[xx]=`). A session qualifies when it launches
+/// `gnome-session` (Ubuntu on Xorg, GNOME on Xorg, GNOME Classic on Xorg all
+/// do) or is named "GNOME/Ubuntu on Xorg/X11". Entries the greeter itself
+/// would not list (`Hidden=true`, `NoDisplay=true`) and GNOME Flashback (a
+/// different shell Fresco has never been verified on) do not.
+fn xsession_is_gnome(file_stem: &str, contents: &str) -> bool {
+    let (mut name, mut exec, mut try_exec) = (String::new(), String::new(), String::new());
+    let (mut hidden, mut in_entry) = (false, false);
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(group) = line.strip_prefix('[') {
+            in_entry = group.trim_end().strip_suffix(']') == Some("Desktop Entry");
+            continue;
+        }
+        if !in_entry || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "Name" => name = value.to_ascii_lowercase(),
+            "Exec" => exec = value.to_ascii_lowercase(),
+            "TryExec" => try_exec = value.to_ascii_lowercase(),
+            "Hidden" | "NoDisplay" if value.eq_ignore_ascii_case("true") => hidden = true,
+            _ => {}
+        }
+    }
+    let stem = file_stem.to_ascii_lowercase();
+    if hidden
+        || [&stem, &name, &exec]
+            .iter()
+            .any(|v| v.contains("flashback"))
+    {
+        return false;
+    }
+    let launches_gnome = exec.contains("gnome-session") || try_exec.contains("gnome-session");
+    let named_gnome_xorg = (name.contains("gnome") || name.contains("ubuntu"))
+        && (name.contains("xorg") || name.contains("x11"));
+    launches_gnome || named_gnome_xorg
+}
+
+/// The running GNOME Shell's version string (`"49.0"`, `"50.beta"`), or `None`
+/// when it cannot be read — not GNOME, no session bus, `gdbus` missing, or the
+/// shell not answering within 2 s. Blocking, so for `fresco doctor` and other
+/// one-shot callers, never a render or poll loop.
+pub fn gnome_shell_version() -> Option<String> {
+    let out = std::process::Command::new("gdbus")
+        .args(["call", "--session", "--timeout", "2"])
+        .args(["--dest", "org.gnome.Shell"])
+        .args(["--object-path", "/org/gnome/Shell"])
+        .args([
+            "--method",
+            "org.freedesktop.DBus.Properties.Get",
+            "org.gnome.Shell",
+            "ShellVersion",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_shell_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pull the version out of `gdbus call`'s reply to `Properties.Get`, a
+/// one-tuple wrapping a string variant: `(<'49.0'>,)`. Anything else (an error
+/// message, empty output, a non-string variant, a version with characters no
+/// GNOME release has ever used) is `None`.
+fn parse_shell_version(out: &str) -> Option<String> {
+    let inner = out.trim().strip_prefix("(<")?.strip_suffix(">,)")?.trim();
+    let quote = inner.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+    let version = inner.strip_prefix(quote)?.strip_suffix(quote)?;
+    let valid = !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '~'));
+    valid.then(|| version.to_string())
 }
 
 /// Probe the live Wayland registry for `zwlr_layer_shell_v1` — no external tools.
@@ -349,6 +509,122 @@ mod tests {
             assert!(!classify_mate(Some(d), None), "current {d}");
         }
         assert!(!classify_mate(None, None));
+    }
+
+    const UBUNTU_XORG: &str = "[Desktop Entry]\n\
+Name=Ubuntu on Xorg\n\
+Name[de]=Ubuntu auf Xorg\n\
+Comment=This session logs you into Ubuntu\n\
+Exec=env GNOME_SHELL_SESSION_MODE=ubuntu /usr/bin/gnome-session --session=ubuntu\n\
+TryExec=/usr/bin/gnome-shell\n\
+Type=Application\n\
+DesktopNames=ubuntu:GNOME\n";
+    const FEDORA_GNOME_XORG: &str =
+        "[Desktop Entry]\nName=GNOME on Xorg\nExec=gnome-session\nType=Application\n";
+
+    #[test]
+    fn xsession_parser_accepts_gnome_and_ubuntu_xorg_sessions() {
+        assert!(xsession_is_gnome("ubuntu-xorg", UBUNTU_XORG));
+        assert!(xsession_is_gnome("gnome-xorg", FEDORA_GNOME_XORG));
+        let classic = "[Desktop Entry]\nName=GNOME Classic on Xorg\n\
+                       Exec=gnome-session --session=gnome-classic\n";
+        assert!(xsession_is_gnome("gnome-classic-xorg", classic));
+        // Named like one even if Exec is a wrapper script.
+        let wrapped = "[Desktop Entry]\nName=GNOME on X11\nExec=/usr/bin/start-session\n";
+        assert!(xsession_is_gnome("gnome-x11", wrapped));
+    }
+
+    #[test]
+    fn xsession_parser_rejects_other_desktops_and_unlisted_entries() {
+        let plasma = "[Desktop Entry]\nName=Plasma (X11)\nExec=/usr/bin/startplasma-x11\n\
+                      DesktopNames=KDE\n";
+        assert!(!xsession_is_gnome("plasmax11", plasma));
+        let xfce = "[Desktop Entry]\nName=Xfce Session\nExec=startxfce4\n";
+        assert!(!xsession_is_gnome("xfce", xfce));
+        // Budgie advertises GNOME in DesktopNames but is not a GNOME Shell session.
+        let budgie = "[Desktop Entry]\nName=Budgie Desktop\nExec=budgie-desktop\n\
+                      DesktopNames=Budgie:GNOME\n";
+        assert!(!xsession_is_gnome("budgie-desktop", budgie));
+        // GNOME Flashback is a different shell.
+        let flashback = "[Desktop Entry]\nName=GNOME Flashback (Metacity)\n\
+                         Exec=gnome-session --session=gnome-flashback-metacity\n";
+        assert!(!xsession_is_gnome("gnome-flashback-metacity", flashback));
+        // The greeter does not list these, so neither do we.
+        for flag in ["Hidden=true", "NoDisplay=true", "NoDisplay=TRUE"] {
+            let hidden = format!("{FEDORA_GNOME_XORG}{flag}\n");
+            assert!(!xsession_is_gnome("gnome-xorg", &hidden), "{flag}");
+        }
+        assert!(xsession_is_gnome(
+            "gnome-xorg",
+            &format!("{FEDORA_GNOME_XORG}NoDisplay=false\n")
+        ));
+        assert!(!xsession_is_gnome("anything", ""));
+    }
+
+    #[test]
+    fn xsession_parser_reads_only_the_desktop_entry_group() {
+        let other_group = "[Desktop Entry]\nName=Custom\nExec=custom-session\n\
+                           [Desktop Action Foo]\nExec=gnome-session\n";
+        assert!(!xsession_is_gnome("custom", other_group));
+        let before_group = "Exec=gnome-session\n[Desktop Entry]\nName=Custom\n";
+        assert!(!xsession_is_gnome("custom", before_group));
+        // A localized name alone never makes a session GNOME.
+        let localized = "[Desktop Entry]\nName=Custom\nName[de]=GNOME auf Xorg\nExec=custom\n";
+        assert!(!xsession_is_gnome("custom", localized));
+    }
+
+    #[test]
+    fn xsession_dirs_follow_xdg_data_dirs_and_always_include_usr_share() {
+        let p = std::path::PathBuf::from;
+        assert_eq!(
+            xsession_dirs(None),
+            vec![p("/usr/local/share/xsessions"), p("/usr/share/xsessions")]
+        );
+        assert_eq!(xsession_dirs(Some("  ")), xsession_dirs(None));
+        assert_eq!(
+            xsession_dirs(Some("/opt/share::/usr/share")),
+            vec![p("/opt/share/xsessions"), p("/usr/share/xsessions")]
+        );
+        assert_eq!(
+            xsession_dirs(Some("/var/lib/flatpak/exports/share")),
+            vec![
+                p("/var/lib/flatpak/exports/share/xsessions"),
+                p("/usr/share/xsessions")
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_version_parser_reads_the_properties_get_reply() {
+        assert_eq!(parse_shell_version("(<'49.0'>,)\n"), Some("49.0".into()));
+        assert_eq!(
+            parse_shell_version("(<'50.beta'>,)"),
+            Some("50.beta".into())
+        );
+        assert_eq!(
+            parse_shell_version("  (<\"46.2\">,)  "),
+            Some("46.2".into())
+        );
+    }
+
+    #[test]
+    fn shell_version_parser_rejects_everything_else() {
+        for bad in [
+            "",
+            "\n",
+            "()",
+            "(<''>,)",
+            "(<49>,)",
+            "(<int32 49>,)",
+            "(<'49.0'>)",
+            "('49.0',)",
+            "Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown",
+            "(<'49.0\\n'>,)",
+            "(<'49 0'>,)",
+            "(<'49.0\">,)",
+        ] {
+            assert_eq!(parse_shell_version(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

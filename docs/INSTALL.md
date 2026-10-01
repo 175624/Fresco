@@ -6,7 +6,8 @@ elementary OS) running an **X11** or **Wayland** session.
 - **X11:** full live wallpapers (embedded mpv).
 - **Wayland layer-shell compositors** (COSMIC, Hyprland, Sway, KDE Plasma 6): live
   wallpapers via the bundled `mpvpaper` backend.
-- **GNOME Wayland:** static-frame fallback (Mutter has no live wallpaper surface).
+- **GNOME Wayland:** still frame only (Mutter has no live wallpaper surface). See
+  [X11 vs Wayland](#x11-vs-wayland) for what that means on your release.
 
 ## Quick install (one-liner)
 
@@ -90,9 +91,20 @@ echo $XDG_SESSION_TYPE     # x11 or wayland
 - **X11:** everything works out of the box.
 - **Wayland layer-shell compositors** (COSMIC, Hyprland, Sway, KDE Plasma 6): live
   wallpapers work out of the box using the bundled `mpvpaper` backend.
-- **GNOME Wayland:** Fresco sets a static frame as the desktop background. For
-  full live playback on GNOME, log out and choose the **Xorg** session on the
-  login screen (e.g. "Pop (on Xorg)" or "Ubuntu on Xorg").
+- **GNOME Wayland:** Fresco sets a still frame as the desktop background and
+  says so in the app (the status pill reads "STILL FRAME"). Whether live video is
+  possible depends on your release:
+  - **Ubuntu 22.04 / 24.04 and other releases that still ship an Xorg session:**
+    log out and choose the **Xorg** session on the login screen (e.g. "Pop (on
+    Xorg)" or "Ubuntu on Xorg") for full live playback.
+  - **GNOME 50, Ubuntu 25.10 and newer (including 26.04 LTS), Fedora 43 and
+    newer:** there is no Xorg session to choose. GNOME 49 disabled it and GNOME
+    50 removed it. Live video on GNOME Wayland needs a Fresco GNOME extension,
+    which is planned; until then use a desktop with live support (KDE Plasma,
+    COSMIC, Hyprland, Sway, or any X11 desktop).
+
+  `fresco doctor` shows your GNOME Shell version and whether an Xorg session is
+  installed, and gives the matching advice.
 
 ## FAQ / troubleshooting
 

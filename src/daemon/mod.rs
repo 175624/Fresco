@@ -6,6 +6,7 @@ pub mod cinnamon_bg;
 mod control;
 mod cosmic_bg;
 mod dde;
+mod dde_lock;
 mod fullscreen;
 mod lock;
 mod signals;
@@ -416,19 +417,17 @@ impl LockRuntime {
     /// `StatusReply.lockscreen`.
     fn status(&self, ctx: &HostCtx, config: &Config) -> LockStatus {
         // Live video and Fresco's own widgets are available only where a
-        // real surface exists to draw them on today — see
-        // `docs/plan-lock-screen.md` §4: COSMIC needs the show-on-lock layer
-        // specifically (not just "is COSMIC"), and GNOME/Cinnamon/MATE/Xfce/
-        // Deepin are still-frame-only until later waves.
-        let capable = matches!(
-            self.kind,
-            HostKind::Cosmic { live: true } | HostKind::Wlroots | HostKind::X11Wm | HostKind::Kde
-        );
+        // real surface exists to draw them on today; GNOME/Cinnamon/Deepin
+        // (and COSMIC without show-on-lock) get a still frame at most. The
+        // matrix lives in `lock::hosts::capabilities`, whose still-frame
+        // column is `HostKind::shows_still_frame`.
+        let caps = lock::hosts::capabilities(self.kind);
         LockStatus {
             enabled: config.lockscreen.as_ref().is_some_and(|l| l.enabled),
             host: self.kind.id().to_string(),
-            live_video: capable,
-            widgets: capable,
+            live_video: caps.live_video,
+            widgets: caps.widgets,
+            still_frame: Some(caps.still_frame),
             locked: self.locked,
             setup: self.host.setup_state(ctx),
             notes: self.host.notes(ctx),
@@ -1085,6 +1084,13 @@ impl Daemon {
             if wallpaper.effective_path().is_none() && wallpaper.kind != Kind::Slideshow {
                 continue; // nothing configured for this monitor
             }
+            if slideshow_has_no_images(&wallpaper) {
+                log::warn!(
+                    "[{}] slideshow has no images to show; leaving the native wallpaper",
+                    monitor.connector
+                );
+                continue;
+            }
             match Self::make_renderer(
                 &self.conn,
                 &screen,
@@ -1285,6 +1291,7 @@ impl Daemon {
         }
         overview::apply(&self.config.wallpaper);
         cosmic_bg::apply(&self.config);
+        dde_lock::apply(&self.config);
         log::info!("frescod started with {} renderer(s)", self.renderers.len());
         crate::telemetry::heartbeat(
             Some("x11"),
@@ -1307,6 +1314,7 @@ impl Daemon {
                 if std::mem::take(&mut self.overview_pending) {
                     overview::apply(&self.config.wallpaper);
                     cosmic_bg::apply(&self.config);
+                    dde_lock::apply(&self.config);
                 }
                 if is_stop {
                     self.shutdown();
@@ -1520,6 +1528,9 @@ impl Daemon {
             monitors_info: monitors_info_from(&self.monitors),
             gave_up: Vec::new(), // X11 backend has no give-up fallback
             lockscreen: Some(self.lock.status(&ctx, &self.config)),
+            // `check_schedule` writes the swapped slot into this in-memory copy
+            // (never to disk), so it — not config.toml — is what is on screen.
+            wallpaper_path: playing_media_path(&self.config.wallpaper),
         }
     }
 
@@ -1531,10 +1542,22 @@ impl Daemon {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned()),
             Kind::Playlist => Some(format!("Playlist ({} items)", w.paths.len())),
-            Kind::Slideshow => w
-                .slideshow
-                .as_ref()
-                .map(|s| format!("Slideshow ({} images)", slideshow_images(s).len())),
+            Kind::Slideshow => w.slideshow.as_ref().map(|_| {
+                // Ask the renderer that is playing it, never the disk: the
+                // renderer resolved the folder when it was built, and a scan
+                // here would run on every status poll (every few seconds,
+                // from the main loop) and, with "Include subfolders", walk a
+                // whole tree each time. No renderer holding it means nothing
+                // could be drawn (the backend skips an output with no
+                // images), which is exactly the "no images found" label.
+                let images = self
+                    .renderers
+                    .iter()
+                    .filter(|r| std::ptr::eq(self.config.wallpaper_for(&r.window.connector), w))
+                    .find_map(|r| r.slideshow.as_ref())
+                    .map_or(0, |s| s.images.len());
+                slideshow_status_label(images)
+            }),
         }
     }
 
@@ -1744,6 +1767,7 @@ impl Daemon {
         self.sched.applied = Some(path);
         overview::apply(&self.config.wallpaper);
         cosmic_bg::apply(&self.config);
+        dde_lock::apply(&self.config);
     }
 
     /// Re-seat clones of the same video on one clock (see SYNC_INTERVAL): the
@@ -1928,6 +1952,7 @@ impl Daemon {
         self.lock.end_lock(); // drop the engine and any LayerFiles/socket state
         overview::restore();
         cosmic_bg::restore();
+        dde_lock::restore();
         // MATE: stop copying Caja's icons (closing the thread's connection
         // undoes the redirect, so Caja renders on screen again), then swap the
         // key colour back for the user's own background. After
@@ -2025,37 +2050,37 @@ fn build_slideshow(wallpaper: &Wallpaper, player: &PlayerHandle) -> Option<Slide
 }
 
 /// Resolve a slideshow's image list: explicit hand-picked `paths`, else a scan
-/// of its `folder`.
+/// of its `folder` (subfolders too when the slideshow says so). The scan and
+/// its extension rules live in [`crate::media`], shared with the GUI so the
+/// card, the editor preview and the health check agree with what plays here.
 fn slideshow_images(s: &crate::config::Slideshow) -> Vec<PathBuf> {
     if !s.paths.is_empty() {
         s.paths.clone()
     } else if let Some(folder) = &s.folder {
-        list_images(folder)
+        crate::media::slideshow_frames(folder, s.recursive)
     } else {
         Vec::new()
     }
 }
 
-/// List image files in a folder, sorted by name.
-fn list_images(folder: &std::path::Path) -> Vec<PathBuf> {
-    let Ok(dir) = std::fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    let mut v: Vec<PathBuf> = dir
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            matches!(
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_lowercase)
-                    .as_deref(),
-                Some("jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "gif")
-            )
-        })
-        .collect();
-    v.sort();
-    v
+/// True for a slideshow wallpaper that resolves to no image at all: an empty
+/// folder, or (issue #36) a folder holding only videos. Nothing can be drawn
+/// for it, so the X11 backend skips the output rather than opening a black
+/// window that looks like a wallpaper in use.
+fn slideshow_has_no_images(w: &Wallpaper) -> bool {
+    w.kind == Kind::Slideshow
+        && w.slideshow
+            .as_ref()
+            .is_none_or(|s| slideshow_images(s).is_empty())
+}
+
+/// The status-pill text for a slideshow. "(0 images)" read as if something
+/// were running; say plainly that nothing was found.
+fn slideshow_status_label(images: usize) -> String {
+    match images {
+        0 => "Slideshow (no images found)".to_string(),
+        n => format!("Slideshow ({n} images)"),
+    }
 }
 
 /// (cpu_percent, rss_megabytes) for the daemon plus any renderer child
@@ -2180,6 +2205,17 @@ impl SchedState {
     }
 }
 
+/// The single media file a wallpaper is showing, for `StatusReply::wallpaper_path`.
+/// Playlists and slideshows have no one file to name (`effective_path` would
+/// answer with a playlist's first item, which is not necessarily what is
+/// playing), so they report none and the GUI keeps going by its own config.
+fn playing_media_path(w: &Wallpaper) -> Option<PathBuf> {
+    match w.kind {
+        Kind::Video | Kind::Image => w.effective_path().map(|p| p.to_path_buf()),
+        Kind::Playlist | Kind::Slideshow => None,
+    }
+}
+
 /// Neutral Monitor list → wire MonitorInfo list (shared by all status paths).
 fn monitors_info_from(monitors: &[Monitor]) -> Vec<MonitorInfo> {
     monitors
@@ -2301,6 +2337,8 @@ fn run_x11() -> Result<()> {
         // our static frame as the background — put the user's original back.
         overview::restore();
         cosmic_bg::restore();
+        // And the Deepin lock-screen background (no-op off Deepin).
+        dde_lock::restore();
         // Same for DDE: a crashed run may have left the transparent wallpaper
         // applied with the original saved on disk — restore it (no-op
         // otherwise).
@@ -2464,6 +2502,7 @@ fn static_status(config: &Config, lockscreen: &LockStatus) -> StatusReply {
         monitors_info: Vec::new(),
         gave_up: Vec::new(),
         lockscreen: Some(lockscreen.clone()),
+        wallpaper_path: playing_media_path(&config.wallpaper),
     }
 }
 
@@ -2506,6 +2545,7 @@ fn run_wayland_layershell() -> Result<()> {
         // Safety net, same as `run_x11`'s: a prior run killed rather than
         // Stopped may have left cosmic-bg pointed at our still frame.
         cosmic_bg::restore();
+        dde_lock::restore();
         log::info!("wallpaper disabled (enabled=false) — exiting");
         return Ok(());
     }
@@ -2593,6 +2633,28 @@ fn run_wayland_layershell() -> Result<()> {
     let mut show_on_lock = wants_show_on_lock(&config, lock_rt.kind);
     let mut lock_dim_applied = 0i32;
 
+    // COSMIC only: `overview` doesn't apply here (COSMIC has none of the
+    // GNOME/Cinnamon/MATE schemas), but its lock screen has the exact same
+    // "can't see the live wallpaper" problem GNOME's overview has — see
+    // `cosmic_bg`'s module doc. No-op on every other layer-shell compositor.
+    //
+    // Synced BEFORE any mpvpaper exists, not after: when this changes
+    // `cosmic-bg`'s config (first run, or because shutdown restored the
+    // original), `cosmic-bg` recreates its surfaces, and cosmic-comp stacks a
+    // newer surface above an older one — so an mpvpaper started first would
+    // end up hidden behind a still picture (the 1.1.46 regression). Waiting
+    // here, only when something actually changed, means the surfaces below
+    // are created last and therefore on top.
+    let mut cosmic_reloads = cosmic_bg::ReloadTracker::default();
+    let synced = cosmic_bg::apply(&config);
+    if let Some(wait) = cosmic_reloads.note_before_spawn(&synced, Instant::now()) {
+        log::info!(
+            "cosmic-bg: configuration changed; waiting {} ms for it to redraw before starting the wallpaper",
+            wait.as_millis()
+        );
+        std::thread::sleep(wait);
+    }
+
     // One supervised mpvpaper per output, keyed by connector name.
     let mut outputs: BTreeMap<String, WlOutput> = BTreeMap::new();
     for m in &monitors {
@@ -2609,11 +2671,11 @@ fn run_wayland_layershell() -> Result<()> {
         out.respawn(false, false);
         outputs.insert(m.connector.clone(), out);
     }
-    // COSMIC only: `overview` doesn't apply here (COSMIC has none of the
-    // GNOME/Cinnamon/MATE schemas), but its lock screen has the exact same
-    // "can't see the live wallpaper" problem GNOME's overview has — see
-    // `cosmic_bg`'s module doc. No-op on every other layer-shell compositor.
-    cosmic_bg::apply(&config);
+    // Deepin (Treeland) only, and only with the lock feature on: its lock
+    // screen draws the user's greeter background, not our surface — see
+    // `dde_lock`'s module doc. No-op on every other compositor. (COSMIC's
+    // `cosmic-bg` sync already ran above, before any mpvpaper existed.)
+    dde_lock::apply(&config);
     log::info!(
         "frescod started (Wayland layer-shell / mpvpaper, {} output(s))",
         outputs.len()
@@ -2728,10 +2790,22 @@ fn run_wayland_layershell() -> Result<()> {
                         // loop already does the whole reconciliation above
                         // inline before replying, so there is no separate
                         // deferred slot to piggyback on here.
+                        //
+                        // Usually a no-op for `cosmic-bg`'s config (fixed
+                        // frame paths, rewritten only on change). When it
+                        // does change — a monitor override added or removed,
+                        // a switch between per-output and same-on-all —
+                        // `cosmic-bg` recreates its surfaces above the
+                        // mpvpaper ones just reconciled, and the tracker
+                        // schedules the respawn that puts them back on top.
                         if config.enabled {
-                            cosmic_bg::apply(&config);
+                            let synced = cosmic_bg::apply(&config);
+                            cosmic_reloads.note(&synced, Instant::now());
+                            dde_lock::apply(&config);
                         } else {
                             cosmic_bg::restore();
+                            cosmic_reloads.reset();
+                            dde_lock::restore();
                         }
                         Response::Ok
                     }
@@ -2749,6 +2823,7 @@ fn run_wayland_layershell() -> Result<()> {
                         Response::Status(wayland_status(
                             &monitors,
                             &outputs,
+                            &config.wallpaper,
                             user_paused || battery_paused,
                             lock_rt.status(&ctx, &config),
                         ))
@@ -2816,6 +2891,18 @@ fn run_wayland_layershell() -> Result<()> {
         // desktop-only is ever pushed after the screen is believed locked.
         if let Some(now_locked) = lock_rt.poll(now) {
             if now_locked {
+                // COSMIC's lock screen shows whatever `cosmic-bg` last drew,
+                // and a new wallpaper only reaches it through a `cosmic-bg`
+                // reload — which stacks new `cosmic-bg` surfaces above the
+                // video, so it is held back until the screen is locked and
+                // nobody is looking at the desktop (the respawn that fixes
+                // the stacking then happens behind the lock screen too).
+                // Skipped when mpvpaper itself is on the lock screen: the
+                // live video is what's shown, and respawning it would blink.
+                if matches!(lock_rt.kind, HostKind::Cosmic { .. }) && !show_on_lock {
+                    let synced = cosmic_bg::refresh_for_lock(&config, cosmic_reloads.frame_stale());
+                    cosmic_reloads.note(&synced, Instant::now());
+                }
                 if let Some(resolved) = LockRuntime::resolved(&config) {
                     let cleared = widget_engine.clear_for_lock(
                         resolved
@@ -2891,6 +2978,32 @@ fn run_wayland_layershell() -> Result<()> {
                         }
                     }
                 }
+            }
+        }
+
+        // `cosmic-bg` reloaded a settle period ago and recreated its surfaces
+        // on every output, above any mpvpaper that already existed (see the
+        // `cosmic_bg` module doc). A fresh mpvpaper surface is created newer,
+        // so respawning each running one puts the video back on top. Outputs
+        // with no player are skipped: whenever they are next spawned it will
+        // be after the settle, so they already land on top.
+        if cosmic_reloads.respawn_due(now) {
+            let paused = user_paused || battery_paused;
+            let mut respawned = 0;
+            for o in outputs.values_mut() {
+                if o.player.is_some() {
+                    let hold_frame = o.static_fallback;
+                    o.respawn(paused, hold_frame);
+                    respawned += 1;
+                }
+            }
+            if respawned > 0 {
+                log::info!(
+                    "cosmic-bg: restacked the wallpaper above its background ({respawned} output(s))"
+                );
+                // The lock dim lives on the player that just died; forget it
+                // so the lock block above re-applies it to the new ones.
+                lock_dim_applied = 0;
             }
         }
 
@@ -3135,6 +3248,7 @@ fn run_wayland_layershell() -> Result<()> {
     lock_rt.end_lock(); // drop the engine and any LayerFiles/socket state
     outputs.clear(); // kill every mpvpaper before we exit
     cosmic_bg::restore();
+    dde_lock::restore();
     std::fs::remove_file(crate::ipc::socket_path()).ok();
     log::info!("frescod stopped");
     Ok(())
@@ -4099,6 +4213,7 @@ fn holds_frame_by_design(player: &PlayerHandle) -> bool {
 fn wayland_status(
     monitors: &[Monitor],
     outputs: &std::collections::BTreeMap<String, WlOutput>,
+    default_wallpaper: &Wallpaper,
     paused: bool,
     lockscreen: LockStatus,
 ) -> StatusReply {
@@ -4150,6 +4265,10 @@ fn wayland_status(
         monitors_info: monitors_info_from(monitors),
         gave_up,
         lockscreen: Some(lockscreen),
+        // The DEFAULT wallpaper, not whichever output sorts first — that one
+        // may carry a per-monitor override. The loop's `config.wallpaper` is
+        // where a schedule swap lands (and is never saved).
+        wallpaper_path: playing_media_path(default_wallpaper),
     }
 }
 
@@ -4958,6 +5077,66 @@ mod tests {
         assert_eq!(parse_stat_ticks("no parens here"), None);
     }
 
+    fn slideshow_wallpaper(folder: &std::path::Path, recursive: bool) -> Wallpaper {
+        Wallpaper {
+            kind: Kind::Slideshow,
+            slideshow: Some(crate::config::Slideshow {
+                folder: Some(folder.to_path_buf()),
+                paths: Vec::new(),
+                interval_s: 30,
+                recursive,
+                transition: Default::default(),
+            }),
+            ..Wallpaper::default()
+        }
+    }
+
+    /// Issue #36: a folder of only videos is a slideshow with nothing to show.
+    /// It must say so (not "(0 images)") and must be recognised as empty so the
+    /// X11 backend does not open a black window for it.
+    #[test]
+    fn a_video_only_folder_is_an_empty_slideshow() {
+        let dir = std::env::temp_dir().join(format!("fresco-daemon-ss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("b.mkv"), b"x").unwrap();
+
+        let w = slideshow_wallpaper(&dir, false);
+        assert!(super::slideshow_has_no_images(&w));
+        assert_eq!(
+            super::slideshow_status_label(0),
+            "Slideshow (no images found)"
+        );
+        assert_eq!(super::slideshow_status_label(3), "Slideshow (3 images)");
+
+        // The first image makes it playable again.
+        std::fs::write(dir.join("c.png"), b"x").unwrap();
+        assert!(!super::slideshow_has_no_images(&w));
+
+        // A non-slideshow wallpaper is never "an empty slideshow".
+        assert!(!super::slideshow_has_no_images(&Wallpaper::default()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A slideshow made with "Include subfolders" plays the subfolders; one
+    /// without stays flat, exactly as before the flag existed.
+    #[test]
+    fn a_recursive_slideshow_scans_subfolders_and_a_flat_one_does_not() {
+        let dir = std::env::temp_dir().join(format!("fresco-daemon-rec-{}", std::process::id()));
+        let sub = dir.join("2024");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("x.jpg"), b"x").unwrap();
+
+        assert!(super::slideshow_has_no_images(&slideshow_wallpaper(
+            &dir, false
+        )));
+        let deep = slideshow_wallpaper(&dir, true);
+        assert!(!super::slideshow_has_no_images(&deep));
+        let images = super::slideshow_images(deep.slideshow.as_ref().unwrap());
+        assert_eq!(images, vec![sub.join("x.jpg")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Points `FRESCO_MPVPAPER` at a throwaway script that prints `body` in
     /// mpvpaper's real coloured `cflp_error()` form on stdout and exits 1.
     /// Caller holds `crate::ENV_LOCK` for as long as the override is set.
@@ -5306,5 +5485,87 @@ mod sched_clock_jump_tests {
         assert!(st.warned_no_path); // later ticks stay quiet (flag unchanged)
         st.due_for(&cfg, wp("/day.mp4"));
         assert!(!st.warned_no_path); // re-armed by a slot with a path
+    }
+
+    /// A one-slot `times` schedule wants `/day.mp4` at every hour of the day,
+    /// so `hold_current` — which reads the real wall clock — is deterministic.
+    fn always_day_config(showing: &str) -> Config {
+        Config {
+            wallpaper: wp(showing),
+            schedule: Some(Schedule {
+                mode: ScheduleMode::Times,
+                day: None,
+                night: None,
+                day_start: "07:00".into(),
+                night_start: "19:00".into(),
+                lat: None,
+                lon: None,
+                at: vec![crate::config::TimeSlot {
+                    time: "00:00".into(),
+                    wallpaper: wp("/day.mp4"),
+                }],
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Resuming a paused schedule: the GUI points `config.wallpaper` at the
+    /// slot the schedule wants (`sync_wallpaper_to_schedule`) before applying,
+    /// so the daemon must treat that as "schedule live now", not as a manual
+    /// override to hold until the next boundary.
+    #[test]
+    fn hold_current_does_not_hold_after_a_resume_sync() {
+        let cfg = always_day_config("/day.mp4");
+        let mut st = SchedState::default();
+        st.hold_current(&cfg);
+        assert!(st.hold.is_none());
+        assert!(st.applied.is_none());
+    }
+
+    /// The failure the resume sync prevents: a stale wallpaper that differs
+    /// from the slot is an explicit user choice and is held.
+    #[test]
+    fn hold_current_holds_a_wallpaper_that_differs_from_the_slot() {
+        let cfg = always_day_config("/stale.mp4");
+        let mut st = SchedState::default();
+        st.hold_current(&cfg);
+        assert_eq!(st.hold.as_deref(), Some(std::path::Path::new("/day.mp4")));
+    }
+
+    #[test]
+    fn playing_media_path_names_single_files_only() {
+        assert_eq!(
+            playing_media_path(&wp("/day.mp4")),
+            Some(PathBuf::from("/day.mp4"))
+        );
+        let image = Wallpaper {
+            kind: Kind::Image,
+            path: Some(PathBuf::from("/a.png")),
+            ..Default::default()
+        };
+        assert_eq!(playing_media_path(&image), Some(PathBuf::from("/a.png")));
+        // A playlist's first item is not necessarily what is playing.
+        let playlist = Wallpaper {
+            kind: Kind::Playlist,
+            paths: vec![PathBuf::from("/a.mp4"), PathBuf::from("/b.mp4")],
+            ..Default::default()
+        };
+        assert_eq!(playing_media_path(&playlist), None);
+        let slideshow = Wallpaper {
+            kind: Kind::Slideshow,
+            ..Default::default()
+        };
+        assert_eq!(playing_media_path(&slideshow), None);
+        // A schedule swap only rewrites `path`, so it wins over a stale list.
+        let swapped = Wallpaper {
+            kind: Kind::Video,
+            path: Some(PathBuf::from("/night.mp4")),
+            paths: vec![PathBuf::from("/day.mp4")],
+            ..Default::default()
+        };
+        assert_eq!(
+            playing_media_path(&swapped),
+            Some(PathBuf::from("/night.mp4"))
+        );
     }
 }

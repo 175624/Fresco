@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Crop, Fit, Kind, PowerSaving, Slideshow, Transition, Wallpaper};
+use crate::media;
 use crate::{t, tf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +24,11 @@ pub struct LibraryEntry {
     /// Slideshow source folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<PathBuf>,
+    /// The folder's subfolders are part of the slideshow too (the "Include
+    /// subfolders" box in the Add folder dialog). Only meaningful with
+    /// `folder`; older entries.json files have no such key and stay flat.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recursive: bool,
     /// Cached thumbnail path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<PathBuf>,
@@ -122,6 +128,7 @@ impl LibraryEntry {
             path: Some(path),
             paths: vec![],
             folder: None,
+            recursive: false,
             thumbnail: None,
             last_used: 0,
             broken: false,
@@ -157,6 +164,7 @@ impl LibraryEntry {
             path: Some(path),
             paths: vec![],
             folder: None,
+            recursive: false,
             thumbnail: None,
             last_used: 0,
             broken: false,
@@ -199,6 +207,7 @@ impl LibraryEntry {
             path: None,
             paths,
             folder: None,
+            recursive: false,
             thumbnail: None,
             last_used: 0,
             broken: false,
@@ -234,6 +243,7 @@ impl LibraryEntry {
             path: None,
             paths: vec![],
             folder: Some(folder),
+            recursive: false,
             thumbnail: None,
             last_used: 0,
             broken: false,
@@ -257,6 +267,14 @@ impl LibraryEntry {
         }
     }
 
+    /// Whether a folder slideshow also plays its subfolders. A builder rather
+    /// than a `new_slideshow` parameter so the many callers that just want the
+    /// flat default stay as they are.
+    pub fn with_recursive(mut self, recursive: bool) -> Self {
+        self.recursive = recursive;
+        self
+    }
+
     /// A slideshow built from hand-picked image files (no folder).
     pub fn new_image_set(paths: Vec<PathBuf>) -> Self {
         let name = tf!("Slideshow ({count} images)", "count" => paths.len().to_string());
@@ -267,6 +285,7 @@ impl LibraryEntry {
             path: None,
             paths,
             folder: None,
+            recursive: false,
             thumbnail: None,
             last_used: 0,
             broken: false,
@@ -298,10 +317,31 @@ impl LibraryEntry {
                 if !self.paths.is_empty() {
                     !self.paths.iter().any(|p| p.exists())
                 } else {
-                    self.folder.as_ref().is_none_or(|f| !f.exists())
+                    // A folder that exists but holds no image is as unplayable
+                    // as one that is gone. It used to pass, which is how a
+                    // folder of videos became a "working" slideshow card that
+                    // set fine, claimed to be in use, and showed nothing.
+                    self.slideshow_is_empty()
                 }
             }
         };
+    }
+
+    /// A folder-backed slideshow that has nothing to show: no folder, a
+    /// missing one, or one with no image the daemon would play (see
+    /// [`media::slideshow_frames`], the same scan the daemon uses). `false`
+    /// for anything that is not a folder slideshow — a hand-picked list is
+    /// judged by whether its files still exist, which `check_health` does.
+    ///
+    /// Scans the disk, so call it from the "set" path or a health pass, not
+    /// from a per-frame draw.
+    pub fn slideshow_is_empty(&self) -> bool {
+        self.kind == Kind::Slideshow
+            && self.paths.is_empty()
+            && self
+                .folder
+                .as_ref()
+                .is_none_or(|f| media::slideshow_frames(f, self.recursive).is_empty())
     }
 
     pub fn touch(&mut self) {
@@ -328,12 +368,14 @@ impl LibraryEntry {
                 self.path.clone().or_else(|| self.paths.first().cloned())
             }
             Kind::Image => self.path.clone(),
+            // The first frame the daemon will show, so the card previews what
+            // plays (and a folder of only videos finds none, instead of
+            // silently getting a placeholder for a slideshow that cannot run).
             Kind::Slideshow => self.paths.first().cloned().or_else(|| {
                 self.folder.as_ref().and_then(|f| {
-                    fs::read_dir(f).ok()?.flatten().find_map(|e| {
-                        let p = e.path();
-                        is_image(&p).then_some(p)
-                    })
+                    media::slideshow_frames(f, self.recursive)
+                        .into_iter()
+                        .next()
                 })
             }),
         };
@@ -511,7 +553,12 @@ impl LibraryEntry {
         }
         if self.paths.is_empty() {
             if let Some(folder) = self.folder.take() {
-                self.paths = folder_media(&folder, false);
+                // What is playing now (the daemon's own scan, subfolders
+                // included when the entry had them) — not every media file in
+                // the folder: a stray video in an image folder would otherwise
+                // be frozen into the list and flip the whole entry to a playlist.
+                self.paths = media::slideshow_frames(&folder, self.recursive);
+                self.recursive = false;
             } else if let Some(single) = self.path.take() {
                 self.paths = vec![single];
             }
@@ -618,6 +665,7 @@ impl LibraryEntry {
                     folder: self.folder.clone(),
                     paths: self.paths.clone(),
                     interval_s: self.interval_s.unwrap_or(30),
+                    recursive: self.recursive,
                     transition: self.transition.unwrap_or_default(),
                 })
             } else {
@@ -1315,21 +1363,14 @@ pub fn entries_for_each(paths: Vec<PathBuf>) -> Vec<LibraryEntry> {
         .collect()
 }
 
-/// How deep [`folder_media`] descends when asked to recurse. A bound rather
-/// than a full walk: `is_dir` follows symlinks, so an unbounded descent can
-/// loop forever on a self-referential link, and a wallpaper folder nested more
-/// than a few levels deep is not what "add this folder" means.
-const MAX_SCAN_DEPTH: usize = 4;
-
 /// Every supported media file in `dir`, sorted by file name.
 ///
 /// This is what lets "Add folder" offer *"as individual wallpapers"* next to
 /// its existing "as a timed slideshow" — the user complained that the folder
 /// picker only ever produced a slideshow. Non-recursive by default; the
-/// recursive walk is depth-bounded (see [`MAX_SCAN_DEPTH`]).
+/// recursive walk is depth-bounded (see [`media::MAX_SCAN_DEPTH`]).
 pub fn folder_media(dir: &Path, recursive: bool) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    scan_media(dir, if recursive { MAX_SCAN_DEPTH } else { 0 }, &mut out);
+    let mut out = media::scan(dir, recursive, &media::is_supported);
     // By file name, with the full path as tie-break so a recursive scan that
     // finds "01.jpg" in two subfolders is still deterministic.
     out.sort_by(|a, b| {
@@ -1340,18 +1381,50 @@ pub fn folder_media(dir: &Path, recursive: bool) -> Vec<PathBuf> {
     out
 }
 
-fn scan_media(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            if depth > 0 {
-                scan_media(&p, depth - 1, out);
+/// What a picked folder holds, split by what each half can become.
+///
+/// A timed slideshow can only show stills; a video loops until the interval
+/// cuts it off, so videos belong in a playlist. The Add folder dialog used to
+/// offer the slideshow regardless, and a folder of only videos became a
+/// slideshow with zero images (issue #36): a placeholder card, a black
+/// preview, and a daemon that had nothing to play.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FolderMedia {
+    pub images: Vec<PathBuf>,
+    /// Videos, GIFs included (see `media::VIDEO_EXTS`).
+    pub videos: Vec<PathBuf>,
+}
+
+/// What the Add folder dialog should offer for a [`FolderMedia`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderShape {
+    /// No supported file at all.
+    Empty,
+    ImagesOnly,
+    VideosOnly,
+    Mixed,
+}
+
+impl FolderMedia {
+    /// Partition a scan (see [`folder_media`]). Order within each half is kept.
+    pub fn partition(files: Vec<PathBuf>) -> Self {
+        let mut out = Self::default();
+        for p in files {
+            if is_video(&p) {
+                out.videos.push(p);
+            } else if is_image(&p) {
+                out.images.push(p);
             }
-        } else if is_video(&p) || is_image(&p) {
-            out.push(p);
+        }
+        out
+    }
+
+    pub fn shape(&self) -> FolderShape {
+        match (self.images.is_empty(), self.videos.is_empty()) {
+            (true, true) => FolderShape::Empty,
+            (false, true) => FolderShape::ImagesOnly,
+            (true, false) => FolderShape::VideosOnly,
+            (false, false) => FolderShape::Mixed,
         }
     }
 }
@@ -1362,14 +1435,10 @@ fn file_name_key(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Moving media (video or GIF). The extension list lives in [`media`], shared
+/// with the daemon.
 pub fn is_video(p: &Path) -> bool {
-    matches!(
-        p.extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_lowercase)
-            .as_deref(),
-        Some("mp4" | "webm" | "mkv" | "avi" | "mov" | "flv" | "gif")
-    )
+    media::is_video(p)
 }
 
 // ─── Media metadata ───────────────────────────────────────────────────────────
@@ -1523,14 +1592,9 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// A still image (a GIF is `is_video`, not this). See [`media`].
 pub fn is_image(p: &Path) -> bool {
-    matches!(
-        p.extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_lowercase)
-            .as_deref(),
-        Some("jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff")
-    )
+    media::is_still(p)
 }
 
 #[cfg(test)]
@@ -2213,5 +2277,214 @@ mod tests {
         assert_eq!(e.paths[2], PathBuf::from("/p/extra.png"));
         assert_eq!(e.kind, Kind::Slideshow);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── Folder imports (issue #36) ──────────────────────────────────────
+
+    fn media_dir(tag: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fresco-{tag}-{}", make_id()));
+        fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            let p = dir.join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, b"x").unwrap();
+        }
+        dir
+    }
+
+    fn names(v: &[PathBuf]) -> Vec<String> {
+        v.iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The dialog decides what to offer from this split: stills feed a
+    /// slideshow, videos (a GIF is one, it is animated) feed a playlist, and
+    /// anything else is dropped.
+    #[test]
+    fn folder_partitions_into_images_and_videos() {
+        let dir = media_dir("partition", &["b.png", "a.mp4", "c.gif", "notes.txt"]);
+        let split = FolderMedia::partition(folder_media(&dir, false));
+        assert_eq!(names(&split.images), ["b.png"]);
+        assert_eq!(names(&split.videos), ["a.mp4", "c.gif"]);
+        assert_eq!(split.shape(), FolderShape::Mixed);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn folder_shape_covers_every_combination() {
+        let shape = |files: &[&str]| {
+            FolderMedia::partition(files.iter().map(PathBuf::from).collect()).shape()
+        };
+        assert_eq!(shape(&[]), FolderShape::Empty);
+        assert_eq!(shape(&["/f/readme.txt"]), FolderShape::Empty);
+        assert_eq!(shape(&["/f/a.png", "/f/b.JPG"]), FolderShape::ImagesOnly);
+        assert_eq!(shape(&["/f/a.mp4", "/f/b.gif"]), FolderShape::VideosOnly);
+        assert_eq!(shape(&["/f/a.mp4", "/f/b.png"]), FolderShape::Mixed);
+    }
+
+    /// The scan the dialog uses honours "Include subfolders": media that lives
+    /// only underneath decides the shape only when the box is ticked.
+    #[test]
+    fn folder_partition_honours_subfolders() {
+        let dir = media_dir("partition-deep", &["clips/a.mp4", "clips/b.webm"]);
+        assert_eq!(
+            FolderMedia::partition(folder_media(&dir, false)).shape(),
+            FolderShape::Empty
+        );
+        let deep = FolderMedia::partition(folder_media(&dir, true));
+        assert_eq!(deep.shape(), FolderShape::VideosOnly);
+        assert_eq!(deep.videos.len(), 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bug itself: a slideshow over a folder of only videos used to pass
+    /// the health check, so it set fine, showed as in use and played nothing.
+    #[test]
+    fn a_video_only_folder_slideshow_is_broken() {
+        let dir = media_dir("video-only", &["a.mp4", "b.mkv"]);
+        let mut e = LibraryEntry::new_slideshow(dir.clone());
+        e.check_health();
+        assert!(e.broken, "no image in the folder: nothing to show");
+        assert!(e.slideshow_is_empty());
+
+        // The first still makes it a working slideshow again.
+        fs::write(dir.join("c.png"), b"x").unwrap();
+        e.check_health();
+        assert!(!e.broken);
+        assert!(!e.slideshow_is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn slideshow_health_covers_missing_and_nested_folders() {
+        let mut gone = LibraryEntry::new_slideshow(PathBuf::from("/nonexistent/fresco-36"));
+        gone.check_health();
+        assert!(gone.broken);
+
+        let dir = media_dir("nested-ss", &["2024/a.jpg"]);
+        let mut flat = LibraryEntry::new_slideshow(dir.clone());
+        flat.check_health();
+        assert!(flat.broken, "images only in a subfolder; not asked to look");
+        let mut deep = LibraryEntry::new_slideshow(dir.clone()).with_recursive(true);
+        deep.check_health();
+        assert!(!deep.broken);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `slideshow_is_empty` is about folder slideshows only; a playlist or a
+    /// hand-picked list is judged by `check_health` on its own files.
+    #[test]
+    fn only_folder_slideshows_can_be_empty() {
+        assert!(!LibraryEntry::new_playlist(vec![]).slideshow_is_empty());
+        assert!(!LibraryEntry::new_video(PathBuf::from("/v/a.mp4")).slideshow_is_empty());
+        assert!(!LibraryEntry::new_image_set(vec![PathBuf::from("/p/a.png")]).slideshow_is_empty());
+    }
+
+    /// The card thumbnail comes from the first frame the daemon would play,
+    /// and a video-only slideshow has none (no placeholder for a ghost).
+    #[test]
+    fn video_only_slideshow_has_no_thumbnail_source() {
+        let dir = media_dir("thumb-src", &["a.mp4"]);
+        let mut e = LibraryEntry::new_slideshow(dir.clone());
+        assert_eq!(e.generate_thumbnail_dims(), None);
+        assert!(e.thumbnail.is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The flag has to reach the daemon (`Slideshow.recursive`) and survive
+    /// entries.json; older files, which lack it, stay flat.
+    #[test]
+    fn recursive_flag_reaches_the_wallpaper_and_round_trips() {
+        let e = LibraryEntry::new_slideshow(PathBuf::from("/p/pics")).with_recursive(true);
+        assert!(e.to_wallpaper().slideshow.unwrap().recursive);
+        let back: LibraryEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert!(back.recursive);
+
+        let flat = LibraryEntry::new_slideshow(PathBuf::from("/p/pics"));
+        assert!(!flat.to_wallpaper().slideshow.unwrap().recursive);
+        assert!(
+            !serde_json::to_string(&flat).unwrap().contains("recursive"),
+            "the default is not written out"
+        );
+        let old: LibraryEntry = serde_json::from_str(
+            r#"{"id":"1-0","name":"p","kind":"slideshow","folder":"/p/pics"}"#,
+        )
+        .unwrap();
+        assert!(!old.recursive);
+    }
+
+    /// Adding to a folder slideshow freezes what is *playing* into a list. A
+    /// stray video next to the images must not come along (it would flip the
+    /// entry to a playlist), and subfolders count when the entry had them.
+    #[test]
+    fn materializing_a_folder_slideshow_keeps_what_was_playing() {
+        let dir = media_dir("mat-rec", &["1.png", "clip.mp4", "sub/2.png"]);
+        let mut e = LibraryEntry::new_slideshow(dir.clone()).with_recursive(true);
+        e.add_paths(vec![PathBuf::from("/p/extra.png")]);
+        assert_eq!(e.kind, Kind::Slideshow);
+        assert_eq!(names(&e.paths), ["1.png", "2.png", "extra.png"]);
+        assert!(!e.recursive, "a frozen list no longer follows a folder");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The GUI classifies files for import and thumbnails; the daemon decides
+    /// what a slideshow plays (`daemon::slideshow_images` is a straight call
+    /// to `media::slideshow_frames`, which is what this checks). They used to
+    /// disagree about `.gif`. Pinned: every still plays, no real video plays,
+    /// the one GIF exception a slideshow has always had still plays, and
+    /// nothing unsupported does, in either case.
+    #[test]
+    fn gui_and_daemon_agree_on_slideshow_media() {
+        let mut files = Vec::new();
+        for ext in media::STILL_EXTS
+            .iter()
+            .chain(media::VIDEO_EXTS)
+            .chain(&["txt", "pdf", "svg"])
+        {
+            files.push(format!("f.{ext}"));
+            files.push(format!("F2.{}", ext.to_uppercase()));
+        }
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        let dir = media_dir("parity", &refs);
+        let played: HashSet<PathBuf> = media::slideshow_frames(&dir, false).into_iter().collect();
+        for name in &files {
+            let p = dir.join(name);
+            let gif = name.to_lowercase().ends_with(".gif");
+            assert_eq!(
+                played.contains(&p),
+                is_image(&p) || gif,
+                "{name}: the daemon and the GUI disagree about whether a slideshow plays it"
+            );
+            if is_video(&p) && !gif {
+                assert!(
+                    !played.contains(&p),
+                    "{name}: a real video must not slideshow"
+                );
+            }
+        }
+        // Every file the import scan lists is one the GUI can classify.
+        for p in folder_media(&dir, false) {
+            assert!(is_image(&p) || is_video(&p), "{p:?}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The GUI's classifiers are thin views of the shared list, upper case
+    /// included; GIF is moving media for import purposes.
+    #[test]
+    fn gui_classifiers_follow_the_shared_extension_lists() {
+        for e in media::STILL_EXTS {
+            for name in [format!("x.{e}"), format!("X.{}", e.to_uppercase())] {
+                let p = Path::new(&name);
+                assert!(is_image(p) && !is_video(p), "{name}");
+            }
+        }
+        for e in media::VIDEO_EXTS {
+            for name in [format!("x.{e}"), format!("X.{}", e.to_uppercase())] {
+                let p = Path::new(&name);
+                assert!(is_video(p) && !is_image(p), "{name}");
+            }
+        }
     }
 }

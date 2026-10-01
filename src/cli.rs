@@ -33,7 +33,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use crate::capability::{detect, Capability};
+use crate::capability::{
+    detect, gnome_shell_version, gnome_x11_session_available, is_gnome_session, Capability,
+};
 use crate::config::Config;
 use crate::ipc::{request, request_with_timeout, Request, Response, StatusReply};
 
@@ -96,16 +98,51 @@ fn doctor() -> i32 {
     let cap = detect();
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into());
     let st = daemon_status();
+    // The still-frame backend is GNOME's, bar the rare old-muffin Cinnamon (or
+    // any other compositor without layer-shell) that lands in it too: only a
+    // real GNOME session has a Shell to ask the version of or an Xorg
+    // GNOME/Ubuntu session to log into instead.
+    let gnome_static = matches!(cap, Capability::WaylandGnomeStatic) && is_gnome_session();
+    let x11_session = gnome_static && gnome_x11_session_available();
 
     println!("{BOLD}Fresco doctor{RESET}\n");
     println!("  Session       {}", session_label(cap));
     println!("  Compositor    {desktop}");
+    if gnome_static {
+        if let Some(version) = gnome_shell_version() {
+            println!("  GNOME Shell   {version}");
+        }
+    }
     println!("  Backend       {}", backend_label(cap));
+    if gnome_static {
+        println!(
+            "  X11 session   {}",
+            if x11_session { "available" } else { "none" }
+        );
+    }
     if let Some(gpu) = gpu_name() {
         println!("  GPU           {gpu}");
     }
     if let Some(n) = st.as_ref().map(|s| s.monitors.len()).filter(|n| *n > 0) {
         println!("  Outputs       {n}");
+    }
+    // The GUI's toolkit, as a bug report needs it. The version functions read
+    // constants out of the loaded library, so no display is opened and this
+    // works over SSH and in a container.
+    #[cfg(feature = "gui")]
+    println!("  GTK           {}", gtk_version_label());
+    if let Some(r) = std::env::var("GSK_RENDERER")
+        .ok()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+    {
+        println!("  GSK renderer  {r} {DIM}(from GSK_RENDERER){RESET}");
+    }
+    if let Ok(cfg) = Config::load() {
+        println!(
+            "  Hover preview {}",
+            if cfg.hover_previews { "on" } else { "off" }
+        );
     }
 
     println!("\n{BOLD}Checks{RESET}");
@@ -118,7 +155,7 @@ fn doctor() -> i32 {
         }
         Capability::WaylandGnomeStatic => warn(
             "Live wallpaper supported",
-            "GNOME Wayland uses a static frame",
+            still_frame_hint(gnome_static, x11_session),
         ),
     }
     check(
@@ -304,6 +341,23 @@ fn backend_label(cap: Capability) -> String {
     }
 }
 
+/// Why a still-frame session has no live wallpaper, and what (if anything) the
+/// user can do about it. `gnome` is whether this is a real GNOME session;
+/// `x11_session` whether an Xorg GNOME/Ubuntu session is installed to log into.
+/// Ubuntu 25.10+ / 26.04 LTS, Fedora 43+ and GNOME 50 ship none, so "use an
+/// Xorg session" is only offered when one exists.
+fn still_frame_hint(gnome: bool, x11_session: bool) -> &'static str {
+    match (gnome, x11_session) {
+        (true, true) => {
+            "GNOME on Wayland can only show a still frame — log out and choose the GNOME/Ubuntu on Xorg session for live video"
+        }
+        (true, false) => {
+            "GNOME on Wayland can't play video wallpapers yet and no Xorg session is installed to fall back to — live video works on KDE Plasma, COSMIC, Hyprland, Sway and X11 desktops; a Fresco GNOME extension is planned"
+        }
+        (false, _) => "this Wayland compositor has no layer-shell, so Fresco can only show a still frame",
+    }
+}
+
 fn decode_label(hwdec: Option<&str>) -> String {
     match hwdec {
         Some("no") | None => "software".into(),
@@ -338,6 +392,17 @@ fn which(bin: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
         .unwrap_or(false)
+}
+
+/// The GTK runtime version, e.g. `4.14.5`. Needs no `gtk::init`.
+#[cfg(feature = "gui")]
+fn gtk_version_label() -> String {
+    format!(
+        "{}.{}.{}",
+        gtk4::major_version(),
+        gtk4::minor_version(),
+        gtk4::micro_version()
+    )
 }
 
 fn gpu_name() -> Option<String> {
@@ -1046,6 +1111,7 @@ mod lock_tests {
             host: "wlroots".into(),
             live_video: true,
             widgets: true,
+            still_frame: Some(true),
             locked,
             setup: crate::ipc::LockSetupState::NotNeeded,
             notes: Vec::new(),
@@ -1127,5 +1193,32 @@ mod lock_tests {
             decide_lock_action(LockRequestOutcome::ConnectedNotLocked),
             LockAction::Fallback
         );
+    }
+}
+
+#[cfg(test)]
+mod still_frame_tests {
+    use super::*;
+
+    #[test]
+    fn still_frame_hint_only_offers_xorg_when_a_session_exists() {
+        let with_xorg = still_frame_hint(true, true);
+        assert!(with_xorg.contains("Xorg session"), "{with_xorg}");
+        let without = still_frame_hint(true, false);
+        assert!(!without.contains("log out"), "{without}");
+        assert!(
+            without.contains("no Xorg session is installed"),
+            "{without}"
+        );
+        assert!(without.contains("extension is planned"), "{without}");
+    }
+
+    #[test]
+    fn still_frame_hint_does_not_call_a_non_gnome_compositor_gnome() {
+        for x11 in [false, true] {
+            let hint = still_frame_hint(false, x11);
+            assert!(!hint.contains("GNOME"), "{hint}");
+            assert!(hint.contains("layer-shell"), "{hint}");
+        }
     }
 }

@@ -103,7 +103,7 @@ export const ALTERNATIVES: Alternative[] = [
       },
       {
         q: "Does the Hidamari alternative work outside GNOME?",
-        a: "Yes. Fresco runs on any X11 desktop and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, KDE Plasma 6). GNOME on Wayland uses a static-frame fallback.",
+        a: "Yes. Fresco runs on any X11 desktop and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, KDE Plasma 6). GNOME on Wayland shows a still frame only for now; a Fresco GNOME extension for live video is planned.",
       },
       {
         q: "Is Fresco free like Hidamari?",

@@ -925,6 +925,7 @@ fn lock_scene_data<'a>(
         greeting: Some(greeting::GreetingData {
             text: "Good evening, Roy",
             avatar: Some(avatar),
+            initials: "R",
             text_size: 20.0,
         }),
         media: Some(lock_scene_media(art, avatar, with_lyrics)),
@@ -1017,7 +1018,7 @@ fn peek_lockscene() -> Result<()> {
 
 /// One [`lockscene::compose_still`] sample: a synthetic photo-like gradient
 /// background, blurred and dimmed exactly as a still-frame host would ask for
-/// (blur 0.4, dim 0.25) — the one case in this module where the wallpaper
+/// (blur at slider position 50 %, dim 0.25) — the one case in this module where the wallpaper
 /// itself, not just the widgets, is this code's problem.
 #[test]
 #[ignore]
@@ -1038,7 +1039,14 @@ fn peek_lockscene_still() -> Result<()> {
         reserved: Vec::new(),
     };
     let data = lock_scene_data(spec.arrangement, theme, &avatar, &art, false);
-    let bgra = lockscene::compose_still(&mut fonts, &bg, &spec, &data, 0.4, 0.25);
+    let bgra = lockscene::compose_still(
+        &mut fonts,
+        &bg,
+        &spec,
+        &data,
+        crate::lockscreen::blur_radius_for(50.0),
+        0.25,
+    );
     let path = dir.join("peek-lockscene-still-classic-1920x1080-dark.png");
     save_bgra_png(&bgra, &path)?;
     eprintln!("widgetkit sample: {}", path.display());

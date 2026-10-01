@@ -49,6 +49,7 @@
 //! Wayland, static GNOME-style); see each `hosts` submodule's own doc
 //! comment for the desktop-specific details.
 
+mod avatar;
 pub mod engine;
 pub mod hosts;
 pub mod notify;

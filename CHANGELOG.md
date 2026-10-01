@@ -4,7 +4,117 @@ All notable changes to Fresco are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.46] — Unreleased
+## [1.1.47] — Unreleased
+
+### Added
+- **A "Video previews on hover" switch in the main menu.** Turn it off and
+  hover previews stop completely: nothing plays and no preview clips are
+  made. Fresco also turns it off by itself, with a notice, if it finds it
+  closed unexpectedly while a preview was showing.
+- **Adding a folder of videos now offers "As a playlist"** (issue #36). The
+  Add folder dialog looks inside the folder first and offers a playlist for
+  videos, a timed slideshow for images, or both for a mixed folder, next to
+  "As individual wallpapers".
+- **`fresco doctor` now reports your GNOME Shell version and whether an Xorg
+  GNOME/Ubuntu session is installed** on GNOME Wayland, and gives advice
+  that fits what your system actually has.
+- **The deepin lock screen now shows a still frame of your wallpaper**
+  (issue #37). It used to keep deepin's default picture. Fresco renders a
+  still of the current wallpaper and sets it as the lock screen's
+  background, so deepin's own blur applies to it. Your original lock screen
+  picture is saved first and put back when Fresco stops, quits or restarts
+  after a crash, unless you picked a different picture yourself in the
+  meantime.
+- **The Lock Screen page now says what actually reaches the lock screen on
+  your desktop** (issue #37): live video and widgets, a still frame only, or
+  nothing yet. The same summary sits on the app menu's "Lock Screen…" row,
+  and turning the switch on where nothing can be shown tells you so instead
+  of looking as if it worked.
+
+### Changed
+- **Hover previews play a small stand-in clip instead of the original
+  video.** The first time you hover a large video, Fresco builds a 480 px,
+  15 fps, 4-second clip of it in the background with ffmpeg and plays that
+  from then on. Previews start after a short pause (about 0.3 s) over the
+  card rather than the instant the pointer touches it. Small videos and GIFs
+  play directly; without ffmpeg, a large video keeps its thumbnail on hover.
+- **GNOME on Wayland now says plainly that it shows a still frame.** The
+  status pill reads STILL FRAME (without a pause button) instead of PLAYING,
+  and the banner no longer tells you to log into an Xorg session that your
+  system doesn't have. GNOME 50, Ubuntu 25.10 and newer (including 26.04
+  LTS) and Fedora 43 and newer ship no Xorg session; there the banner says
+  live video isn't possible yet and that a Fresco GNOME extension is
+  planned. Where an Xorg session is installed, the banner still points to
+  it. A still-frame session that isn't GNOME (an older Cinnamon, or another
+  compositor without layer-shell) gets a plain "no layer-shell support"
+  message instead of GNOME's advice. The README, install guide and website say
+  the same.
+- **The Add folder dialog now looks inside the folder before offering
+  choices** (issue #36), and "Include subfolders" applies to all of them. A
+  folder whose media is only in subfolders gets the box ticked for you
+  instead of being reported as empty.
+- **The experimental deepin icon mirror has cleaner icon edges** (issue
+  #33). Icons were cut out with a rough one-bit mask, which dropped dark
+  detail and left dark fringes; the mask now keeps enclosed dark areas of an
+  icon and trims the fringe around it.
+- **The lock screen's Blur slider now uses a curve so its low range is
+  usable** (issue #37). It used to be linear, so only the first quarter of
+  the slider was usable and the rest was an unrecognisable smear; now the low
+  range gets most of the travel, and 100% is the old 30%. Settings you
+  already saved are converted once and keep their current look.
+
+### Fixed
+- **On COSMIC, an external monitor no longer shows a still frame while the
+  video plays underneath** (a 1.1.46 regression). 1.1.46 rewrote
+  `cosmic-bg`'s config with a new timestamped picture on every sync, and
+  `cosmic-bg` rebuilds its background surfaces on every output whenever its
+  config changes, which stacked them above the video. Fresco now uses fixed
+  file names, rewrites the config only when it actually changes, syncs
+  `cosmic-bg` before the video starts, and restarts the video once if a
+  reload can't be avoided. The lock screen's frame is refreshed when you lock.
+- **Turning the day/night schedule off no longer leaves the screen and the
+  library out of sync** (issue #32). The schedule swaps wallpapers in the
+  background service only, so after a switch the window still marked the
+  other slot's card as active, and turning the schedule off left the screen
+  and the library disagreeing about what was playing. The card of the
+  wallpaper that is actually playing is now marked active while a schedule
+  runs, turning the schedule off or pausing it keeps that wallpaper, and
+  resuming picks up the schedule again. A wallpaper you have just set also
+  shows as active straight away, instead of the previous card for a few
+  seconds.
+- **A folder of videos no longer becomes an empty slideshow** (issue #36).
+  It used to show "Slideshow (0 images)", a placeholder card and a black
+  preview, and play nothing. A slideshow with no images is now flagged as
+  broken and "Set" refuses it with a message that points you to a playlist.
+  A slideshow also now follows the folder's subfolders when you ticked
+  "Include subfolders"; before, that box only applied to adding files one by
+  one.
+- **Clicking the deepin desktop no longer flashes a coloured window over the
+  video when the icon mirror is on** (issue #33). The mirror paints deepin's
+  desktop window in a key colour, and a click made that window show for a
+  moment. Fresco now hides it from the compositor while the mirror runs and
+  puts it back when the mirror stops, or on the next start after a crash.
+  Icon windows also repaint from an off-screen copy, so newly cut-out parts
+  of an icon no longer wait for the next redraw.
+- **Hovering over a 4K video in the library could crash Fresco.** Previews
+  decoded the full-size video, making a new full-size picture for every
+  frame, which used up GPU memory under GTK's Vulkan renderer. The small
+  stand-in clips above fix this.
+- **The Avatar widget on the lock screen now shows your real account
+  picture** (issue #37). On deepin it showed a grey disc with a single
+  letter, because Fresco asked the wrong accounts service for the picture.
+  It now asks deepin's own accounts service first, then the standard one,
+  and picks up a new picture when you change it. If you have no picture, it
+  shows your initials.
+- **The lock screen preview is no longer black for large wallpapers and
+  always has a background** (issue #37). A wallpaper wider than 4096 px, such
+  as a photo or a 5K video frame, was dropped, leaving only the widgets on a
+  black window. The preview now shrinks it to fit, and when the wallpaper
+  can't be read it falls back to the Library thumbnail and then to a plain
+  gradient. If the preview image still can't be loaded, you get a message
+  instead of an empty window.
+
+## [1.1.46] — 2026-09-30
 
 ### Added
 - **Experimental "Show desktop icons over the video" on deepin** (issue

@@ -72,6 +72,25 @@
 //!   rescale it, so a channel within [`DDE_TOLERANCE`] of the key counts;
 //! * KWin, not Marco, is the window manager — whether it honours lowering the
 //!   DDE window after a click is only knowable on real hardware.
+//!
+//! Two more things follow from DDE painting into an *opaque* buffer. Edge and
+//! shadow pixels are already blended toward the key, so the Deepin flavour does
+//! not take "is it the key" per pixel at face value: `mask` fills the key-coloured
+//! holes an icon encloses and peels the one-pixel dark fringe that borders the
+//! key. And KWin raises DDE's window on a click and composites on its own
+//! schedule, so for a frame the key-coloured window would show over the video:
+//! `opacity` makes the window invisible to KWin (the offscreen copy we mirror
+//! from is unaffected), with a raise of our own windows as a second line.
+//!
+//! # How a refresh paints
+//!
+//! Each icon window has a *staging pixmap* as its background. A refresh copies
+//! Caja's new pixels into the staging pixmap, then (only if the visible pixels
+//! changed) sets the shape, then clears the window so the server paints it from
+//! the staging pixmap. Nothing depends on an Expose arriving: a pixel that the
+//! new shape reveals is painted by the server from pixels that are already
+//! there. (Copying straight into the window, as this used to, drew only inside
+//! the *old* shape, and relied on an Expose after the shape grew.)
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -91,6 +110,13 @@ use x11rb::protocol::xproto::*;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::{COPY_DEPTH_FROM_PARENT, NONE};
+
+use super::x11win;
+
+mod mask;
+mod opacity;
+#[cfg(test)]
+mod xvfb_harness;
 
 /// The background Caja paints while the mirror runs. Near-black, so the
 /// anti-aliased edges it leaves on icons and labels read as a shadow.
@@ -242,6 +268,9 @@ struct Caja {
     damage: damage::Damage,
     /// Where the window's origin is on the root, and its size.
     rect: Rectangle,
+    /// The window manager's frame around it, when it has reparented the
+    /// window (KWin does). Restacking shows up as a configure of the frame.
+    frame: Option<Window>,
     /// Diagnostics: when the second, later pixel sample is due (Deepin only —
     /// the DBus wallpaper change lands a moment after we attach).
     late_sample: Option<Instant>,
@@ -262,10 +291,48 @@ struct Child {
     parent: Parent,
     window: Window,
     gc: Gcontext,
+    /// The window's background: the latest copy of Caja's pixels under this
+    /// parent. The server paints the window from it, so a pixel the shape newly
+    /// reveals is never blank or stale.
+    staging: Pixmap,
     /// Per pixel of the parent: true where Caja drew something other than
     /// the key colour — i.e. where the icon window is visible.
     mask: Vec<bool>,
+    /// Deepin only: per pixel, [`mask::CLASS_KEY`] / `CLASS_DARK` / `CLASS_OTHER`.
+    /// The mask is derived from these, and they are what lets a small damage
+    /// rectangle be refined with the icon around it. Empty for Caja.
+    classes: Vec<u8>,
 }
+
+impl Child {
+    /// Destroy the window and free what was made for it. A BadWindow is
+    /// expected (and ignored) when the parent went first and took it along.
+    fn destroy(self, conn: &RustConnection) {
+        let _ = conn.destroy_window(self.window);
+        self.release(conn);
+    }
+
+    /// Free what outlives the window: its GC and staging pixmap.
+    fn release(self, conn: &RustConnection) {
+        let _ = conn.free_gc(self.gc);
+        let _ = conn.free_pixmap(self.staging);
+    }
+}
+
+/// A desktop window that came up over the wallpaper, and what has been done
+/// about it so far. One per click.
+struct Episode {
+    started: Instant,
+    acted: u8,
+}
+
+/// Re-checks after the first reaction to a raised desktop window, as offsets
+/// from it: KWin may take a moment to honour a restack.
+const RECHECK_AFTER: [Duration; 2] = [Duration::from_millis(30), Duration::from_millis(100)];
+/// An episode older than this is a new click, not a stubborn window manager.
+const EPISODE_LIFETIME: Duration = Duration::from_secs(2);
+/// Reactions per episode before the mirror stops fighting until it ends.
+const EPISODE_MAX_ACTIONS: u8 = 6;
 
 struct State {
     desktop: Desktop,
@@ -280,6 +347,15 @@ struct State {
     /// The wallpaper windows the daemon last asked us to cover.
     parents: Vec<Parent>,
     child_fmt: Option<ChildFmt>,
+    /// Deepin: `_NET_WM_WINDOW_OPACITY`, and the desktop window while it is
+    /// held at 0 (see `opacity`).
+    opacity_atom: Atom,
+    hider: Option<opacity::Hider>,
+    /// A stacking-relevant event arrived; `guard_stacking` must look.
+    stack_dirty: bool,
+    episode: Option<Episode>,
+    /// Instants at which the loop must wake to look at the stack again.
+    rechecks: Vec<Instant>,
 }
 
 fn run(desktop: Desktop, rx: Receiver<Cmd>, ready: &Sender<Result<Window, String>>) -> Result<()> {
@@ -301,6 +377,7 @@ fn run(desktop: Desktop, rx: Receiver<Cmd>, ready: &Sender<Result<Window, String
         .intern_atom(false, b"_NET_CLIENT_LIST_STACKING")?
         .reply()?
         .atom;
+    let opacity_atom = conn.intern_atom(false, opacity::ATOM_NAME)?.reply()?.atom;
     let msb_first = conn.setup().image_byte_order == ImageOrder::MSB_FIRST;
 
     let wake = conn.generate_id()?;
@@ -317,10 +394,16 @@ fn run(desktop: Desktop, rx: Receiver<Cmd>, ready: &Sender<Result<Window, String
         0,
         &CreateWindowAux::new().override_redirect(1),
     )?;
-    // Stacking changes arrive as property changes on the root.
+    // Stacking changes arrive as property changes on the root. On Deepin the
+    // window manager's frames are watched too: KWin restacks them (which we
+    // hear as a configure) before it updates the property.
+    let mut root_events = EventMask::PROPERTY_CHANGE;
+    if desktop == Desktop::Dde {
+        root_events |= EventMask::SUBSTRUCTURE_NOTIFY;
+    }
     conn.change_window_attributes(
         screen.root,
-        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        &ChangeWindowAttributesAux::new().event_mask(root_events),
     )?;
     conn.flush()?;
     let _ = ready.send(Ok(wake));
@@ -337,40 +420,72 @@ fn run(desktop: Desktop, rx: Receiver<Cmd>, ready: &Sender<Result<Window, String
         children: Vec::new(),
         parents: Vec::new(),
         child_fmt: None,
+        opacity_atom,
+        hider: None,
+        stack_dirty: false,
+        episode: None,
+        rechecks: Vec::new(),
     };
 
+    // Look at the stack once whatever the events say: on start, and whenever
+    // the set of windows we cover changes.
+    let mut check_stack = true;
     loop {
         loop {
             match rx.try_recv() {
-                Ok(Cmd::Parents(p)) => st.set_parents(p)?,
+                Ok(Cmd::Parents(p)) => {
+                    st.set_parents(p)?;
+                    check_stack = true;
+                }
                 Ok(Cmd::Stop) | Err(TryRecvError::Disconnected) => return Ok(()),
                 Err(TryRecvError::Empty) => break,
             }
         }
         if st.caja.is_none() {
             st.attach()?;
+            check_stack = true;
         }
-        st.guard_stacking()?;
+        if check_stack {
+            check_stack = false;
+            st.guard_stacking(Instant::now())?;
+        }
         st.conn.flush()?;
 
         let mut dirty: Option<Rectangle> = None;
         let mut restack = false;
-        // While a late diagnostic sample is pending, poll instead of blocking
-        // so it fires on time even if Caja/DDE stays quiet.
-        let first = if st.caja.as_ref().is_some_and(|c| c.late_sample.is_some()) {
-            let ev = st.conn.poll_for_event()?;
-            if ev.is_none() {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            ev
-        } else {
-            Some(st.conn.wait_for_event()?)
+        // While a deadline is pending (the late diagnostic sample, a re-check
+        // of the stack) poll instead of blocking, so it fires on time even if
+        // Caja/DDE stays quiet.
+        let first = match st.next_wake() {
+            Some((deadline, step)) => loop {
+                if let Some(ev) = st.conn.poll_for_event()? {
+                    break Some(ev);
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break None;
+                }
+                std::thread::sleep((deadline - now).min(step));
+            },
+            None => Some(st.conn.wait_for_event()?),
         };
+        let woke = Instant::now();
         if let Some(ev) = first {
             st.handle(ev, &mut dirty, &mut restack)?;
         }
         while let Some(ev) = st.conn.poll_for_event()? {
             st.handle(ev, &mut dirty, &mut restack)?;
+        }
+        let before = st.rechecks.len();
+        st.rechecks.retain(|&t| t > woke);
+        st.stack_dirty |= st.rechecks.len() != before;
+        // Before the slow part: a desktop window that has come up over the
+        // wallpaper is on screen until this runs. Caja is checked on every
+        // wake, as it always was; Deepin when an event said the stack moved.
+        if st.stack_dirty || st.desktop == Desktop::Caja {
+            st.stack_dirty = false;
+            st.guard_stacking(woke)?;
+            st.conn.flush()?;
         }
         if let Some(r) = dirty {
             st.refresh(r)?;
@@ -379,6 +494,25 @@ fn run(desktop: Desktop, rx: Receiver<Cmd>, ready: &Sender<Result<Window, String
             st.raise_children()?;
         }
         st.late_diagnostics();
+    }
+}
+
+impl Drop for State {
+    /// Every way out of the thread — a stop, an error, a lost display — leaves
+    /// the desktop window as it was found. (The X server frees the rest when
+    /// the connection closes; the opacity property is the one thing it would
+    /// not undo.)
+    fn drop(&mut self) {
+        if let Some(mut h) = self.hider.take() {
+            h.restore(&self.conn);
+        }
+        self.drop_children();
+        if let Some(f) = self.child_fmt.take() {
+            let _ = self.conn.free_colormap(f.colormap);
+        }
+        let _ = self.conn.flush();
+        // Round trip: once the thread has returned, the restore has landed.
+        let _ = self.conn.get_input_focus().map(|c| c.reply());
     }
 }
 
@@ -420,26 +554,70 @@ impl State {
         };
         // Deepin's 32-bit window: the icon windows must share its depth and
         // visual. A 24-bit one (older DDE) copies from the parent as usual.
+        // Attaching again to a window of the same format (DDE restarted) keeps
+        // the colormap the existing icon windows already use.
         let fmt = if geom.depth == self.root_depth {
             None
         } else {
-            let colormap = conn.generate_id()?;
-            conn.create_colormap(ColormapAlloc::NONE, colormap, self.root, visual)?;
-            Some(ChildFmt {
-                depth: geom.depth,
-                visual,
-                colormap,
-            })
+            match self.child_fmt {
+                Some(old) if old.depth == geom.depth && old.visual == visual => Some(old),
+                _ => {
+                    let colormap = conn.generate_id()?;
+                    conn.create_colormap(ColormapAlloc::NONE, colormap, self.root, visual)?;
+                    Some(ChildFmt {
+                        depth: geom.depth,
+                        visual,
+                        colormap,
+                    })
+                }
+            }
         };
         if fmt.map(|f| (f.depth, f.visual)) != self.child_fmt.map(|f| (f.depth, f.visual)) {
             self.drop_children();
         }
+        // The replaced colormap is no window's any more: free it rather than
+        // leaving one behind per attach.
+        if let Some(old) = self.child_fmt {
+            if fmt.map(|f| f.colormap) != Some(old.colormap) {
+                let _ = self.conn.free_colormap(old.colormap);
+            }
+        }
         self.child_fmt = fmt;
         let conn = &self.conn;
+        let mut events = EventMask::STRUCTURE_NOTIFY;
+        if self.desktop == Desktop::Dde {
+            // Opacity changes (DDE resets it) arrive as property changes.
+            events |= EventMask::PROPERTY_CHANGE;
+        }
         conn.change_window_attributes(
             window,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+            &ChangeWindowAttributesAux::new().event_mask(events),
         )?;
+        let frame = conn
+            .query_tree(window)?
+            .reply()
+            .ok()
+            .map(|t| t.parent)
+            .filter(|&p| p != self.root);
+        if self.desktop == Desktop::Dde && opacity::enabled() {
+            if let Some(old) = self.hider.take() {
+                old.forget();
+            }
+            match opacity::Hider::engage(&self.conn, self.opacity_atom, window) {
+                Ok(h) => {
+                    self.hider = Some(h);
+                    log::info!(
+                        "DDE: the desktop window is hidden from the compositor (opacity 0); \
+                         its icons are still mirrored"
+                    );
+                }
+                Err(e) => log::warn!(
+                    "DDE: could not hide the desktop window from the compositor ({e:#}); a \
+                     click on the desktop may flash it over the wallpaper"
+                ),
+            }
+        }
+        let conn = &self.conn;
         conn.composite_redirect_window(window, composite::Redirect::AUTOMATIC)?;
         let pixmap = conn.generate_id()?;
         conn.composite_name_window_pixmap(window, pixmap)?;
@@ -459,6 +637,7 @@ impl State {
                 width: geom.width,
                 height: geom.height,
             },
+            frame,
             late_sample: (self.desktop == Desktop::Dde).then(|| Instant::now() + LATE_SAMPLE),
         });
         log::info!(
@@ -494,11 +673,18 @@ impl State {
             .map(|v| format!("{:?}", v.class))
             .unwrap_or_else(|| "unknown".into());
         let sample = self.sample_pixmap();
+        // The probe sets a transparent wallpaper instead of the key colour, to
+        // see whether DDE's buffer then carries real alpha.
+        let probe = if super::dde::probe_alpha() {
+            " [probe=alpha: transparent wallpaper]"
+        } else {
+            ""
+        };
         match sample {
             Some(s) => log::info!(
-                "DDE mirror diagnostics ({when}): window {window:#x} depth {} visual {visual:#x} \
-                 class {class} geometry {}x{}{:+}{:+}; sampled {} px: alpha min {} max {}, \
-                 key-colour fraction {:.3}",
+                "DDE mirror diagnostics ({when}){probe}: window {window:#x} depth {} visual \
+                 {visual:#x} class {class} geometry {}x{}{:+}{:+}; sampled {} px: alpha min {} \
+                 max {} (partial {:.3}), key-colour fraction {:.3}",
                 geom.depth,
                 geom.width,
                 geom.height,
@@ -507,11 +693,13 @@ impl State {
                 s.count,
                 s.alpha_min,
                 s.alpha_max,
+                s.alpha_partial,
                 s.key_fraction
             ),
             None => log::info!(
-                "DDE mirror diagnostics ({when}): window {window:#x} depth {} visual {visual:#x} \
-                 class {class} geometry {}x{}{:+}{:+}; the window's pixels could not be read",
+                "DDE mirror diagnostics ({when}){probe}: window {window:#x} depth {} visual \
+                 {visual:#x} class {class} geometry {}x{}{:+}{:+}; the window's pixels could not \
+                 be read",
                 geom.depth,
                 geom.width,
                 geom.height,
@@ -565,9 +753,11 @@ impl State {
             count: 0,
             alpha_min: 255,
             alpha_max: 0,
+            alpha_partial: 0.0,
             key_fraction: 0.0,
         };
         let mut keys = 0u32;
+        let mut partial = 0u32;
         for i in 0..16u32 {
             let y = (u32::from(h) * i / 16).min(u32::from(h) - 1) as i16;
             let img = self
@@ -580,6 +770,9 @@ impl State {
                 let a = if self.msb_first { px[0] } else { px[3] };
                 s.alpha_min = s.alpha_min.min(a);
                 s.alpha_max = s.alpha_max.max(a);
+                if a != 0 && a != 255 {
+                    partial += 1;
+                }
                 s.count += 1;
                 if is_key(px, self.msb_first, self.desktop) {
                     keys += 1;
@@ -588,6 +781,7 @@ impl State {
         }
         if s.count > 0 {
             s.key_fraction = keys as f32 / s.count as f32;
+            s.alpha_partial = partial as f32 / s.count as f32;
         }
         Some(s)
     }
@@ -614,28 +808,95 @@ impl State {
     }
 
     /// Push Caja back below the wallpaper if a click brought it up.
-    fn guard_stacking(&self) -> Result<()> {
+    ///
+    /// `woke` is when the event that made us look arrived, for the timing in
+    /// the log. On Deepin lowering the desktop window is only a request KWin
+    /// may ignore (it lowers a window only within its own application), so our
+    /// own windows are raised as well — the move verified on Deepin 25 — and
+    /// the stack is looked at again shortly after, in case KWin was slow.
+    fn guard_stacking(&mut self, woke: Instant) -> Result<()> {
         let Some(caja) = &self.caja else {
             return Ok(());
         };
+        let window = caja.window;
         let ours: Vec<Window> = self.children.iter().map(|c| c.parent.window).collect();
-        if caja_above_ours(&self.stack(), caja.window, &ours) {
-            self.conn.configure_window(
-                caja.window,
-                &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
-            )?;
+        let label = self.desktop.label();
+        if !caja_above_ours(&self.stack(), window, &ours) {
+            if let Some(ep) = self.episode.take() {
+                log::debug!(
+                    "{label}: the desktop is below the wallpaper again, {:.1} ms after it came up",
+                    ep.started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(());
+        }
+        if self
+            .episode
+            .as_ref()
+            .is_none_or(|e| e.started.elapsed() > EPISODE_LIFETIME)
+        {
+            self.episode = Some(Episode {
+                started: woke,
+                acted: 0,
+            });
+        }
+        let Some(ep) = &mut self.episode else {
+            return Ok(());
+        };
+        ep.acted += 1;
+        let acted = ep.acted;
+        if acted > EPISODE_MAX_ACTIONS {
+            // The window manager is not having it; stop shouting until the
+            // next click starts a new episode.
+            return Ok(());
+        }
+        self.conn.configure_window(
+            window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
+        )?;
+        if self.desktop == Desktop::Dde {
+            for &w in &ours {
+                x11win::raise(&self.conn, w)?;
+            }
+        }
+        self.conn.flush()?;
+        if acted == 1 {
             log::debug!(
-                "{}: the desktop came up over the wallpaper; lowered it",
-                self.desktop.label()
+                "{label}: the desktop came up over the wallpaper; lowered it ({:.1} ms after the \
+                 event)",
+                woke.elapsed().as_secs_f64() * 1000.0
+            );
+            if self.desktop == Desktop::Dde {
+                let now = Instant::now();
+                self.rechecks.extend(RECHECK_AFTER.iter().map(|d| now + *d));
+            }
+        } else {
+            log::debug!(
+                "{label}: the desktop is still over the wallpaper (attempt {acted}); lowered it \
+                 again"
             );
         }
         Ok(())
     }
 
+    /// When the loop next has to wake without an event, and how often to look
+    /// for one meanwhile. `None` means block until something arrives.
+    fn next_wake(&self) -> Option<(Instant, Duration)> {
+        let late = self.caja.as_ref().and_then(|c| c.late_sample);
+        let recheck = self.rechecks.iter().min().copied();
+        let deadline = [late, recheck].into_iter().flatten().min()?;
+        // A re-check is worth a finer poll than the diagnostic sample.
+        let step = if recheck.is_some() {
+            Duration::from_millis(5)
+        } else {
+            Duration::from_millis(50)
+        };
+        Some((deadline, step))
+    }
+
     fn drop_children(&mut self) {
         for c in self.children.drain(..) {
-            let _ = self.conn.destroy_window(c.window);
-            let _ = self.conn.free_gc(c.gc);
+            c.destroy(&self.conn);
         }
     }
 
@@ -659,8 +920,7 @@ impl State {
             if parents.contains(&c.parent) {
                 kept.push(c);
             } else {
-                let _ = self.conn.destroy_window(c.window);
-                let _ = self.conn.free_gc(c.gc);
+                c.destroy(&self.conn);
             }
         }
         self.children = kept;
@@ -687,10 +947,20 @@ impl State {
     fn create_child(&self, p: Parent) -> Result<Child> {
         let conn = &self.conn;
         let window = conn.generate_id()?;
-        // No background: the server must not clear it to anything before the
-        // first copy lands.
-        let mut aux =
-            CreateWindowAux::new().event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY);
+        let staging = conn.generate_id()?;
+        // The staging pixmap is the window's background, so the two must agree
+        // on depth: the source's on Deepin, the parent's (which the window
+        // inherits) otherwise.
+        let pixmap_depth = match self.child_fmt {
+            Some(f) => f.depth,
+            None => conn.get_geometry(p.window)?.reply()?.depth,
+        };
+        conn.create_pixmap(pixmap_depth, staging, p.window, p.width, p.height)?;
+        // The server paints the window from the staging pixmap whenever any of
+        // it becomes visible, so no Expose is needed (or selected).
+        let mut aux = CreateWindowAux::new()
+            .background_pixmap(staging)
+            .event_mask(EventMask::STRUCTURE_NOTIFY);
         let (depth, visual) = match self.child_fmt {
             Some(f) => {
                 // A window whose depth differs from its parent's must name its
@@ -745,11 +1015,18 @@ impl State {
             p.window,
             &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
         )?;
+        let pixels = usize::from(p.width) * usize::from(p.height);
         Ok(Child {
             parent: p,
             window,
             gc,
-            mask: vec![false; usize::from(p.width) * usize::from(p.height)],
+            staging,
+            mask: vec![false; pixels],
+            classes: if self.desktop == Desktop::Dde {
+                vec![mask::CLASS_KEY; pixels]
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -784,20 +1061,17 @@ impl State {
                     }
                 }
             }
-            Event::Expose(e) => {
-                if let Some(c) = self.children.iter().find(|c| c.window == e.window) {
-                    let area = Rectangle {
-                        x: c.parent.x.saturating_add(e.x as i16),
-                        y: c.parent.y.saturating_add(e.y as i16),
-                        width: e.width,
-                        height: e.height,
-                    };
-                    *dirty = Some(union(*dirty, area));
-                }
-            }
             Event::PropertyNotify(e) if e.window == self.root && e.atom == self.stacking => {
-                // Handled every loop by `guard_stacking`, and a Caja that has
-                // just appeared is attached there too.
+                // The stack moved; `guard_stacking` looks (and a Caja that has
+                // just appeared is attached in the main loop).
+                self.stack_dirty = true;
+            }
+            Event::PropertyNotify(e) if e.atom == self.opacity_atom => {
+                if let Some(h) = &mut self.hider {
+                    if h.window() == e.window {
+                        h.on_change(&self.conn, Instant::now());
+                    }
+                }
             }
             Event::MapNotify(e) => {
                 let is_child = self.children.iter().any(|c| c.window == e.window);
@@ -806,20 +1080,17 @@ impl State {
                 }
             }
             Event::ConfigureNotify(e) => {
-                if let Some(caja) = &mut self.caja {
-                    if e.window == caja.window
-                        && (e.width != caja.rect.width || e.height != caja.rect.height)
-                    {
-                        // The offscreen copy is per size; name the new one.
-                        let _ = self.conn.free_pixmap(caja.pixmap);
-                        let pixmap = self.conn.generate_id()?;
-                        self.conn
-                            .composite_name_window_pixmap(caja.window, pixmap)?;
-                        caja.pixmap = pixmap;
-                        caja.rect.width = e.width;
-                        caja.rect.height = e.height;
-                        *dirty = Some(union(*dirty, caja.rect));
-                    }
+                let Some(caja) = &self.caja else {
+                    return Ok(());
+                };
+                let is_desktop = e.window == caja.window;
+                if is_desktop || caja.frame == Some(e.window) {
+                    // Restacked (or moved): look at the stack without waiting
+                    // for the window manager to update the property.
+                    self.stack_dirty = true;
+                }
+                if is_desktop {
+                    self.desktop_reconfigured(e.width, e.height, dirty)?;
                 }
             }
             Event::DestroyNotify(e) => {
@@ -828,9 +1099,17 @@ impl State {
                         "{}: the desktop window went away; waiting for it to return",
                         self.desktop.label()
                     );
-                    self.caja = None;
+                    if let Some(caja) = self.caja.take() {
+                        let _ = self.conn.free_pixmap(caja.pixmap);
+                    }
+                    // The window took its opacity with it; only the file is left.
+                    if let Some(h) = self.hider.take() {
+                        h.forget();
+                    }
+                    self.episode = None;
                     for c in &mut self.children {
                         c.mask.iter_mut().for_each(|m| *m = false);
+                        c.classes.iter_mut().for_each(|k| *k = mask::CLASS_KEY);
                         let _ = self.conn.shape_rectangles(
                             shape::SO::SET,
                             shape::SK::BOUNDING,
@@ -842,17 +1121,72 @@ impl State {
                         );
                     }
                 }
-                self.children.retain(|c| c.window != e.window);
+                if let Some(i) = self.children.iter().position(|c| c.window == e.window) {
+                    // The window is gone already; its GC and pixmap are not.
+                    self.children.remove(i).release(&self.conn);
+                }
             }
             Event::ClientMessage(e) if e.window == self.wake => {}
-            Event::Error(e) => log::debug!("MATE mirror: X error {e:?}"),
+            Event::Error(e) => log::debug!("{}: X error {e:?}", self.desktop.label()),
             _ => {}
         }
         Ok(())
     }
 
+    /// The desktop window was configured: it may have been resized, or moved.
+    ///
+    /// A move matters as much as a resize — the pixels are copied from the
+    /// window's offscreen pixmap at offsets worked out from where the window
+    /// sits on the root. The event's own x/y are relative to the window
+    /// manager's frame when it has reparented the window (KWin does), so the
+    /// origin is asked for rather than read from the event.
+    fn desktop_reconfigured(
+        &mut self,
+        width: u16,
+        height: u16,
+        dirty: &mut Option<Rectangle>,
+    ) -> Result<()> {
+        let Some(caja) = &mut self.caja else {
+            return Ok(());
+        };
+        let origin = self
+            .conn
+            .translate_coordinates(caja.window, self.root, 0, 0)?
+            .reply()
+            .ok();
+        let (x, y) = origin.map_or((caja.rect.x, caja.rect.y), |o| (o.dst_x, o.dst_y));
+        let resized = width != caja.rect.width || height != caja.rect.height;
+        if !resized && (x, y) == (caja.rect.x, caja.rect.y) {
+            return Ok(());
+        }
+        if resized {
+            // The offscreen copy is per size; name the new one.
+            let _ = self.conn.free_pixmap(caja.pixmap);
+            let pixmap = self.conn.generate_id()?;
+            self.conn
+                .composite_name_window_pixmap(caja.window, pixmap)?;
+            caja.pixmap = pixmap;
+        }
+        caja.rect = Rectangle {
+            x,
+            y,
+            width,
+            height,
+        };
+        *dirty = Some(union(*dirty, caja.rect));
+        Ok(())
+    }
+
     /// Re-read `area` (root coordinates) of Caja's offscreen copy and bring
     /// every icon window it touches up to date.
+    ///
+    /// Per icon window: read the new pixels and work out which of them are
+    /// visible; copy them into the staging pixmap that is the window's
+    /// background; change the shape only if the visible pixels differ from
+    /// what the shape already has; then clear the window, which has the server
+    /// paint it from the staging pixmap. Whatever the shape reveals is painted
+    /// from pixels already in place, so the result does not hang on any later
+    /// Expose.
     fn refresh(&mut self, area: Rectangle) -> Result<()> {
         let Some(caja) = &self.caja else {
             return Ok(());
@@ -861,71 +1195,142 @@ impl State {
             return Ok(());
         };
         let conn = &self.conn;
-        let desktop = self.desktop;
+        let (desktop, msb_first) = (self.desktop, self.msb_first);
         for c in &mut self.children {
             let Some(part) = intersect(area, c.parent.rect()) else {
                 continue;
             };
-            let pw = usize::from(c.parent.width);
-            let mut row = 0u16;
-            while row < part.height {
-                let h = BAND_ROWS.min(part.height - row);
-                let src_x = part.x - caja.rect.x;
-                let src_y = part.y - caja.rect.y + row as i16;
-                let Some(img) = conn
-                    .get_image(
-                        ImageFormat::Z_PIXMAP,
-                        caja.pixmap,
-                        src_x,
-                        src_y,
-                        part.width,
-                        h,
-                        !0,
-                    )?
-                    .reply()
-                    .ok()
-                else {
-                    return Ok(());
-                };
-                let stride = usize::from(part.width) * 4;
-                for dy in 0..usize::from(h) {
-                    let py =
-                        usize::try_from(part.y - c.parent.y).unwrap_or(0) + usize::from(row) + dy;
-                    let px0 = usize::try_from(part.x - c.parent.x).unwrap_or(0);
-                    let line = img.data.get(dy * stride..(dy + 1) * stride).unwrap_or(&[]);
-                    for (dx, px) in line.chunks_exact(4).enumerate() {
-                        if let Some(m) = c.mask.get_mut(py * pw + px0 + dx) {
-                            *m = !is_key(px, self.msb_first, desktop);
-                        }
-                    }
-                }
-                row += h;
-            }
+            let Some(changed) = read_part(conn, caja, c, part, desktop, msb_first)? else {
+                return Ok(());
+            };
+            let (dst_x, dst_y) = (part.x - c.parent.x, part.y - c.parent.y);
             conn.copy_area(
                 caja.pixmap,
-                c.window,
+                c.staging,
                 c.gc,
                 part.x - caja.rect.x,
                 part.y - caja.rect.y,
-                part.x - c.parent.x,
-                part.y - c.parent.y,
+                dst_x,
+                dst_y,
                 part.width,
                 part.height,
             )?;
-            let rects = mask_rects(&c.mask, c.parent.width, c.parent.height);
-            conn.shape_rectangles(
-                shape::SO::SET,
-                shape::SK::BOUNDING,
-                ClipOrdering::YX_SORTED,
-                c.window,
-                0,
-                0,
-                &rects,
-            )?;
+            if changed {
+                let rects = mask_rects(&c.mask, c.parent.width, c.parent.height);
+                conn.shape_rectangles(
+                    shape::SO::SET,
+                    shape::SK::BOUNDING,
+                    ClipOrdering::YX_SORTED,
+                    c.window,
+                    0,
+                    0,
+                    &rects,
+                )?;
+            }
+            conn.clear_area(false, c.window, dst_x, dst_y, part.width, part.height)?;
         }
         conn.flush()?;
         Ok(())
     }
+}
+
+/// Read `part` (root coordinates) of Caja's offscreen copy into `c`'s mask.
+///
+/// Returns whether the visible pixels changed (so the shape must be re-sent),
+/// or `None` when the pixels could not be read. Caja: a pixel is visible when
+/// it is not exactly the key. Deepin: the pixels are classified and the mask is
+/// refined from the cached classes of the whole icon — see [`mask`].
+fn read_part(
+    conn: &RustConnection,
+    caja: &Caja,
+    c: &mut Child,
+    part: Rectangle,
+    desktop: Desktop,
+    msb_first: bool,
+) -> Result<Option<bool>> {
+    let pw = usize::from(c.parent.width);
+    let ph = usize::from(c.parent.height);
+    let px0 = usize::try_from(part.x - c.parent.x).unwrap_or(0);
+    let py0 = usize::try_from(part.y - c.parent.y).unwrap_or(0);
+    let mut changed = false;
+    // Deepin: the box of pixels whose class differs from what was cached.
+    let mut classes_changed: Option<(usize, usize, usize, usize)> = None;
+    let mut row = 0u16;
+    while row < part.height {
+        let h = BAND_ROWS.min(part.height - row);
+        let src_x = part.x - caja.rect.x;
+        let src_y = part.y - caja.rect.y + row as i16;
+        let Some(img) = conn
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                caja.pixmap,
+                src_x,
+                src_y,
+                part.width,
+                h,
+                !0,
+            )?
+            .reply()
+            .ok()
+        else {
+            return Ok(None);
+        };
+        let stride = usize::from(part.width) * 4;
+        for dy in 0..usize::from(h) {
+            let py = py0 + usize::from(row) + dy;
+            let line = img.data.get(dy * stride..(dy + 1) * stride).unwrap_or(&[]);
+            for (dx, px) in line.chunks_exact(4).enumerate() {
+                let i = py * pw + px0 + dx;
+                match desktop {
+                    Desktop::Caja => {
+                        if let Some(m) = c.mask.get_mut(i) {
+                            let visible = !is_key(px, msb_first, desktop);
+                            changed |= *m != visible;
+                            *m = visible;
+                        }
+                    }
+                    Desktop::Dde => {
+                        if let Some(k) = c.classes.get_mut(i) {
+                            let class =
+                                mask::classify(pixel_rgb(px, msb_first), KEY, DDE_TOLERANCE);
+                            if *k != class {
+                                *k = class;
+                                let (x, y) = (px0 + dx, py);
+                                classes_changed = Some(match classes_changed {
+                                    None => (x, y, x, y),
+                                    Some((x0, y0, x1, y1)) => {
+                                        (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        row += h;
+    }
+    // A repaint that left every pixel in the same class (most of them) changes
+    // nothing about what is visible: no refine, no shape.
+    if let (Desktop::Dde, Some((x0, y0, x1, y1))) = (desktop, classes_changed) {
+        let dirty = mask::Area {
+            x: x0,
+            y: y0,
+            w: x1 - x0 + 1,
+            h: y1 - y0 + 1,
+        };
+        let (area, refined) = mask::refine_area(&c.classes, pw, ph, dirty);
+        for (r, new) in refined.chunks_exact(area.w).enumerate() {
+            let at = (area.y + r) * pw + area.x;
+            if let Some(old) = c.mask.get_mut(at..at + area.w) {
+                if old != new {
+                    changed = true;
+                    old.copy_from_slice(new);
+                }
+            }
+        }
+    }
+    Ok(Some(changed))
 }
 
 /// Diagnostic summary of a pixel sample.
@@ -933,11 +1338,23 @@ struct Sample {
     count: u32,
     alpha_min: u8,
     alpha_max: u8,
+    /// Fraction of pixels whose alpha is neither 0 nor 255.
+    alpha_partial: f32,
     key_fraction: f32,
 }
 
 /// How long after attaching the second diagnostic sample is taken.
 const LATE_SAMPLE: Duration = Duration::from_secs(3);
+
+/// The R, G, B of a 32-bit ZPixmap pixel, for either byte order. LSB-first is
+/// B, G, R, pad/alpha; MSB-first is pad/alpha, R, G, B.
+fn pixel_rgb(px: &[u8], msb_first: bool) -> [u8; 3] {
+    if msb_first {
+        [px[1], px[2], px[3]]
+    } else {
+        [px[2], px[1], px[0]]
+    }
+}
 
 /// Whether a 32-bit ZPixmap pixel is the key colour, for either byte order.
 ///
@@ -947,11 +1364,7 @@ const LATE_SAMPLE: Duration = Duration::from_secs(3);
 /// so a pure-black label shadow on Deepin is dropped; the icons themselves and
 /// their white labels are unaffected.
 fn is_key(px: &[u8], msb_first: bool, desktop: Desktop) -> bool {
-    let rgb = if msb_first {
-        [px[1], px[2], px[3]]
-    } else {
-        [px[2], px[1], px[0]]
-    };
+    let rgb = pixel_rgb(px, msb_first);
     match desktop {
         Desktop::Caja => rgb == KEY,
         Desktop::Dde => rgb
@@ -1071,6 +1484,13 @@ fn bg_state_file() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("fresco")
         .join("mate-mirror-background")
+}
+
+/// Give DDE's desktop window its original opacity back if a mirror run that
+/// hid it did not get to (a crash, a kill). Idempotent; a no-op without the
+/// state file `opacity` writes before it touches the window.
+pub(super) fn restore_desktop_opacity() {
+    opacity::restore_saved();
 }
 
 /// True while Caja is painting the key colour on our behalf. The still-frame

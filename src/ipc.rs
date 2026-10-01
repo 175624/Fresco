@@ -108,10 +108,19 @@ pub struct LockStatus {
     /// `"unsupported"`. See `daemon::lock::hosts::HostKind::id`.
     pub host: String,
     /// Whether this host can show the wallpaper as live video while locked
-    /// — false means still-frame only (GNOME, Cinnamon, MATE, Xfce, Deepin).
+    /// — false means no live surface (GNOME, Cinnamon, MATE, Xfce, Deepin);
+    /// [`LockStatus::still_frame`] says whether a still is shown instead.
     pub live_video: bool,
     /// Whether this host can show Fresco's own widgets while locked.
     pub widgets: bool,
+    /// Whether the real lock screen shows at least a still frame of Fresco's
+    /// wallpaper on this host. Implied by `live_video`; what separates "still
+    /// frame only" from "nothing reaches the lock screen yet" for a host with
+    /// neither live video nor widgets (the Lock Screen page's support
+    /// summary). `None` from a daemon that predates the field — the GUI then
+    /// says nothing rather than guess.
+    #[serde(default)]
+    pub still_frame: Option<bool>,
     /// Whether the session is locked right now.
     pub locked: bool,
     pub setup: LockSetupState,
@@ -177,6 +186,14 @@ pub struct StatusReply {
     /// parses as `None`; a current daemon always sets `Some(..)`.
     #[serde(default)]
     pub lockscreen: Option<LockStatus>,
+    /// Media file the DEFAULT wallpaper is showing right now, from the
+    /// daemon's in-memory config — which a day/night boundary swap updates
+    /// without ever saving, so unlike `config.toml` it says what is actually
+    /// on screen. `None` for playlists/slideshows (no single file) and from
+    /// an older daemon (`#[serde(default)]`), in which case the GUI falls
+    /// back to its own config.
+    #[serde(default)]
+    pub wallpaper_path: Option<PathBuf>,
 }
 
 /// Outcome of a [`Request::Lock`] attempt.
@@ -189,6 +206,10 @@ pub struct LockReply {
     pub message: Option<String>,
 }
 
+// `StatusReply` is a fat but short-lived value (one per request, never stored
+// in bulk); boxing it would ripple through every `Response::Status(..)`
+// pattern in the daemon, CLI and GUI for no real saving.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "lowercase")]
 pub enum Response {
@@ -571,14 +592,25 @@ mod tests {
             host: "cosmic".into(),
             live_video: true,
             widgets: true,
+            still_frame: Some(true),
             locked: false,
             setup: LockSetupState::NotNeeded,
             notes: vec!["cosmic-greeter's own panel stays put for now".into()],
         };
         assert_eq!(
             serde_json::to_string(&status).unwrap(),
-            r#"{"enabled":true,"host":"cosmic","live_video":true,"widgets":true,"locked":false,"setup":"notneeded","notes":["cosmic-greeter's own panel stays put for now"]}"#
+            r#"{"enabled":true,"host":"cosmic","live_video":true,"widgets":true,"still_frame":true,"locked":false,"setup":"notneeded","notes":["cosmic-greeter's own panel stays put for now"]}"#
         );
+    }
+
+    /// A status from a daemon that predates `still_frame` still parses, and
+    /// reads as "unknown" (`None`) rather than guessing either way — the GUI
+    /// says nothing about the still frame then.
+    #[test]
+    fn lock_status_without_still_frame_parses_as_unknown() {
+        let old = r#"{"enabled":true,"host":"deepin","live_video":false,"widgets":false,"locked":false,"setup":"notneeded","notes":[]}"#;
+        let status: LockStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(status.still_frame, None);
     }
 
     // -- lock screen: round-trips -------------------------------------------
@@ -648,6 +680,7 @@ mod tests {
                 host: "wlroots".into(),
                 live_video: false,
                 widgets: false,
+                still_frame: Some(false),
                 locked: true,
                 setup: LockSetupState::Unavailable,
                 notes: Vec::new(),
@@ -656,6 +689,29 @@ mod tests {
         });
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""lockscreen":{"#), "{s}");
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+    }
+
+    /// `wallpaper_path` arrived after the other status fields: a reply from an
+    /// older daemon (no such key) must parse as `None`, and a current one must
+    /// carry the path through unchanged.
+    #[test]
+    fn status_reply_wallpaper_path_backcompat_and_roundtrip() {
+        let old = r#"{"result":"status","running":true,"paused":false,"hwdec":null,
+                      "wallpaper":null,"cpu_percent":0.0,"rss_mb":10,"monitors":[],"error":null}"#;
+        match serde_json::from_str::<Response>(old).unwrap() {
+            Response::Status(s) => assert_eq!(s.wallpaper_path, None),
+            other => panic!("expected a status reply, got {other:?}"),
+        }
+
+        let r = Response::Status(StatusReply {
+            running: true,
+            wallpaper_path: Some(PathBuf::from("/walls/night.mp4")),
+            ..Default::default()
+        });
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""wallpaper_path":"/walls/night.mp4""#), "{s}");
         let back: Response = serde_json::from_str(&s).unwrap();
         assert_eq!(r, back);
     }

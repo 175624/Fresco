@@ -260,9 +260,12 @@ pub struct ResolvedLock {
     pub live_video: LiveVideo,
     /// Wallpaper darkening under the widgets, already clamped to `0.0..=0.8`.
     pub dim: f32,
-    /// Still-frame blur, already clamped to `0.0..=1.0`. Meaningful only when
-    /// [`ResolvedLock::live_video`] is not currently playing — see
-    /// [`crate::config::LockScreen::blur`].
+    /// Still-frame blur **radius** (Gaussian σ, as a fraction of the output's
+    /// height), already mapped through [`blur_radius_for`] and so within
+    /// `0.0..=`[`BLUR_MAX_RADIUS`]. This is what to hand
+    /// [`crate::widgetkit::lockscene::compose_still`]; it is not the slider
+    /// position stored in [`crate::config::LockScreen::blur`]. Meaningful only
+    /// when [`ResolvedLock::live_video`] is not currently playing.
     pub blur: f32,
     /// What the greeting widget should say, if it is present in
     /// [`ResolvedLock::widgets`] at all.
@@ -275,8 +278,68 @@ pub struct ResolvedLock {
 /// result than the plain lock screen this feature exists to replace.
 const MAX_DIM: f32 = 0.8;
 
-/// Upper bound [`crate::config::LockScreen::blur`] is clamped to on resolve.
-const MAX_BLUR: f32 = 1.0;
+/// The blur radius at the top of the slider, as a fraction of the output's
+/// height (so ~324 px of σ on a 1080p screen). It is deliberately what the old
+/// *linear* slider produced at 30 %: by then the wallpaper had already dissolved
+/// into colour blobs, so there is nothing useful further out and no reason to
+/// spend slider travel there.
+pub const BLUR_MAX_RADIUS: f32 = 0.30;
+
+/// How fast the blur radius grows along the slider: `radius ∝ position^2`.
+///
+/// Blur strength is judged by ratio, not by difference — going from a 2 px
+/// blur to a 4 px one is as visible as going from 40 px to 80 px. A linear
+/// slider therefore wastes nearly all of its travel on blurs that are already
+/// "too much" and crams every subtle one into the first few pixels of
+/// thumb movement. A square keeps the relative change per step near one
+/// just-noticeable difference (`dσ/σ = 2·dp/p`: 20 % per 1 % step at 10 %
+/// position, 4 % at 50 %), so no step is wasted and none is a jump. It is also
+/// smooth, monotonic, and exactly invertible, which the config migration needs.
+pub const BLUR_EXPONENT: f32 = 2.0;
+
+/// The one place a blur setting becomes a blur radius.
+///
+/// `percent` is the slider position, `0.0..=100.0` (clamped; `NaN` is `0`).
+/// The result is the Gaussian σ as a fraction of the output's height —
+/// `0.0` for no blur, [`BLUR_MAX_RADIUS`] at `100.0`, and
+/// `BLUR_MAX_RADIUS * (percent / 100)^`[`BLUR_EXPONENT`] in between. Strictly
+/// increasing, so a higher setting is never a softer picture.
+///
+/// ```text
+/// slider  0%   10%    20%    30%    50%    70%    100%
+/// radius  0   .0030  .0120  .0270  .0750  .1470  .3000   (× output height)
+/// ```
+pub fn blur_radius_for(percent: f32) -> f32 {
+    let p = clamp_finite(percent, 0.0, 100.0) / 100.0;
+    BLUR_MAX_RADIUS * p.powf(BLUR_EXPONENT)
+}
+
+/// The slider position (`0.0..=100.0`) whose [`blur_radius_for`] equals the
+/// given radius — the exact inverse, clamped to the slider's range.
+pub fn blur_percent_for_radius(radius: f32) -> f32 {
+    let r = clamp_finite(radius, 0.0, BLUR_MAX_RADIUS) / BLUR_MAX_RADIUS;
+    100.0 * r.powf(1.0 / BLUR_EXPONENT)
+}
+
+/// A `blur` stored on the old linear scale (where it *was* the radius), as the
+/// slider position that reproduces that radius. Old values past
+/// [`BLUR_MAX_RADIUS`] saturate at `100.0`.
+pub fn legacy_blur_to_percent(old: f32) -> f32 {
+    blur_percent_for_radius(old)
+}
+
+/// The slider position (`0.0..=100.0`) a [`crate::config::LockScreen`]
+/// currently means, whichever scale it was stored on. [`resolve`] and the
+/// settings slider both read blur through this, so an un-migrated config (one
+/// handed over without going through `Config::load_from`) still renders and
+/// displays the way it always did.
+pub fn blur_percent(cfg: &LockScreen) -> f32 {
+    if cfg.blur_curve < crate::config::LOCK_BLUR_CURVE {
+        legacy_blur_to_percent(cfg.blur)
+    } else {
+        clamp_finite(cfg.blur, 0.0, 1.0) * 100.0
+    }
+}
 
 /// Resolve a [`crate::config::LockScreen`] into everything a host needs to
 /// draw it.
@@ -317,7 +380,7 @@ pub fn resolve(cfg: &LockScreen) -> ResolvedLock {
         widgets,
         live_video: cfg.live_video,
         dim: clamp_finite(cfg.dim, 0.0, MAX_DIM),
-        blur: clamp_finite(cfg.blur, 0.0, MAX_BLUR),
+        blur: blur_radius_for(blur_percent(cfg)),
         greeting,
     }
 }
@@ -480,13 +543,13 @@ mod tests {
         assert_eq!(at(-5.0, -5.0).dim, 0.0);
         assert_eq!(at(-5.0, -5.0).blur, 0.0);
         assert_eq!(at(5.0, 5.0).dim, MAX_DIM);
-        assert_eq!(at(5.0, 5.0).blur, MAX_BLUR);
+        assert_eq!(at(5.0, 5.0).blur, BLUR_MAX_RADIUS);
         assert_eq!(at(0.4, 0.6).dim, 0.4, "inside the range must pass through");
-        assert_eq!(at(0.4, 0.6).blur, 0.6);
+        assert_close(at(0.4, 0.6).blur, blur_radius_for(60.0));
         // Boundary values are not pushed inward.
         assert_eq!(at(0.0, 0.0).dim, 0.0);
-        assert_eq!(at(MAX_DIM, MAX_BLUR).dim, MAX_DIM);
-        assert_eq!(at(MAX_DIM, MAX_BLUR).blur, MAX_BLUR);
+        assert_eq!(at(MAX_DIM, 1.0).dim, MAX_DIM);
+        assert_eq!(at(MAX_DIM, 1.0).blur, BLUR_MAX_RADIUS);
     }
 
     #[test]
@@ -502,7 +565,11 @@ mod tests {
             assert!(!r.dim.is_nan(), "dim must never resolve to NaN");
             assert!(!r.blur.is_nan(), "blur must never resolve to NaN");
             assert!((0.0..=MAX_DIM).contains(&r.dim), "{v} -> dim {}", r.dim);
-            assert!((0.0..=MAX_BLUR).contains(&r.blur), "{v} -> blur {}", r.blur);
+            assert!(
+                (0.0..=BLUR_MAX_RADIUS).contains(&r.blur),
+                "{v} -> blur {}",
+                r.blur
+            );
         }
         // Infinities saturate like any other out-of-range value; NaN falls
         // back to the bottom of the range (the least intrusive outcome) rather
@@ -510,6 +577,113 @@ mod tests {
         assert_eq!(clamp_finite(f32::INFINITY, 0.0, MAX_DIM), MAX_DIM);
         assert_eq!(clamp_finite(f32::NEG_INFINITY, 0.0, MAX_DIM), 0.0);
         assert_eq!(clamp_finite(f32::NAN, 0.0, MAX_DIM), 0.0);
+    }
+
+    // -- blur_radius_for(): the slider curve -------------------------------------
+
+    fn assert_close(a: f32, b: f32) {
+        assert!((a - b).abs() <= 1e-5, "{a} != {b}");
+    }
+
+    #[test]
+    fn blur_radius_zero_is_no_blur_and_full_slider_is_the_old_thirty_percent() {
+        assert_eq!(blur_radius_for(0.0), 0.0);
+        assert_eq!(blur_radius_for(100.0), BLUR_MAX_RADIUS);
+        // The top of the new slider is exactly what the old linear slider
+        // gave at 30 %.
+        assert_close(BLUR_MAX_RADIUS, 0.30);
+    }
+
+    #[test]
+    fn blur_radius_is_strictly_increasing_across_the_whole_slider() {
+        let mut prev = blur_radius_for(0.0);
+        for step in 1..=100 {
+            let r = blur_radius_for(step as f32);
+            assert!(r > prev, "step {step}: {r} must exceed {prev}");
+            prev = r;
+        }
+        // Fine steps too, not only whole percents.
+        let mut prev = 0.0_f32;
+        for i in 1..=1000 {
+            let r = blur_radius_for(i as f32 / 10.0);
+            assert!(r > prev, "{}%", i as f32 / 10.0);
+            prev = r;
+        }
+    }
+
+    #[test]
+    fn blur_radius_gives_the_low_range_fine_control() {
+        // The complaint this exists to fix: with the old linear slider 10 %
+        // was already a faint outline and 20 % colour blobs. On the curve the
+        // first half of the slider stays under the old 8 % — a picture still
+        // recognisably the wallpaper — and no single 1 % step ever moves the
+        // radius by more than ~20 % of itself above the 10 % mark.
+        assert!(blur_radius_for(50.0) < 0.08);
+        assert_close(blur_radius_for(10.0), 0.003);
+        assert_close(blur_radius_for(20.0), 0.012);
+        assert_close(blur_radius_for(50.0), 0.075);
+        for p in 10..100 {
+            let (a, b) = (blur_radius_for(p as f32), blur_radius_for(p as f32 + 1.0));
+            assert!(b / a < 1.22, "{p}%: step grows the radius by {}x", b / a);
+        }
+    }
+
+    #[test]
+    fn old_ten_and_twenty_percent_land_high_on_the_new_slider() {
+        // The same pictures as before, found further along the slider: the old
+        // 10 % (a faint outline) at ~58 %, the old 20 % (colour blobs) at ~82 %,
+        // the old 30 % at the very end.
+        assert!((legacy_blur_to_percent(0.10) - 57.74).abs() < 0.01);
+        assert!((legacy_blur_to_percent(0.20) - 81.65).abs() < 0.01);
+        assert_close(legacy_blur_to_percent(0.30), 100.0);
+        for old in [0.0_f32, 0.01, 0.05, 0.10, 0.20, 0.30] {
+            assert_close(blur_radius_for(legacy_blur_to_percent(old)), old);
+        }
+    }
+
+    #[test]
+    fn legacy_blur_beyond_the_new_maximum_saturates_and_junk_is_harmless() {
+        assert_eq!(legacy_blur_to_percent(0.31), 100.0);
+        assert_eq!(legacy_blur_to_percent(1.0), 100.0);
+        assert_eq!(legacy_blur_to_percent(9.0), 100.0);
+        assert_eq!(legacy_blur_to_percent(-1.0), 0.0);
+        assert_eq!(legacy_blur_to_percent(f32::NAN), 0.0);
+        assert_eq!(legacy_blur_to_percent(f32::INFINITY), 100.0);
+        assert_eq!(blur_radius_for(f32::NAN), 0.0);
+        assert_eq!(blur_radius_for(-5.0), 0.0);
+        assert_eq!(blur_radius_for(500.0), BLUR_MAX_RADIUS);
+        assert_eq!(blur_radius_for(f32::INFINITY), BLUR_MAX_RADIUS);
+    }
+
+    #[test]
+    fn blur_percent_for_radius_inverts_blur_radius_for() {
+        for p in 0..=100 {
+            let p = p as f32;
+            let back = blur_percent_for_radius(blur_radius_for(p));
+            assert!((back - p).abs() < 0.01, "{p} -> {back}");
+        }
+    }
+
+    #[test]
+    fn resolve_reads_an_unmigrated_legacy_blur_as_the_old_radius() {
+        // A config that never went through `Config::load_from` (blur_curve 0)
+        // must still resolve to the radius it always did.
+        for old in [0.0_f32, 0.05, 0.1, 0.2, 0.3] {
+            let legacy = LockScreen {
+                blur: old,
+                blur_curve: 0,
+                ..cfg()
+            };
+            assert_close(resolve(&legacy).blur, old);
+        }
+        // ...while the same number on the current scale is a slider position.
+        let current = LockScreen {
+            blur: 0.5,
+            blur_curve: crate::config::LOCK_BLUR_CURVE,
+            ..cfg()
+        };
+        assert_close(resolve(&current).blur, blur_radius_for(50.0));
+        assert_close(blur_percent(&current), 50.0);
     }
 
     // -- resolve(): clock theme overrides --------------------------------------

@@ -2,6 +2,7 @@
 //! `ipc::request(&Request::Status)`.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -10,6 +11,8 @@ use gtk4::{glib, glib::ControlFlow};
 
 use crate::ipc::{self, MonitorInfo, Request, StatusReply};
 use crate::{t, tf};
+
+use super::lockscreen::{lock_support_of, LockSupport};
 
 thread_local! {
     /// Last `monitors_info` this poll loop saw, so other GUI code (e.g. the
@@ -23,6 +26,99 @@ thread_local! {
 /// read of state `poll_once` already fetched in the background.
 pub(crate) fn cached_monitors() -> Vec<MonitorInfo> {
     LAST_MONITORS.with(|m| m.borrow().clone())
+}
+
+thread_local! {
+    /// Media file the daemon last said the default wallpaper is playing
+    /// (`StatusReply::wallpaper_path`). A day/night swap changes this without
+    /// touching config.toml, so it is the only place the GUI can learn which
+    /// card is really on screen — see `cached_playing_path`.
+    static LAST_PLAYING: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    /// Redraws the library when `LAST_PLAYING` changes; installed once by the
+    /// library view (mirrors `NOTICE_HOOK`).
+    static PLAYING_HOOK: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// The pill the poll loop feeds, kept so [`poll_soon`] can poll on demand.
+    static POLL_WIDGETS: RefCell<Option<Rc<PillWidgets>>> = const { RefCell::new(None) };
+    /// What the last status poll said reaches this desktop's real lock screen,
+    /// for the app menu's "Lock Screen…" row — see `cached_lock_support`.
+    static LAST_LOCK_SUPPORT: Cell<Option<LockSupport>> = const { Cell::new(None) };
+}
+
+/// How long [`poll_soon`] waits: long enough for the daemon to have finished
+/// the apply that prompted it, short enough to feel immediate.
+const POLL_SOON_MS: u64 = 500;
+
+/// Poll the daemon shortly, instead of at the next 4 s tick. Call after the GUI
+/// changed what plays (see [`forget_playing_path`]) so the pill and the library
+/// learn the new state promptly. A no-op before the pill exists.
+pub(crate) fn poll_soon() {
+    let Some(widgets) = POLL_WIDGETS.with(|w| w.borrow().clone()) else {
+        return;
+    };
+    glib::timeout_add_local_once(Duration::from_millis(POLL_SOON_MS), move || {
+        poll_once(widgets);
+    });
+}
+
+/// What the daemon reported as playing on the last status poll. `None` before
+/// the first poll lands, while the daemon isn't running, or when it has no
+/// single file to name (playlist/slideshow, or an older daemon). Never blocks.
+pub(crate) fn cached_playing_path() -> Option<PathBuf> {
+    LAST_PLAYING.with(|p| p.borrow().clone())
+}
+
+/// Drop the cached playing path *without* running the hook, because the GUI is
+/// about to change which wallpaper plays (a Set, a schedule being switched on)
+/// and the cache describes the one it is replacing.
+///
+/// The cache is only refreshed by the 4 s status poll. Left alone after a Set,
+/// it would keep naming the old file for up to that long: the library would
+/// highlight the old card for a schedule's sake, and an Off or Pause in that
+/// window would adopt the old wallpaper as "what is playing" and re-apply it,
+/// flipping the screen back. Unknown (`None`) is the safe answer meanwhile —
+/// callers then fall back to the config / the schedule's clock — and the caller
+/// redraws on its own, so no hook is needed. Follow with [`poll_soon`] to
+/// learn the truth sooner than the next tick.
+pub(crate) fn forget_playing_path() {
+    LAST_PLAYING.with(|p| *p.borrow_mut() = None);
+}
+
+/// Register the callback fired when [`cached_playing_path`] changes — and only
+/// then, so a 4 s poll that sees the same wallpaper never rebuilds the grid.
+pub(crate) fn on_playing_path_changed(hook: impl Fn() + 'static) {
+    PLAYING_HOOK.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
+}
+
+/// Store the polled path; true when it differs from the previous one.
+fn set_cached_playing_path(path: Option<PathBuf>) -> bool {
+    LAST_PLAYING.with(|p| {
+        let mut slot = p.borrow_mut();
+        if *slot == path {
+            false
+        } else {
+            *slot = path;
+            true
+        }
+    })
+}
+
+/// Cache a poll's result and tell the library only if it moved. The hook is
+/// cloned out before it runs: it re-renders the grid, which reads the cache.
+fn note_playing_path(path: Option<PathBuf>) {
+    if set_cached_playing_path(path) {
+        let hook = PLAYING_HOOK.with(|h| h.borrow().clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// What reaches the real lock screen on this desktop, as of the last status
+/// poll. `None` before the first poll lands, while the daemon isn't running,
+/// or when it predates the capability data. Never blocks, like
+/// [`cached_monitors`].
+pub(crate) fn cached_lock_support() -> Option<LockSupport> {
+    LAST_LOCK_SUPPORT.with(Cell::get)
 }
 
 /// Callback that shows/hides the service notice from a reachability result.
@@ -139,6 +235,12 @@ struct PillWidgets {
     hwdec: gtk4::Label,
     toggle: gtk4::Button,
     pill: gtk4::Box,
+    /// This session only ever paints a still frame (GNOME Wayland): the daemon
+    /// reports "running" for it, but nothing is playing and Pause/Resume are
+    /// no-ops, so the pill must not say PLAYING or offer a pause button.
+    /// Derived from the session capability once at build — `StatusReply`
+    /// cannot say it, and no IPC change is needed.
+    still_frame: bool,
 }
 
 /// Build the status pill (dot + wallpaper name + hwdec badge + CPU% + a
@@ -186,6 +288,8 @@ pub fn build_status_pill() -> gtk4::Widget {
         hwdec,
         toggle: toggle.clone(),
         pill: pill.clone(),
+        still_frame: crate::capability::detect()
+            == crate::capability::Capability::WaylandGnomeStatic,
     });
 
     {
@@ -207,6 +311,7 @@ pub fn build_status_pill() -> gtk4::Widget {
         });
     }
 
+    POLL_WIDGETS.with(|w| *w.borrow_mut() = Some(widgets.clone()));
     poll_once(widgets.clone());
     // Runs for the life of the process: the single window (build_ui guards
     // against duplicates) closing quits the app, taking the timer with it.
@@ -236,6 +341,9 @@ fn poll_once(widgets: Rc<PillWidgets>) {
         match result {
             Ok(crate::ipc::Response::Status(status)) => {
                 LAST_MONITORS.with(|m| *m.borrow_mut() = status.monitors_info.clone());
+                note_playing_path(status.wallpaper_path.clone());
+                LAST_LOCK_SUPPORT
+                    .with(|c| c.set(status.lockscreen.as_ref().and_then(lock_support_of)));
                 apply_status(&widgets, &status);
                 notify_reachable(status.running);
             }
@@ -244,6 +352,8 @@ fn poll_once(widgets: Rc<PillWidgets>) {
                 // Daemon not running — expected and common, not an error.
                 log::debug!("status poll: daemon unreachable: {e:#}");
                 LAST_MONITORS.with(|m| m.borrow_mut().clear());
+                note_playing_path(None);
+                LAST_LOCK_SUPPORT.with(|c| c.set(None));
                 apply_off(&widgets);
                 notify_reachable(false);
             }
@@ -292,13 +402,11 @@ fn apply_status(w: &PillWidgets, status: &StatusReply) {
     // `daemon::WlOutput::supervise`) must not say PLAYING — the dot already
     // turns amber for it via `status.error`, but the overline used to keep
     // claiming the wallpaper was animating right through a give-up.
-    w.overline.set_label(if !status.gave_up.is_empty() {
-        t!("NEEDS ATTENTION")
-    } else if status.paused {
-        t!("PAUSED")
-    } else {
-        t!("PLAYING")
-    });
+    w.overline.set_label(pill_overline(
+        !status.gave_up.is_empty(),
+        status.paused,
+        w.still_frame,
+    ));
     w.overline.set_visible(true);
     let name = status
         .wallpaper
@@ -314,7 +422,7 @@ fn apply_status(w: &PillWidgets, status: &StatusReply) {
         _ => w.hwdec.set_visible(false),
     }
 
-    w.toggle.set_visible(true);
+    w.toggle.set_visible(pill_shows_toggle(w.still_frame));
     if status.paused {
         w.toggle.set_icon_name("media-playback-start-symbolic");
         w.toggle.set_tooltip_text(Some(t!("Resume")));
@@ -329,6 +437,28 @@ fn apply_status(w: &PillWidgets, status: &StatusReply) {
         tip.push_str(err);
     }
     w.pill.set_tooltip_text(Some(&tip));
+}
+
+/// The pill's state overline for a running daemon. A give-up outranks
+/// everything; after that a still-frame session says so rather than PLAYING
+/// (GNOME Wayland paints one frame and never animates it, whatever `paused`
+/// says), then paused, then playing.
+fn pill_overline(gave_up: bool, paused: bool, still_frame: bool) -> &'static str {
+    if gave_up {
+        t!("NEEDS ATTENTION")
+    } else if still_frame {
+        t!("STILL FRAME")
+    } else if paused {
+        t!("PAUSED")
+    } else {
+        t!("PLAYING")
+    }
+}
+
+/// Pause/Resume only mean something when something is playing; on a
+/// still-frame session the daemon ignores both, so don't offer the button.
+fn pill_shows_toggle(still_frame: bool) -> bool {
+    !still_frame
 }
 
 /// Prettify the daemon-reported wallpaper name for the pill: strip a trailing
@@ -374,5 +504,113 @@ fn hwdec_label(raw: &str) -> &str {
         "vdpau" => "VDPAU",
         "drm" => "DRM",
         _ => raw,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overline_says_playing_or_paused_on_a_live_session() {
+        assert_eq!(pill_overline(false, false, false), "PLAYING");
+        assert_eq!(pill_overline(false, true, false), "PAUSED");
+    }
+
+    /// GNOME Wayland reports `running: true, paused: false` for a wallpaper
+    /// that is one frozen frame; the pill must not call that PLAYING.
+    #[test]
+    fn overline_says_still_frame_on_a_still_frame_session() {
+        assert_eq!(pill_overline(false, false, true), "STILL FRAME");
+        // `paused` is meaningless there (Pause is a no-op) and must not leak.
+        assert_eq!(pill_overline(false, true, true), "STILL FRAME");
+    }
+
+    #[test]
+    fn a_give_up_outranks_every_other_state() {
+        for paused in [false, true] {
+            for still_frame in [false, true] {
+                assert_eq!(pill_overline(true, paused, still_frame), "NEEDS ATTENTION");
+            }
+        }
+    }
+
+    #[test]
+    fn pause_toggle_is_hidden_only_on_a_still_frame_session() {
+        assert!(pill_shows_toggle(false));
+        assert!(!pill_shows_toggle(true));
+    }
+
+    /// The poll runs every few seconds; the library must only be told when the
+    /// playing file actually changes (including going to/from "unknown").
+    #[test]
+    fn playing_path_cache_reports_changes_only() {
+        // thread_local: each test thread starts empty.
+        assert_eq!(cached_playing_path(), None);
+        assert!(!set_cached_playing_path(None), "unknown -> unknown");
+
+        let day = Some(PathBuf::from("/walls/day.mp4"));
+        assert!(set_cached_playing_path(day.clone()));
+        assert_eq!(cached_playing_path(), day);
+        assert!(!set_cached_playing_path(day), "same file again");
+
+        assert!(set_cached_playing_path(Some(PathBuf::from(
+            "/walls/night.mp4"
+        ))));
+        assert!(set_cached_playing_path(None), "daemon went away");
+        assert_eq!(cached_playing_path(), None);
+    }
+
+    /// After the GUI's own Set the cache still names the wallpaper that was
+    /// replaced. Forgetting it must make the answer "unknown" at once, and must
+    /// not run the hook: the caller redraws itself, and a redraw from inside
+    /// the hook would read the half-updated state.
+    #[test]
+    fn forgetting_the_playing_path_clears_it_without_firing_the_hook() {
+        let calls = Rc::new(Cell::new(0u32));
+        {
+            let calls = calls.clone();
+            on_playing_path_changed(move || calls.set(calls.get() + 1));
+        }
+        note_playing_path(Some(PathBuf::from("/walls/old.mp4")));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cached_playing_path(), Some(PathBuf::from("/walls/old.mp4")));
+
+        forget_playing_path();
+        assert_eq!(
+            cached_playing_path(),
+            None,
+            "still naming the replaced file"
+        );
+        assert_eq!(calls.get(), 1, "forgetting must not fire the hook");
+
+        // The next poll reports the new wallpaper and is a change again.
+        note_playing_path(Some(PathBuf::from("/walls/new.mp4")));
+        assert_eq!(cached_playing_path(), Some(PathBuf::from("/walls/new.mp4")));
+        assert_eq!(calls.get(), 2);
+
+        // Forgetting an already-unknown cache is harmless.
+        forget_playing_path();
+        forget_playing_path();
+        assert_eq!(cached_playing_path(), None);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn note_playing_path_fires_the_hook_once_per_change() {
+        let calls = Rc::new(Cell::new(0u32));
+        {
+            let calls = calls.clone();
+            on_playing_path_changed(move || {
+                // The hook re-renders the grid, which reads the cache: it must
+                // already hold the new value by the time the hook runs.
+                assert!(cached_playing_path().is_some());
+                calls.set(calls.get() + 1);
+            });
+        }
+        let p = Some(PathBuf::from("/walls/day.mp4"));
+        note_playing_path(p.clone());
+        note_playing_path(p);
+        assert_eq!(calls.get(), 1);
     }
 }

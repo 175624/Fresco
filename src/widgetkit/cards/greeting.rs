@@ -11,9 +11,18 @@
 //! addressed to somebody. `docs/widget-design-spec.md`'s cards are all reused
 //! or adapted from an existing widget; this one has no ancestor, so its
 //! treatment borrows the two closest cousins rather than inventing a third:
-//! the avatar is [`crate::widgetkit::surface::badge`] (spec §8.6) at a larger
-//! size, and the text sits on [`crate::widgetkit::surface::text_scrim`]
-//! (spec §2.3), exactly as [`super::clock`]'s micro-label does.
+//! the avatar is the disc of [`crate::widgetkit::surface::badge`] (spec §8.6)
+//! at a larger size — well, picture, hairline ring — and the text sits on
+//! [`crate::widgetkit::surface::text_scrim`] (spec §2.3), exactly as
+//! [`super::clock`]'s micro-label does.
+//!
+//! # A person without a picture
+//!
+//! With no image the disc carries the person's **initials**
+//! ([`GreetingData::initials`]), sized to the disc. It used to borrow
+//! `badge`'s no-icon fallback — the first letter of the *label* — which for a
+//! greeting is the first letter of "Good evening": a "G" in a grey circle,
+//! which reads as an application's icon, not as the user.
 //!
 //! # No card, a scrim anyway
 //!
@@ -39,7 +48,8 @@
 //! parameter, not baked into the geometry.
 
 use crate::widgetkit::canvas::Canvas;
-use crate::widgetkit::geom::{Point, Rect, Size};
+use crate::widgetkit::geom::{HAlign, Point, Rect, Size, VAlign};
+use crate::widgetkit::paint::Fill;
 use crate::widgetkit::surface::{self, ScrimSpec, WidgetSize};
 use crate::widgetkit::text::FontStack;
 use crate::widgetkit::theme::Theme;
@@ -51,10 +61,14 @@ pub struct GreetingData<'a> {
     /// The salutation, e.g. `"Good evening, Roy"`. Sentence case, not a label —
     /// never transformed.
     pub text: &'a str,
-    /// The avatar image. `None` falls back to a well-filled circle carrying
-    /// the greeting's first grapheme, exactly as a source-app badge with no
-    /// icon falls back to the app name's first grapheme.
+    /// The avatar image. Drawn as a centre-cropped cover, so a non-square
+    /// source is cropped, never squashed. `None` falls back to a well-filled
+    /// circle carrying [`GreetingData::initials`].
     pub avatar: Option<&'a image::RgbaImage>,
+    /// The person's initials (`"RD"`; see `userinfo::initials`), drawn in the
+    /// disc when there is no `avatar`. Empty draws a plain disc — never the
+    /// greeting's own first letter, which is not a fact about the person.
+    pub initials: &'a str,
     /// Text size in logical units. Not part of the two-field sketch this card
     /// was scoped from, but every other card in this toolkit sizes itself from
     /// a field on its own data rather than from the rect it is handed (see
@@ -83,6 +97,9 @@ const DEFAULT_SIZE: f32 = 20.0;
 const AVATAR_RATIO: f32 = 1.9;
 /// Gap between the avatar and the text, as a multiple of the text size.
 const GAP_RATIO: f32 = 0.55;
+/// Initials' font size as a multiple of the disc diameter: large enough to
+/// read as a monogram, small enough that two capitals clear the ring.
+const MONOGRAM_RATIO: f32 = 0.42;
 
 fn text_size(d: &GreetingData) -> f32 {
     if d.text_size.is_finite() && d.text_size > 0.0 {
@@ -166,6 +183,46 @@ fn layout(
     }
 }
 
+/// The avatar: [`surface::badge`]'s disc (elevation, well, hairline ring) with
+/// the picture — or, without one, the initials — inside.
+///
+/// The well is filled under a picture as well as behind initials, so a PNG
+/// with transparent corners (cut-out avatars are common) shows the disc
+/// through them rather than the wallpaper.
+fn avatar_disc(
+    c: &mut Canvas,
+    fonts: &mut FontStack,
+    t: &Theme,
+    r: Rect,
+    image: Option<&image::RgbaImage>,
+    initials: &str,
+) {
+    let d = r.min_side();
+    if d <= 0.0 {
+        return;
+    }
+    let sq = r.align(Size::new(d, d), HAlign::Center, VAlign::Middle);
+    surface::elevation(c, sq, d / 2.0, t, t.e1());
+    c.rounded_rect(sq, d / 2.0, &Fill::solid(t.well));
+    match image {
+        Some(img) => c.image_cover(img, sq, d / 2.0),
+        None => {
+            let initials = initials.trim();
+            if !initials.is_empty() {
+                let run = typo::styled(initials, d * MONOGRAM_RATIO, 600, false, fonts)
+                    .color(t.text_primary);
+                let m = fonts.measure(&run, c.scale());
+                c.text(
+                    fonts,
+                    &run,
+                    sq.align(m.size(), HAlign::Center, VAlign::Middle).origin(),
+                );
+            }
+        }
+    }
+    c.hairline(sq, d / 2.0, t.edge, t.metrics.hairline);
+}
+
 /// How big this greeting is, and how much shadow margin it needs.
 pub fn measure(
     fonts: &mut FontStack,
@@ -209,7 +266,7 @@ pub fn draw_at(
 
     if l.avatar_d > 0.0 {
         let avatar = l.avatar.offset(card.x, card.y);
-        surface::badge(c, fonts, t, avatar, d.avatar, d.text);
+        avatar_disc(c, fonts, t, avatar, d.avatar, d.initials);
     }
 
     if d.text.is_empty() {
@@ -261,6 +318,7 @@ mod tests {
         GreetingData {
             text,
             avatar: None,
+            initials: "RD",
             text_size: 20.0,
         }
     }
@@ -319,7 +377,7 @@ mod tests {
             GreetingLayout::Row,
             1.0,
         );
-        // Even with no image, the badge still draws a well + initial, so the
+        // Even with no image, the disc still draws a well + initials, so the
         // avatar diameter is still reserved — the fallback is a real object,
         // not a hole.
         assert!(with.avatar_d > 0.0);
@@ -360,6 +418,7 @@ mod tests {
                             let d = GreetingData {
                                 text,
                                 avatar: art,
+                                initials: "RD",
                                 text_size: size,
                             };
                             let m = measure(&mut f, &t, &d, layout_mode, 1.0);

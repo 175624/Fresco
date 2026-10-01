@@ -23,49 +23,77 @@
 //! decision of which card may hold that decoder is centralised in
 //! [`PreviewPolicy`] below — process-wide, not per card.
 //!
-//! Two rules keep it honest. Every hover edge is debounced, both of them, by
-//! the same [`HOVER_GRACE`]: sweeping the pointer across a shelf of cards must
-//! start *nothing*, and a flicker across a card's own Edit button must stop
-//! nothing. And a card that leaves the widget tree releases its pipeline on the
-//! way out, so `populate_library`'s "remove every child" sweep can never strand
-//! one mid-decode.
+//! What that decoder is given matters as much as how many there are. GTK
+//! decodes at the file's own resolution, so previewing a 4K clip turned every
+//! hover into 30 fresh 30 MB textures a second for a 300 px card — enough to
+//! exhaust a Vulkan device and take the whole GUI down inside GSK. A card
+//! therefore never plays a large source: it asks [`preview_proxy`] for a small
+//! stand-in clip, and if that has not been made yet it keeps showing the
+//! thumbnail while one is built in the background.
+//!
+//! Three rules keep it honest. A hover must *settle* before it starts anything
+//! ([`START_DEBOUNCE`]): sweeping the pointer across a shelf of cards must start
+//! nothing. A leave is forgiven for a moment ([`HOVER_GRACE`]): a flicker across
+//! a card's own Edit button must stop nothing. And a card that leaves the widget
+//! tree releases its pipeline on the way out, so `populate_library`'s "remove
+//! every child" sweep can never strand one mid-decode.
 //!
 //! One subtlety is load-bearing enough to spell out: the `Picture` holds a
 //! strong reference to the `MediaFile` (it is its paintable), so anything the
-//! `MediaFile` holds pointing back at the `Picture` closes a reference cycle,
-//! and GObject has no cycle collector. The `invalidate_contents` handler below
-//! therefore captures the `Picture` **weakly**. Without that, none of the rest
-//! of this module frees a thing.
+//! `MediaFile` holds pointing back at the card closes a reference cycle, and
+//! GObject has no cycle collector. The `invalidate_contents` handler below
+//! therefore captures the card **weakly**. Without that, none of the rest of
+//! this module frees a thing.
 //!
 //! A preview nobody can see is pure cost, and on a machine without GStreamer
-//! hardware-decode plugins (stock Deepin, for one) it is a large one: the
-//! hovered file decodes at full source resolution in software, inside the GUI
-//! process. So the toplevel window is watched too — losing focus, being
-//! minimised or being hidden stops and releases the live preview through the
-//! same policy ([`PreviewPolicy::on_window_hidden`]), and no hover may start a
-//! new one until the window is back ([`PreviewPolicy::on_window_shown`]).
+//! hardware-decode plugins (stock Deepin, for one) it is a large one. So the
+//! toplevel window is watched too — losing focus, being minimised or being
+//! hidden stops and releases the live preview through the same policy
+//! ([`PreviewPolicy::on_window_hidden`]), and no hover may start a new one
+//! until the window is back ([`PreviewPolicy::on_window_shown`]). The Settings
+//! switch is the same idea one level up ([`PreviewPolicy::set_disabled`]).
+//!
+//! Finally, a crash sentinel ([`startup`]): while a `MediaFile` exists we leave
+//! a file in the state directory naming our pid. A normal exit or a termination
+//! signal removes it; if the next launch finds it with that pid dead, we died
+//! with a preview showing — whatever the cause, the next hover would do it
+//! again — so previews are switched off and the user is told, instead of
+//! crashing every time they touch the library.
 //!
 //! Decoding stays best-effort: if no GStreamer plugins are installed the media
 //! simply never produces frames and the card shows no motion — nothing breaks.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::CString;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
-use gtk4::EventControllerMotion;
+use gtk4::{gio, glib, EventControllerMotion};
 
-/// Grace period applied to *both* hover edges.
+use super::preview_proxy::{self, PreviewSource, Priority};
+use super::window::{show_sticky_toast, AppState};
+use crate::t;
+
+/// Grace period for the *leave* edge.
 ///
-/// On leave it debounces the glitch: moving the pointer across the card's
-/// revealed Edit button / overlays emits brief leave→enter crossings, and
-/// without the delay the preview swaps back and forth. On enter it is what
-/// makes a pointer sweep across the library free — five cards crossed inside
-/// one grace period spawn zero decoders, not five — which is also the thing
-/// that protects a GPU with a handful of hardware-decode sessions.
+/// Moving the pointer across the card's revealed Edit button / overlays emits
+/// brief leave→enter crossings, and without the delay the preview swaps back
+/// and forth.
 const HOVER_GRACE: Duration = Duration::from_millis(140);
+
+/// How long a hover must stay put before it earns a preview.
+///
+/// Longer than [`HOVER_GRACE`] on purpose. Leaving is forgiven quickly because
+/// a stray crossing should not interrupt something playing; starting is
+/// deliberate because a start is the expensive edge — a decoder, a GPU
+/// context, and now possibly a proxy transcode. Five cards crossed inside one
+/// debounce period spawn zero of them, not five, which is also what protects a
+/// GPU with only a handful of hardware-decode sessions.
+const START_DEBOUNCE: Duration = Duration::from_millis(300);
 
 // ---------------------------------------------------------------------------
 // Policy: which card may hold the one live decoder. No GTK in this half.
@@ -119,6 +147,11 @@ struct PreviewPolicy {
     /// crossing events on most compositors, and a preview playing behind
     /// another app's window is software decode for nobody.
     suppressed: bool,
+    /// The user (or the crash sentinel) switched hover previews off. While
+    /// set, nothing hovers into a decoder at all. Separate from `suppressed`
+    /// because the two end for different reasons: focus returns by itself, this
+    /// stays until the switch is flipped back.
+    disabled: bool,
 }
 
 impl PreviewPolicy {
@@ -131,11 +164,11 @@ impl PreviewPolicy {
             self.pending = None;
             return Vec::new();
         }
-        if self.suppressed {
+        if self.suppressed || self.disabled {
             return Vec::new();
         }
         // Nothing starts on the enter edge itself; the tick decides.
-        self.pending = Some((card, now + HOVER_GRACE));
+        self.pending = Some((card, now + START_DEBOUNCE));
         Vec::new()
     }
 
@@ -184,6 +217,18 @@ impl PreviewPolicy {
         Vec::new()
     }
 
+    /// Hover previews were switched off (or back on). Switching off tears the
+    /// live preview down at once and forgets the hover in flight; switching on
+    /// starts nothing — the next hover that settles does.
+    fn set_disabled(&mut self, disabled: bool) -> Vec<Action> {
+        self.disabled = disabled;
+        if !disabled {
+            return Vec::new();
+        }
+        self.pending = None;
+        self.release_live()
+    }
+
     fn on_tick(&mut self, now: Instant) -> Vec<Action> {
         let mut actions = Vec::new();
         if let Some((card, deadline)) = self.expiring {
@@ -199,9 +244,10 @@ impl PreviewPolicy {
         if let Some((card, deadline)) = self.pending {
             if now >= deadline {
                 self.pending = None;
-                if self.suppressed {
+                if self.suppressed || self.disabled {
                     // Settled while the window was away (or the enter raced the
-                    // focus change): drop it rather than decode unseen.
+                    // focus change, or the switch): drop it rather than decode
+                    // unseen or unwanted.
                     return actions;
                 }
                 // Whatever was playing loses its decoder before the new card
@@ -235,6 +281,199 @@ impl PreviewPolicy {
     }
 }
 
+/// Bookkeeping for the one timer that wakes [`PreviewPolicy::on_tick`].
+///
+/// With a single debounce for both edges a later event could only push the
+/// deadline *out*, so "a timer is already armed" was enough. Starts and leaves
+/// now wait different lengths, so a leave can fall due *before* a start that is
+/// already being timed — and the release must not be held back until the start
+/// timer fires. So the plan is per deadline: an earlier one supersedes the
+/// armed timer, and the superseded timer, when it fires, recognises itself as
+/// stale by its generation number and does nothing.
+#[derive(Default)]
+struct TickArm {
+    /// `(generation, deadline)` of the timer that is currently wanted.
+    armed: Option<(u64, Instant)>,
+    generation: u64,
+}
+
+impl TickArm {
+    /// Given the policy's next deadline, say which timer (if any) to start.
+    fn plan(&mut self, next: Option<Instant>) -> Option<(u64, Instant)> {
+        let next = next?;
+        if matches!(self.armed, Some((_, at)) if at <= next) {
+            return None;
+        }
+        self.generation += 1;
+        self.armed = Some((self.generation, next));
+        Some((self.generation, next))
+    }
+
+    /// The timer of `generation` fired. True if it is still the wanted one.
+    fn fired(&mut self, generation: u64) -> bool {
+        if matches!(self.armed, Some((g, _)) if g == generation) {
+            self.armed = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Crash sentinel. No GTK in this half either.
+// ---------------------------------------------------------------------------
+
+/// What the sentinel file left by the previous run says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// No sentinel, or one that names no pid: the last run ended normally.
+    Clean,
+    /// The sentinel names a Fresco that is no longer running: it died with a
+    /// preview showing.
+    Crashed,
+    /// The sentinel names a Fresco that is still alive — another instance owns
+    /// it, and it is not ours to clear or to judge.
+    Running,
+}
+
+/// Read the sentinel. `pid_alive` is a parameter so the decision is testable
+/// without real processes.
+///
+/// Our own pid counts as dead: a sentinel naming us at startup can only be left
+/// over from an earlier process that happened to have the same pid (a reboot
+/// after a crash, say), since we have not written one yet.
+fn sentinel_verdict(
+    contents: Option<&str>,
+    my_pid: u32,
+    pid_alive: impl Fn(u32) -> bool,
+) -> Verdict {
+    let Some(pid) = contents.and_then(|c| c.trim().parse::<u32>().ok()) else {
+        return Verdict::Clean;
+    };
+    if pid != my_pid && pid_alive(pid) {
+        Verdict::Running
+    } else {
+        Verdict::Crashed
+    }
+}
+
+/// What to do about a [`Verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    Nothing,
+    /// Remove the stale sentinel, say nothing: previews were already off, so
+    /// the crash cannot have been theirs to prevent.
+    ClearOnly,
+    /// Turn previews off, remember that, and tell the user why.
+    DisableAndTell,
+}
+
+fn recovery(verdict: Verdict, previews_on: bool) -> Recovery {
+    match verdict {
+        Verdict::Clean | Verdict::Running => Recovery::Nothing,
+        Verdict::Crashed if previews_on => Recovery::DisableAndTell,
+        Verdict::Crashed => Recovery::ClearOnly,
+    }
+}
+
+/// Whether `pid` is a running `fresco`. The name check is what stops a pid
+/// recycled by some unrelated process, after a reboot, from reading as alive.
+fn pid_is_fresco(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "fresco")
+}
+
+/// Next to `frescod.log` and the other state-dir markers.
+fn sentinel_path() -> PathBuf {
+    dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("fresco")
+        .join("hover-active")
+}
+
+fn write_sentinel(path: &Path, pid: u32) {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    std::fs::write(path, pid.to_string()).ok();
+}
+
+/// Mark that a preview decoder now exists. Written *before* the `MediaFile`,
+/// because the crash this guards against happens inside GTK while it plays.
+fn arm_sentinel() {
+    write_sentinel(&sentinel_path(), std::process::id());
+}
+
+/// The preview was released; a crash from here on is not the preview's.
+fn disarm_sentinel() {
+    std::fs::remove_file(sentinel_path()).ok();
+}
+
+/// The sentinel's path as a C string, prepared before any signal can arrive so
+/// that [`clear_sentinel_and_die`] never allocates.
+static SENTINEL_C: OnceLock<CString> = OnceLock::new();
+
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+const SIG_DFL: usize = 0;
+
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn unlink(path: *const std::ffi::c_char) -> i32;
+    fn raise(signum: i32) -> i32;
+}
+
+/// Delete the sentinel, then die of the signal exactly as we would have.
+///
+/// Only async-signal-safe calls (`unlink`, `signal`, `raise`) and one atomic
+/// load; nothing here allocates, locks or touches GLib.
+extern "C" fn clear_sentinel_and_die(sig: i32) {
+    if let Some(path) = SENTINEL_C.get() {
+        // SAFETY: `unlink` is async-signal-safe and `path` is a NUL-terminated
+        // string that lives in a static for the rest of the process.
+        unsafe {
+            unlink(path.as_ptr());
+        }
+    }
+    // SAFETY: `signal` and `raise` are async-signal-safe. Restoring the default
+    // disposition and re-raising ends the process the way the signal would have
+    // without this handler, status and all.
+    unsafe {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+/// Make `SIGTERM`, `SIGINT` and `SIGHUP` clear the sentinel on the way out.
+///
+/// A logout, `pkill fresco` or Ctrl+C is the user (or the session) ending
+/// Fresco, not Fresco dying, and must not be read next launch as a crash that
+/// turns previews off. Only a death with no chance to clean up — `SIGKILL`, a
+/// segfault inside GSK — should leave the file behind.
+///
+/// A plain handler rather than a GLib signal source, deliberately: a GLib
+/// source runs on the main loop, so a GUI whose loop is wedged would swallow
+/// the signal and become killable only by `SIGKILL`. This handler never needs
+/// the loop, and leaves the process dying of the signal just as before; the
+/// window state, as before, is not saved on a signal death.
+fn install_signal_cleanup() {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = CString::new(sentinel_path().as_os_str().as_bytes()) else {
+        return;
+    };
+    if SENTINEL_C.set(path).is_err() {
+        return; // already installed
+    }
+    for sig in [SIGHUP, SIGINT, SIGTERM] {
+        // SAFETY: the handler only makes async-signal-safe calls.
+        unsafe {
+            signal(sig, clear_sentinel_and_die as *const () as usize);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GTK glue: a translator over the policy, plus the registry it addresses.
 // ---------------------------------------------------------------------------
@@ -256,8 +495,8 @@ struct Previews {
     /// so the registry never keeps a closed window alive; checked so that a
     /// library of 200 cards connects one set of handlers, not 200.
     watched: Vec<gtk4::glib::WeakRef<gtk4::Window>>,
-    /// Whether a timer is already on its way to call [`PreviewPolicy::on_tick`].
-    tick_armed: bool,
+    /// The timer that will call [`PreviewPolicy::on_tick`].
+    tick: TickArm,
 }
 
 thread_local! {
@@ -290,25 +529,23 @@ fn dispatch(event: impl FnOnce(&mut PreviewPolicy) -> Vec<Action>) {
     arm_tick();
 }
 
-/// Make sure a timer exists for the policy's next deadline.
-///
-/// At most one is ever outstanding. Every deadline is `now + HOVER_GRACE`, so a
-/// later event can only ever push a deadline further out than the armed one —
-/// which is why one timer is enough and no wakeup can be missed.
+/// Make sure a timer exists for the policy's next deadline. See [`TickArm`] for
+/// why this is more than "is one armed".
 fn arm_tick() {
-    let delay = PREVIEWS.with(|previews| {
+    let plan = PREVIEWS.with(|previews| {
         let mut previews = previews.borrow_mut();
-        if previews.tick_armed {
-            return None;
-        }
-        let deadline = previews.policy.next_deadline()?;
-        previews.tick_armed = true;
-        Some(deadline.saturating_duration_since(Instant::now()))
+        let next = previews.policy.next_deadline();
+        previews.tick.plan(next)
     });
-    let Some(delay) = delay else { return };
-    gtk4::glib::timeout_add_local_once(delay, || {
-        PREVIEWS.with(|previews| previews.borrow_mut().tick_armed = false);
-        dispatch(|policy| policy.on_tick(Instant::now()));
+    let Some((generation, deadline)) = plan else {
+        return;
+    };
+    let delay = deadline.saturating_duration_since(Instant::now());
+    gtk4::glib::timeout_add_local_once(delay, move || {
+        let current = PREVIEWS.with(|previews| previews.borrow_mut().tick.fired(generation));
+        if current {
+            dispatch(|policy| policy.on_tick(Instant::now()));
+        }
     });
 }
 
@@ -387,6 +624,186 @@ fn forget_card(id: CardId) {
     });
 }
 
+/// Turn hover previews on or off for every card, now. Off releases whatever is
+/// playing; on starts nothing by itself.
+pub fn set_enabled(enabled: bool) {
+    dispatch(|policy| policy.set_disabled(!enabled));
+}
+
+/// One-time setup at launch: honour the saved switch, deal with a crash left
+/// by the previous run, tidy `library/previews`, and make sure a normal exit
+/// clears the sentinel. Call before the library view is built.
+pub(super) fn startup(app: &gio::Application, state: &Rc<RefCell<AppState>>) {
+    let (previews_on, known_ids) = {
+        let s = state.borrow();
+        (
+            s.config.hover_previews,
+            s.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+        )
+    };
+
+    let path = sentinel_path();
+    let contents = std::fs::read_to_string(&path).ok();
+    let verdict = sentinel_verdict(contents.as_deref(), std::process::id(), pid_is_fresco);
+    if contents.is_some() && verdict != Verdict::Running {
+        std::fs::remove_file(&path).ok();
+    }
+
+    let mut enabled = previews_on;
+    if recovery(verdict, previews_on) == Recovery::DisableAndTell {
+        log::warn!(
+            "hover previews: the previous Fresco died with a preview showing; turning them off"
+        );
+        {
+            let mut s = state.borrow_mut();
+            s.config.hover_previews = false;
+            s.config.save().ok();
+        }
+        enabled = false;
+        let state = state.clone();
+        glib::idle_add_local_once(move || {
+            show_sticky_toast(
+                &state,
+                t!("Video previews on hover were turned off because Fresco closed unexpectedly while showing one. You can turn them back on in the menu."),
+            );
+        });
+    }
+    set_enabled(enabled);
+
+    // The card teardown clears the sentinel as each preview is released; this
+    // is the backstop for a quit path that skips it.
+    app.connect_shutdown(|_| disarm_sentinel());
+    // And a signal is not a crash: see `install_signal_cleanup`.
+    install_signal_cleanup();
+
+    preview_proxy::prune_orphans(known_ids);
+}
+
+/// What one attached card holds. Shared by the policy's action closure, the
+/// first-frame callback (weakly) and the proxy-ready callback (weakly).
+struct CardView {
+    /// The video layer stacked above the thumbnail.
+    video_pic: gtk4::Picture,
+    /// The card's decoder, for as long as it is the live one. `None` between
+    /// hovers is the point: an idle card owns no pipeline.
+    media: RefCell<Option<gtk4::MediaFile>>,
+    /// True once the current MediaFile has produced its first frame. Showing the
+    /// video layer BEFORE that blanks the card — for however long the decoder
+    /// takes, or forever when the codec's GStreamer plugin is missing. The
+    /// thumbnail must stay visible until real frames exist. Resets on release,
+    /// because the next hover starts a fresh MediaFile with no frames yet.
+    ready: Cell<bool>,
+    /// Whether this card is the live one, as far as the policy is concerned.
+    /// The first-frame callback consults it so a frame that lands after the
+    /// pointer has already moved on doesn't flash the preview up.
+    live: Cell<bool>,
+    /// What to play, decided at hover time rather than when the card is built:
+    /// a proxy that did not exist at build time may exist now.
+    source: Box<dyn Fn() -> PreviewSource>,
+}
+
+impl CardView {
+    fn apply(self: &Rc<Self>, action: Action) {
+        match action {
+            Action::Start(_) => self.start(),
+            Action::Stop(_) => self.stop(),
+            Action::Release(_) => self.release(),
+        }
+    }
+
+    fn start(self: &Rc<Self>) {
+        self.live.set(true);
+        // Clone out of the slot and let go: `play()` and `set_visible()` can
+        // call back into GTK, and a callback that reaches another Action must
+        // find `media` free. Cloning the MediaFile is a refcount bump.
+        let existing = self.media.borrow().clone();
+        if let Some(m) = existing {
+            if self.ready.get() {
+                self.video_pic.set_visible(true);
+            }
+            m.play();
+            return;
+        }
+        match (self.source)() {
+            PreviewSource::Direct(file) | PreviewSource::Proxy(file) => self.open(&file),
+            PreviewSource::Build(request) => {
+                // No clip yet: the thumbnail stays up, and when the transcode
+                // lands the preview begins — if the pointer is still here.
+                let weak = Rc::downgrade(self);
+                preview_proxy::enqueue(
+                    request,
+                    Priority::Hover,
+                    Some(Box::new(move |ok| {
+                        let Some(card) = weak.upgrade() else { return };
+                        if ok && card.live.get() && card.media.borrow().is_none() {
+                            card.start();
+                        }
+                    })),
+                );
+            }
+            PreviewSource::None => {}
+        }
+    }
+
+    fn open(self: &Rc<Self>, file: &Path) {
+        // Before the decoder exists, not after: the crash this records happens
+        // inside GTK while the first frames are being painted.
+        arm_sentinel();
+        let m = gtk4::MediaFile::for_filename(file.to_string_lossy().as_ref());
+        m.set_muted(true);
+        m.set_loop(true);
+        self.video_pic.set_paintable(Some(&m));
+
+        // WEAK, and this is the leak fix. `set_paintable` above gave the
+        // Picture a strong reference to the MediaFile; a strong reference from
+        // this handler back to the card would close a cycle, and GObject has no
+        // cycle collector, so neither object would ever be finalised — the
+        // decoder, its hardware context and its textures would outlive the
+        // card, unreachable, for the life of the process.
+        let weak = Rc::downgrade(self);
+        m.connect_invalidate_contents(move |_| {
+            let Some(card) = weak.upgrade() else { return };
+            if card.ready.get() {
+                return;
+            }
+            card.ready.set(true);
+            if card.live.get() {
+                card.video_pic.set_visible(true);
+            }
+        });
+        *self.media.borrow_mut() = Some(m.clone());
+        m.play();
+    }
+
+    fn stop(&self) {
+        self.live.set(false);
+        let m = self.media.borrow().clone();
+        self.video_pic.set_visible(false);
+        if let Some(m) = m {
+            m.pause();
+        }
+    }
+
+    fn release(&self) {
+        self.live.set(false);
+        self.ready.set(false);
+        let m = self.media.borrow_mut().take();
+        self.video_pic.set_visible(false);
+        // Drop the Picture's half of the pair too, or the cleared MediaFile
+        // stays referenced until the next hover replaces it.
+        self.video_pic.set_paintable(None::<&gtk4::gdk::Paintable>);
+        if let Some(m) = m {
+            m.pause();
+            // `clear()` — gtk_media_file_clear — is the public teardown: it
+            // closes the stream and unsets the file. (There is no `close()` in
+            // the bindings; gtk_media_file_close is a class vfunc.) The
+            // MediaFile itself is freed as `m` drops here.
+            m.clear();
+            disarm_sentinel();
+        }
+    }
+}
+
 /// Attach hover-to-play to a card.
 ///
 /// - `card`: the card root `gtk4::Overlay` (the hover target spanning the card).
@@ -394,13 +811,19 @@ fn forget_card(id: CardId) {
 /// - `thumb`: the `gtk4::Picture` showing the static thumbnail. It stays the
 ///   card's size-driving base child forever; the video preview is layered above
 ///   it inside an inner `Overlay` so it can never trigger a relayout.
-/// - `video`: the video/GIF file to preview.
+/// - `source`: asked what to play each time a hover settles — see
+///   [`PreviewSource`]. It is deliberately a function and not a path: the
+///   answer changes as proxy clips get built.
 ///
 /// Plays muted + looping while hovered, one card at a time process-wide, and
 /// releases the decoder on leave. Degrades gracefully: if the media can't be
 /// decoded (e.g. no GStreamer plugins installed) nothing bad happens — the card
 /// simply shows no motion.
-pub fn attach(card: &gtk4::Overlay, thumb: &gtk4::Picture, video: PathBuf) {
+pub fn attach(
+    card: &gtk4::Overlay,
+    thumb: &gtk4::Picture,
+    source: impl Fn() -> PreviewSource + 'static,
+) {
     // Re-parent the thumbnail into an inner overlay and stack the (initially
     // hidden) video layer above it. Only the thumbnail is measured.
     let inner = gtk4::Overlay::new();
@@ -414,98 +837,16 @@ pub fn attach(card: &gtk4::Overlay, thumb: &gtk4::Picture, video: PathBuf) {
     inner.add_overlay(&video_pic);
     card.set_child(Some(&inner));
 
-    // The card's decoder, for as long as it is the live one. `None` between
-    // hovers is the point: an idle card owns no pipeline.
-    let media: Rc<RefCell<Option<gtk4::MediaFile>>> = Rc::new(RefCell::new(None));
-    // True once the current MediaFile has produced its first frame. Showing the
-    // video layer BEFORE that blanks the card — for however long the decoder
-    // takes, or forever when the codec's GStreamer plugin is missing. The
-    // thumbnail must stay visible until real frames exist. Resets on release,
-    // because the next hover starts a fresh MediaFile with no frames yet.
-    let ready = Rc::new(Cell::new(false));
-    // Whether this card is the live one, as far as the policy is concerned.
-    // The first-frame callback consults it so a frame that lands after the
-    // pointer has already moved on doesn't flash the preview up.
-    let live = Rc::new(Cell::new(false));
-
+    let view = Rc::new(CardView {
+        video_pic,
+        media: RefCell::new(None),
+        ready: Cell::new(false),
+        live: Cell::new(false),
+        source: Box::new(source),
+    });
     let apply: Apply = {
-        let video_pic = video_pic.clone();
-        let media = media.clone();
-        let ready = ready.clone();
-        let live = live.clone();
-        Rc::new(move |action| match action {
-            Action::Start(_) => {
-                live.set(true);
-                // Build (if needed) under a scoped borrow, then let go of it:
-                // `play()` and `set_visible()` can call back into GTK, and a
-                // callback that reaches another Action must find `media` free.
-                // Cloning the MediaFile is a refcount bump, not a copy.
-                let m = {
-                    let mut slot = media.borrow_mut();
-                    if slot.is_none() {
-                        let m = gtk4::MediaFile::for_filename(video.to_string_lossy().as_ref());
-                        m.set_muted(true);
-                        m.set_loop(true);
-                        video_pic.set_paintable(Some(&m));
-
-                        // WEAK, and this is the leak fix. `set_paintable` above
-                        // gave the Picture a strong reference to the MediaFile;
-                        // capturing the Picture strongly here would point one
-                        // back, and GObject has no cycle collector, so neither
-                        // object would ever be finalised — the decoder, its
-                        // hardware context and its textures would outlive the
-                        // card, unreachable, for the life of the process.
-                        let weak_pic = video_pic.downgrade();
-                        let ready = ready.clone();
-                        let live = live.clone();
-                        m.connect_invalidate_contents(move |_| {
-                            if ready.get() {
-                                return;
-                            }
-                            ready.set(true);
-                            // Card destroyed mid-decode: nothing left to reveal.
-                            let Some(pic) = weak_pic.upgrade() else {
-                                return;
-                            };
-                            if live.get() {
-                                pic.set_visible(true);
-                            }
-                        });
-                        *slot = Some(m);
-                    }
-                    slot.clone().expect("just inserted")
-                };
-                if ready.get() {
-                    video_pic.set_visible(true);
-                }
-                m.play();
-            }
-            Action::Stop(_) => {
-                live.set(false);
-                let m = media.borrow().clone();
-                video_pic.set_visible(false);
-                if let Some(m) = m {
-                    m.pause();
-                }
-            }
-            Action::Release(_) => {
-                live.set(false);
-                ready.set(false);
-                let m = media.borrow_mut().take();
-                video_pic.set_visible(false);
-                // Drop the Picture's half of the pair too, or the cleared
-                // MediaFile stays referenced until the next hover replaces it.
-                video_pic.set_paintable(None::<&gtk4::gdk::Paintable>);
-                if let Some(m) = m {
-                    m.pause();
-                    // `clear()` — gtk_media_file_clear — is the public teardown:
-                    // it closes the stream and unsets the file. (There is no
-                    // `close()` in the bindings; gtk_media_file_close is a class
-                    // vfunc.) The MediaFile itself is freed as `m` drops here.
-                    m.clear();
-                }
-            }
-        })
+        let view = view.clone();
+        Rc::new(move |action| view.apply(action))
     };
 
     let id = PREVIEWS.with(|previews| {
@@ -568,7 +909,12 @@ mod tests {
     }
 
     /// Long enough that every outstanding deadline has certainly passed.
-    const SETTLED: u64 = 500;
+    const SETTLED: u64 = 1000;
+
+    /// Milliseconds a hover must stay put before it starts (`START_DEBOUNCE`).
+    const START: u64 = 300;
+    /// Milliseconds a leave is forgiven for (`HOVER_GRACE`).
+    const GRACE: u64 = 140;
 
     /// A stand-in for the GTK half, asserting the contract the real translator
     /// relies on: never two live pipelines, never a `Start` on a card that is
@@ -618,7 +964,7 @@ mod tests {
         gtk.apply(policy.on_enter(1, base));
         assert_eq!(gtk.starts, 0, "a hover started decoding before it settled");
 
-        gtk.apply(policy.on_tick(t(base, 140)));
+        gtk.apply(policy.on_tick(t(base, START)));
         assert_eq!(gtk.playing, Some(1));
         assert_eq!(gtk.starts, 1);
     }
@@ -654,14 +1000,14 @@ mod tests {
         let mut gtk = FakeGtk::default();
 
         gtk.apply(policy.on_enter(1, base));
-        gtk.apply(policy.on_tick(t(base, 140)));
+        gtk.apply(policy.on_tick(t(base, START)));
         assert_eq!(gtk.playing, Some(1));
 
-        gtk.apply(policy.on_leave(1, t(base, 200)));
-        gtk.apply(policy.on_enter(2, t(base, 200)));
+        gtk.apply(policy.on_leave(1, t(base, 400)));
+        gtk.apply(policy.on_enter(2, t(base, 400)));
         // Card 1 loses its decoder before card 2 gets one — the order is the
         // cap: there is no instant at which both exist.
-        let actions = policy.on_tick(t(base, 400));
+        let actions = policy.on_tick(t(base, 400 + START));
         assert_eq!(
             actions,
             vec![Action::Stop(1), Action::Release(1), Action::Start(2)]
@@ -678,12 +1024,12 @@ mod tests {
         let mut gtk = FakeGtk::default();
 
         gtk.apply(policy.on_enter(1, base));
-        gtk.apply(policy.on_tick(t(base, 140)));
+        gtk.apply(policy.on_tick(t(base, START)));
 
         // The flicker across the card's own Edit button: leave, then back
         // inside the grace window. Nothing may stop.
-        gtk.apply(policy.on_leave(1, t(base, 200)));
-        gtk.apply(policy.on_enter(1, t(base, 260)));
+        gtk.apply(policy.on_leave(1, t(base, 400)));
+        gtk.apply(policy.on_enter(1, t(base, 460)));
         gtk.apply(policy.on_tick(t(base, SETTLED)));
         assert_eq!(gtk.playing, Some(1), "a flicker tore down a live preview");
         assert_eq!(gtk.starts, 1, "a flicker restarted the decoder");
@@ -696,10 +1042,10 @@ mod tests {
         let mut gtk = FakeGtk::default();
 
         gtk.apply(policy.on_enter(1, base));
-        gtk.apply(policy.on_tick(t(base, 140)));
-        gtk.apply(policy.on_leave(1, t(base, 200)));
+        gtk.apply(policy.on_tick(t(base, START)));
+        gtk.apply(policy.on_leave(1, t(base, 400)));
 
-        let actions = policy.on_tick(t(base, 400));
+        let actions = policy.on_tick(t(base, 400 + GRACE));
         assert_eq!(actions, vec![Action::Stop(1), Action::Release(1)]);
         gtk.apply(actions);
         assert!(gtk.decoders.is_empty(), "the MediaFile survived the leave");
@@ -712,7 +1058,7 @@ mod tests {
         let mut gtk = FakeGtk::default();
 
         gtk.apply(policy.on_enter(1, base));
-        gtk.apply(policy.on_tick(t(base, 140)));
+        gtk.apply(policy.on_tick(t(base, START)));
 
         // `populate_library` pulls the card out mid-play; no leave ever arrives.
         gtk.apply(policy.on_gone(1));
@@ -722,7 +1068,7 @@ mod tests {
         );
 
         // And the policy doesn't still believe card 1 owns the slot.
-        gtk.apply(policy.on_enter(2, t(base, 200)));
+        gtk.apply(policy.on_enter(2, t(base, 400)));
         gtk.apply(policy.on_tick(t(base, SETTLED)));
         assert_eq!(gtk.playing, Some(2));
     }
@@ -734,7 +1080,7 @@ mod tests {
         let mut gtk = FakeGtk::default();
 
         gtk.apply(policy.on_enter(1, base));
-        gtk.apply(policy.on_tick(t(base, 140)));
+        gtk.apply(policy.on_tick(t(base, START)));
         assert_eq!(gtk.playing, Some(1));
 
         // Focus lost / minimised with the pointer still on the card: no leave
@@ -808,7 +1154,7 @@ mod tests {
             ms += next() % 200;
             let now = t(base, ms);
             let card = next() % 6 + 1;
-            match next() % 6 {
+            match next() % 8 {
                 0 | 1 => {
                     if inside.insert(card) {
                         gtk.apply(policy.on_enter(card, now));
@@ -821,6 +1167,7 @@ mod tests {
                 }
                 3 => gtk.apply(policy.on_window_hidden()),
                 4 => gtk.apply(policy.on_window_shown()),
+                5 => gtk.apply(policy.set_disabled(next() % 2 == 0)),
                 _ => {
                     inside.remove(&card);
                     gtk.apply(policy.on_gone(card));
@@ -833,6 +1180,7 @@ mod tests {
 
         // Pointer off everything, all timers drained: no decoder may remain.
         gtk.apply(policy.on_window_shown());
+        gtk.apply(policy.set_disabled(false));
         for card in inside.clone() {
             gtk.apply(policy.on_leave(card, t(base, ms)));
         }
@@ -846,5 +1194,320 @@ mod tests {
             gtk.starts > 0,
             "the generated sequence never started anything"
         );
+    }
+
+    #[test]
+    fn a_hover_starts_after_the_start_debounce_and_not_a_moment_before() {
+        let base = Instant::now();
+        let mut policy = PreviewPolicy::default();
+        let mut gtk = FakeGtk::default();
+
+        gtk.apply(policy.on_enter(1, base));
+        // The leave grace is shorter than the start debounce; hovering for the
+        // length of the grace must not be enough.
+        gtk.apply(policy.on_tick(t(base, GRACE)));
+        gtk.apply(policy.on_tick(t(base, START - 1)));
+        assert_eq!(gtk.starts, 0, "started before the debounce elapsed");
+        gtk.apply(policy.on_tick(t(base, START)));
+        assert_eq!(gtk.playing, Some(1));
+    }
+
+    #[test]
+    fn a_pointer_that_lingers_less_than_the_debounce_starts_nothing() {
+        let base = Instant::now();
+        let mut policy = PreviewPolicy::default();
+        let mut gtk = FakeGtk::default();
+
+        // Card after card, each held 250 ms: longer than the old 140 ms
+        // debounce, shorter than the new one. A reader scanning a shelf does
+        // exactly this, and it must cost nothing.
+        for card in 1..=8u64 {
+            let at = card * 250;
+            gtk.apply(policy.on_enter(card, t(base, at)));
+            gtk.apply(policy.on_tick(t(base, at + 249)));
+            gtk.apply(policy.on_leave(card, t(base, at + 250)));
+        }
+        gtk.apply(policy.on_tick(t(base, 20_000)));
+        assert_eq!(gtk.starts, 0, "a scan across the shelf started a decoder");
+    }
+
+    #[test]
+    fn the_leave_grace_is_still_short() {
+        let base = Instant::now();
+        let mut policy = PreviewPolicy::default();
+        let mut gtk = FakeGtk::default();
+
+        gtk.apply(policy.on_enter(1, base));
+        gtk.apply(policy.on_tick(t(base, START)));
+        gtk.apply(policy.on_leave(1, t(base, 1000)));
+        gtk.apply(policy.on_tick(t(base, 1000 + GRACE - 1)));
+        assert_eq!(gtk.playing, Some(1), "released inside the grace window");
+        gtk.apply(policy.on_tick(t(base, 1000 + GRACE)));
+        assert_eq!(gtk.playing, None, "the leave waited for the start debounce");
+        assert!(gtk.decoders.is_empty());
+    }
+
+    #[test]
+    fn the_earlier_of_the_two_deadlines_is_the_one_to_wake_for() {
+        let base = Instant::now();
+        let mut policy = PreviewPolicy::default();
+        policy.on_enter(1, base);
+        policy.on_tick(t(base, START));
+        assert_eq!(policy.next_deadline(), None);
+
+        // Card 1 plays; the pointer leaves it for card 2 ten ms later. The
+        // release (grace) falls due long before card 2's start (debounce).
+        policy.on_leave(1, t(base, 400));
+        policy.on_enter(2, t(base, 410));
+        assert_eq!(policy.next_deadline(), Some(t(base, 400 + GRACE)));
+    }
+
+    #[test]
+    fn a_disabled_policy_never_starts_anything() {
+        let base = Instant::now();
+        let mut policy = PreviewPolicy::default();
+        let mut gtk = FakeGtk::default();
+
+        gtk.apply(policy.set_disabled(true));
+        gtk.apply(policy.on_enter(1, base));
+        assert_eq!(
+            policy.next_deadline(),
+            None,
+            "a disabled hover armed a timer"
+        );
+        gtk.apply(policy.on_tick(t(base, SETTLED)));
+        assert_eq!(gtk.starts, 0);
+        gtk.apply(policy.on_leave(1, t(base, SETTLED)));
+        gtk.apply(policy.on_tick(t(base, 2 * SETTLED)));
+        assert!(gtk.decoders.is_empty());
+    }
+
+    #[test]
+    fn switching_previews_off_releases_the_live_card_and_the_hover_in_flight() {
+        let base = Instant::now();
+        let mut policy = PreviewPolicy::default();
+        let mut gtk = FakeGtk::default();
+
+        gtk.apply(policy.on_enter(1, base));
+        gtk.apply(policy.on_tick(t(base, START)));
+        gtk.apply(policy.on_enter(2, t(base, 400)));
+        assert_eq!(gtk.playing, Some(1));
+
+        let actions = policy.set_disabled(true);
+        assert_eq!(actions, vec![Action::Stop(1), Action::Release(1)]);
+        gtk.apply(actions);
+        assert!(gtk.decoders.is_empty(), "the switch left a decoder running");
+        // Card 2's hover was about to settle; the switch cancels it too.
+        gtk.apply(policy.on_tick(t(base, 400 + SETTLED)));
+        assert_eq!(gtk.starts, 1, "a hover settled after the switch went off");
+        assert_eq!(policy.next_deadline(), None);
+    }
+
+    #[test]
+    fn switching_previews_on_starts_nothing_until_the_next_hover() {
+        let base = Instant::now();
+        let mut policy = PreviewPolicy::default();
+        let mut gtk = FakeGtk::default();
+
+        gtk.apply(policy.set_disabled(true));
+        gtk.apply(policy.on_enter(1, base));
+        gtk.apply(policy.set_disabled(false));
+        gtk.apply(policy.on_tick(t(base, SETTLED)));
+        assert_eq!(gtk.starts, 0, "turning the switch on resurrected a hover");
+
+        gtk.apply(policy.on_enter(1, t(base, 2000)));
+        gtk.apply(policy.on_tick(t(base, 2000 + START)));
+        assert_eq!(gtk.playing, Some(1));
+        // Idempotent in both directions.
+        gtk.apply(policy.set_disabled(false));
+        assert_eq!(gtk.playing, Some(1));
+    }
+
+    #[test]
+    fn disabling_an_idle_policy_is_harmless_and_repeatable() {
+        let mut policy = PreviewPolicy::default();
+        assert!(policy.set_disabled(true).is_empty());
+        assert!(policy.set_disabled(true).is_empty());
+        assert!(policy.set_disabled(false).is_empty());
+    }
+
+    #[test]
+    fn a_superseded_timer_is_recognised_as_stale() {
+        let base = Instant::now();
+        let mut arm = TickArm::default();
+        assert_eq!(
+            arm.plan(None),
+            None,
+            "armed a timer with nothing to wait for"
+        );
+
+        // A start is timed first...
+        let first = arm.plan(Some(t(base, 300))).expect("first timer");
+        // ...a later deadline needs no second timer...
+        assert_eq!(arm.plan(Some(t(base, 500))), None);
+        assert_eq!(arm.plan(Some(t(base, 300))), None);
+        // ...but an earlier one (a leave falling due) must supersede it.
+        let second = arm.plan(Some(t(base, 150))).expect("earlier timer");
+        assert_ne!(first.0, second.0);
+        assert_eq!(second.1, t(base, 150));
+
+        // The superseded timer fires first or last; either way it is ignored.
+        assert!(!arm.fired(first.0));
+        assert!(arm.fired(second.0));
+        assert!(!arm.fired(second.0), "a timer fired twice");
+
+        // Once it has fired the next deadline arms afresh.
+        assert!(arm.plan(Some(t(base, 300))).is_some());
+    }
+
+    // ---- crash sentinel -----------------------------------------------------
+
+    #[test]
+    fn no_sentinel_means_the_last_run_ended_normally() {
+        let alive = |_| panic!("no pid to look up");
+        assert_eq!(sentinel_verdict(None, 100, alive), Verdict::Clean);
+        // Garbage names no pid, so it cannot name a crash either.
+        assert_eq!(sentinel_verdict(Some(""), 100, alive), Verdict::Clean);
+        assert_eq!(sentinel_verdict(Some("   \n"), 100, alive), Verdict::Clean);
+        assert_eq!(sentinel_verdict(Some("fresco"), 100, alive), Verdict::Clean);
+    }
+
+    #[test]
+    fn a_sentinel_for_a_dead_pid_is_a_crash() {
+        assert_eq!(
+            sentinel_verdict(Some("4242\n"), 100, |_| false),
+            Verdict::Crashed
+        );
+        assert_eq!(
+            sentinel_verdict(Some(" 4242 "), 100, |_| false),
+            Verdict::Crashed
+        );
+    }
+
+    #[test]
+    fn a_sentinel_for_a_live_fresco_is_left_alone() {
+        assert_eq!(
+            sentinel_verdict(Some("4242"), 100, |pid| pid == 4242),
+            Verdict::Running
+        );
+    }
+
+    #[test]
+    fn a_sentinel_naming_this_very_process_is_stale() {
+        // We have not written one yet, so it is a previous run's, pid reused.
+        assert_eq!(
+            sentinel_verdict(Some("100"), 100, |_| true),
+            Verdict::Crashed
+        );
+    }
+
+    #[test]
+    fn only_a_crash_with_previews_on_turns_them_off_and_says_so() {
+        assert_eq!(recovery(Verdict::Clean, true), Recovery::Nothing);
+        assert_eq!(recovery(Verdict::Clean, false), Recovery::Nothing);
+        assert_eq!(recovery(Verdict::Running, true), Recovery::Nothing);
+        assert_eq!(recovery(Verdict::Crashed, true), Recovery::DisableAndTell);
+        // Already off: nothing to turn off, nothing to announce - just tidy up.
+        assert_eq!(recovery(Verdict::Crashed, false), Recovery::ClearOnly);
+    }
+
+    #[test]
+    fn the_sentinel_file_round_trips_through_the_decision() {
+        let dir = std::env::temp_dir().join(format!("fresco-sentinel-{}", std::process::id()));
+        let path = dir.join("fresco").join("hover-active");
+        std::fs::remove_dir_all(&dir).ok();
+
+        write_sentinel(&path, 31337);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "31337");
+        // A later launch, the writer long gone:
+        assert_eq!(
+            sentinel_verdict(Some(&on_disk), 1, |_| false),
+            Verdict::Crashed
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(std::fs::read_to_string(&path).is_err());
+    }
+
+    // ---- signal cleanup -------------------------------------------------------
+
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    /// Set in the re-executed copy of this test binary that plays the part of
+    /// Fresco with a preview showing.
+    const SIGNAL_CHILD_ENV: &str = "FRESCO_TEST_HOVER_SIGNAL_CHILD";
+
+    /// `install_signal_cleanup` replaces the process-wide disposition of three
+    /// signals, which a test must not do to the harness it runs in. So the test
+    /// re-runs itself as a child process that installs the handler and arms the
+    /// sentinel exactly as a preview does, and the parent signals that child
+    /// from outside, the way a logout, `pkill` or Ctrl+C would.
+    #[test]
+    fn a_terminating_signal_clears_the_sentinel_and_still_ends_the_process() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+
+        if std::env::var_os(SIGNAL_CHILD_ENV).is_some() {
+            install_signal_cleanup();
+            arm_sentinel();
+            // Wait to be signalled; only reached again if no signal kills us.
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(99);
+        }
+
+        for sig in [SIGHUP, SIGINT, SIGTERM] {
+            let state =
+                std::env::temp_dir().join(format!("fresco-signal-{}-{sig}", std::process::id()));
+            std::fs::remove_dir_all(&state).ok();
+            let sentinel = state.join("fresco").join("hover-active");
+
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "gui::hover_preview::tests::a_terminating_signal_clears_the_sentinel_and_still_ends_the_process",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(SIGNAL_CHILD_ENV, "1")
+                .env("XDG_STATE_HOME", &state)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            // The child writes the sentinel after the handler is installed, so
+            // its appearance means a signal is now safe to send.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !sentinel.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "signal {sig}: the child never armed the sentinel"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // SAFETY: plain `kill(2)` on a child we spawned and still hold.
+            assert_eq!(unsafe { kill(child.id() as i32, sig) }, 0);
+
+            let status = child.wait().unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(sig),
+                "signal {sig}: the child must die of the signal, not exit ({status:?})"
+            );
+            assert!(
+                !sentinel.exists(),
+                "signal {sig}: the sentinel was left behind and would read as a crash"
+            );
+            std::fs::remove_dir_all(&state).ok();
+        }
+    }
+
+    #[test]
+    fn this_test_process_is_not_mistaken_for_fresco() {
+        // The cargo test binary is not named `fresco`; the name check is what
+        // keeps a recycled pid from reading as a live instance.
+        assert!(!pid_is_fresco(std::process::id()));
+        assert!(!pid_is_fresco(u32::MAX));
     }
 }

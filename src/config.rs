@@ -435,6 +435,13 @@ pub struct Slideshow {
     pub paths: Vec<PathBuf>,
     #[serde(default = "default_interval")]
     pub interval_s: u64,
+    /// Also scan the `folder`'s subfolders (depth-bounded; see
+    /// `media::MAX_SCAN_DEPTH`). The GUI's "Include subfolders" choice used to
+    /// apply only to importing files one by one: the daemon's folder scan was
+    /// always flat, so a slideshow made from a folder of subfolders was empty.
+    /// Absent in older configs, which stay flat.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recursive: bool,
     /// Where the transition used to live, back when only slideshows had one.
     /// Superseded by [`Wallpaper::transition`], which applies to any wallpaper
     /// change; `Config::migrate` lifts this up into it. Still parsed, still
@@ -1375,8 +1382,14 @@ pub struct LockScreen {
     /// screen. See [`crate::lockscreen::resolve`].
     #[serde(default = "default_lock_dim")]
     pub dim: f32,
-    /// Gaussian blur over a still frame: `0.0` (sharp) to `1.0` (softest).
-    /// Clamped to that range on resolve.
+    /// Gaussian blur over a still frame, as a **slider position**: `0.0`
+    /// (sharp) to `1.0` (softest). Clamped to that range on resolve.
+    ///
+    /// This is *not* the blur radius. The radius grows with the square of
+    /// this value, so the low end of the slider gets fine control — see
+    /// [`crate::lockscreen::blur_radius_for`], the one place that turns this
+    /// number into a radius. Which scale a stored number is on is recorded in
+    /// [`LockScreen::blur_curve`].
     ///
     /// **Still-frame hosts only.** A live-video wallpaper would need every
     /// decoded frame pushed back through a blur filter for as long as the
@@ -1385,6 +1398,15 @@ pub struct LockScreen {
     /// blurred once, when the lock screen appears, and costs nothing after.
     #[serde(default)]
     pub blur: f32,
+    /// Which scale [`LockScreen::blur`] is stored on. `0` — what serde fills
+    /// in for every config written before this key existed — is the original
+    /// linear scale (`blur` was the radius itself, as a fraction of the output
+    /// height); [`LOCK_BLUR_CURVE`] is the curved slider position described on
+    /// `blur`. [`Config::load_from`] folds the old scale onto the new one the
+    /// first time it sees it (see [`LockScreen::migrate_blur`]), so a person's
+    /// existing look is preserved and the next save writes the new scale.
+    #[serde(default)]
+    pub blur_curve: u8,
     /// Override the preset's own clock look. `None` — the default — takes
     /// whichever [`crate::clock::ClockTheme`] the preset was designed around,
     /// so picking a preset is one decision instead of two.
@@ -1408,6 +1430,27 @@ fn default_lock_dim() -> f32 {
     0.2
 }
 
+/// The current scale of [`LockScreen::blur`]: a position on the curve
+/// [`crate::lockscreen::blur_radius_for`] defines. `0` (absent) is the old
+/// linear scale.
+pub const LOCK_BLUR_CURVE: u8 = 1;
+
+impl LockScreen {
+    /// Fold a blur stored on the old linear scale onto the current curve, so
+    /// the radius it produced is the radius it still produces. Idempotent: a
+    /// value already on [`LOCK_BLUR_CURVE`] is left alone.
+    ///
+    /// Anything the old scale allowed beyond what the curve can reach
+    /// (`blur > 0.3`, already a field of colour blobs) saturates at the new
+    /// maximum rather than being rejected.
+    pub fn migrate_blur(&mut self) {
+        if self.blur_curve < LOCK_BLUR_CURVE {
+            self.blur = crate::lockscreen::legacy_blur_to_percent(self.blur) / 100.0;
+            self.blur_curve = LOCK_BLUR_CURVE;
+        }
+    }
+}
+
 impl Default for LockScreen {
     fn default() -> Self {
         LockScreen {
@@ -1416,6 +1459,7 @@ impl Default for LockScreen {
             live_video: LiveVideo::default(),
             dim: default_lock_dim(),
             blur: 0.0,
+            blur_curve: LOCK_BLUR_CURVE,
             clock_theme: None,
             greeting: None,
             widgets: LockWidgets::default(),
@@ -1706,6 +1750,16 @@ pub struct Config {
     /// me" means, and a user should not have to find a TOML file to do it.
     #[serde(default = "default_true")]
     pub feedback_reminders: bool,
+    /// Library cards play a muted, looping preview while hovered.
+    ///
+    /// A Settings switch, and also the thing Fresco itself turns off when it
+    /// finds it died while a preview was showing (see
+    /// `gui::hover_preview::startup`): a preview is a GTK video decoder living
+    /// inside the GUI process, and on a few GPU/driver pairings GTK's renderer
+    /// takes the whole app down with it. Off is a complete off — no decoder,
+    /// no proxy clips generated, the card just keeps its thumbnail.
+    #[serde(default = "default_true")]
+    pub hover_previews: bool,
     /// Full anonymous usage telemetry (daily ping with a random install id,
     /// feature counts, error kinds). Opt-out via the Settings switch or
     /// config.toml. False does NOT mean total silence: see
@@ -1874,6 +1928,7 @@ impl Default for Config {
             first_run_epoch: 0,
             feedback_prompted: false,
             feedback_reminders: true,
+            hover_previews: true,
             telemetry: true,
             telemetry_prompted: false,
             telemetry_consent_version: 0,
@@ -1996,7 +2051,11 @@ impl Config {
         }
         // `widgets` needs nothing here: it has never shipped under another
         // name, so no released config can contain a deprecated spelling of it.
-        // `lockscreen` needs nothing here either, for the same reason.
+        // `lockscreen` has no deprecated *key*, but 1.1.46's `blur` was a
+        // linear radius and is now a position on a curve; fold it over once.
+        if let Some(l) = self.lockscreen.as_mut() {
+            l.migrate_blur();
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -2109,6 +2168,24 @@ mod tests {
         assert_ne!(DEFAULT_DDE_ICON_PEEK_SECS, 0);
     }
 
+    /// Hover previews are on for everyone who never touched the switch — an
+    /// upgrade must not silently turn the feature off — and an explicit `false`
+    /// (the user's choice, or the crash sentinel's) survives a save/load.
+    #[test]
+    fn hover_previews_default_on_and_round_trip_off() {
+        assert!(Config::default().hover_previews);
+        let absent: Config = toml::from_str("autostart = true").unwrap();
+        assert!(
+            absent.hover_previews,
+            "an old config.toml lost the previews"
+        );
+
+        let off: Config = toml::from_str("hover_previews = false").unwrap();
+        assert!(!off.hover_previews);
+        let back: Config = toml::from_str(&toml::to_string(&off).unwrap()).unwrap();
+        assert!(!back.hover_previews, "the off switch did not persist");
+    }
+
     /// An explicit `0` must survive; it is the documented "never yield" escape
     /// hatch, and a `#[serde(default)]` that swallowed it would be a bug.
     #[test]
@@ -2219,6 +2296,27 @@ mod tests {
         .unwrap();
         explicit.migrate();
         assert_eq!(explicit.wallpaper.transition, Transition::Zoom);
+    }
+
+    /// `recursive` is new: configs written before it must stay flat, and a flat
+    /// slideshow must not write the key (an older daemon ignores unknown keys,
+    /// but there is no reason to litter every config with a `false`).
+    #[test]
+    fn slideshow_recursive_defaults_off_and_round_trips() {
+        let old: Config = toml::from_str(
+            "[wallpaper]\nkind = \"slideshow\"\n[wallpaper.slideshow]\nfolder = \"/pics\"",
+        )
+        .unwrap();
+        assert!(!old.wallpaper.slideshow.as_ref().unwrap().recursive);
+        assert!(!toml::to_string(&old).unwrap().contains("recursive"));
+
+        let deep: Config = toml::from_str(
+            "[wallpaper]\nkind = \"slideshow\"\n[wallpaper.slideshow]\nfolder = \"/pics\"\nrecursive = true",
+        )
+        .unwrap();
+        assert!(deep.wallpaper.slideshow.as_ref().unwrap().recursive);
+        let back: Config = toml::from_str(&toml::to_string(&deep).unwrap()).unwrap();
+        assert!(back.wallpaper.slideshow.unwrap().recursive);
     }
 
     /// `transition = "crossfade"` is on disk for real users. It must still
@@ -3235,7 +3333,11 @@ opacity = 200
     fn empty_lockscreen_table_uses_every_default() {
         // Naming the block never by itself takes over the system lock screen,
         // and every field the table leaves out takes its pinned default.
-        let cfg: Config = toml::from_str("[lockscreen]\n").unwrap();
+        let mut cfg: Config = toml::from_str("[lockscreen]\n").unwrap();
+        // The load path, not bare serde: a table with no `blur_curve` is a
+        // pre-curve config, and loading is what stamps it as current. (Its
+        // blur is 0, so nothing else about it changes.)
+        cfg.migrate();
         let l = cfg.lockscreen.expect("[lockscreen] table must deserialize");
         assert_eq!(l, LockScreen::default());
         assert!(!l.enabled, "lockscreen must default to OFF");
@@ -3325,6 +3427,7 @@ visualizer = true
             live_video: LiveVideo::Always,
             dim: 0.65,
             blur: 0.9,
+            blur_curve: LOCK_BLUR_CURVE,
             clock_theme: Some(crate::clock::ClockTheme::Lock),
             greeting: Some(String::new()),
             widgets: LockWidgets {
@@ -3350,6 +3453,69 @@ visualizer = true
             "every lockscreen field must survive a round trip"
         );
         assert_eq!(back.lockscreen.unwrap(), l);
+    }
+
+    /// Load `toml` the way every process does: through `load_from`, so the
+    /// migrations run.
+    fn load_lockscreen_toml(tag: &str, toml: &str) -> (Config, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("fresco-lockblur-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        (Config::load_from(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn lockscreen_blur_from_before_the_curve_keeps_its_radius_and_migrates_once() {
+        use crate::lockscreen::{blur_radius_for, resolve};
+        // 1.1.46 wrote `blur` only: a linear radius.
+        for old in [0.0_f32, 0.02, 0.1, 0.2, 0.3] {
+            let (cfg, path) = load_lockscreen_toml(
+                &format!("legacy{old}"),
+                &format!("[lockscreen]\nenabled = true\nblur = {old}\n"),
+            );
+            let l = cfg.lockscreen.clone().unwrap();
+            assert_eq!(l.blur_curve, LOCK_BLUR_CURVE, "stamped as migrated");
+            // The picture does not change: same radius before and after.
+            assert!(
+                (resolve(&l).blur - old).abs() < 1e-5,
+                "{old} -> {}",
+                resolve(&l).blur
+            );
+            // And the slider now sits where that radius lives on the curve.
+            assert!((blur_radius_for(l.blur * 100.0) - old).abs() < 1e-5);
+
+            // Persist, reload: the stored number is now final, not migrated
+            // again (which would compound the conversion).
+            cfg.save_to(&path).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("blur_curve = 1"), "{text}");
+            let again = Config::load_from(&path).unwrap().lockscreen.unwrap();
+            assert_eq!(again, l, "second load must be a no-op");
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+    }
+
+    #[test]
+    fn lockscreen_blur_already_on_the_curve_is_left_alone() {
+        let (cfg, path) =
+            load_lockscreen_toml("current", "[lockscreen]\nblur = 0.25\nblur_curve = 1\n");
+        assert_eq!(cfg.lockscreen.unwrap().blur, 0.25);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn lockscreen_blur_past_the_new_maximum_saturates_when_migrated() {
+        // Old 0.6 asked for a blur no slider position reaches any more.
+        let (cfg, path) = load_lockscreen_toml("over", "[lockscreen]\nblur = 0.6\n");
+        assert_eq!(cfg.lockscreen.unwrap().blur, 1.0);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        // And junk stays harmless.
+        let (cfg, path) = load_lockscreen_toml("nan", "[lockscreen]\nblur = nan\n");
+        assert_eq!(cfg.lockscreen.unwrap().blur, 0.0);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]

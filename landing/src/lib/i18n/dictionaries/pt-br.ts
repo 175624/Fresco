@@ -114,7 +114,7 @@ export const ptBr: Dictionary = {
     labelInstall: "Instalação",
     what: "O Fresco é um app gratuito e de código aberto de papel de parede animado para Linux: ele define vídeos, GIFs, imagens, apresentações de slides e playlists como plano de fundo animado, com decodificação por hardware na GPU. Uma alternativa gratuita ao Wallpaper Engine e uma interface gráfica para o mpvpaper no Wayland.",
     platforms:
-      "Qualquer área de trabalho X11 (Ubuntu, Pop!_OS, Linux Mint, Debian, Kali Linux), além dos compositores Wayland com layer-shell: COSMIC, Hyprland, Sway e KDE Plasma 6. No GNOME com Wayland ele recorre a um quadro estático.",
+      "Qualquer área de trabalho X11 (Ubuntu, Pop!_OS, Linux Mint, Debian, Kali Linux), além dos compositores Wayland com layer-shell: COSMIC, Hyprland, Sway e KDE Plasma 6. No GNOME com Wayland ele mostra só um quadro estático até existir uma extensão do Fresco para GNOME.",
     widgets:
       "Quatro widgets desenhados no próprio papel de parede, e não em uma janela: letras de música sincronizadas, um relógio com seis temas, um visualizador de áudio e a capa do álbum em um disco girando. Nada flutua sobre as suas janelas e nada intercepta cliques. Todos vêm desativados. Indisponíveis no GNOME com Wayland, que não tem superfície de papel de parede animado.",
     licenseLead: "GPL-3.0, gratuito para sempre.",
@@ -133,7 +133,7 @@ export const ptBr: Dictionary = {
     thWhatYouGet: "O que você ganha",
     thStatus: "Status",
     footnote:
-      "GNOME Wayland: recorre a um quadro estático (o Mutter não expõe superfície animada), e os widgets também precisam dessa superfície, então não estão disponíveis ali. Todo o resto acima funciona.",
+      "GNOME Wayland: somente um quadro estático. O Mutter não expõe superfície animada, e o GNOME 50, o Ubuntu 25.10+ e o Fedora 43+ não trazem mais uma sessão Xorg para onde recorrer. Os widgets também precisam dessa superfície, então não estão disponíveis ali, e o vídeo animado aguarda uma extensão do Fresco para GNOME, que está planejada. Todo o resto acima funciona.",
     tally: (shipping: number, total: number, soon: number) =>
       `${shipping} de ${total} disponíveis · ${soon} em prévia · 0 descontinuados`,
     rows: {
@@ -148,7 +148,7 @@ export const ptBr: Dictionary = {
         tag: "Sessões",
         title: "X11 e Wayland",
         description:
-          "Um backend de janela de área de trabalho em qualquer sessão X11, mais um backend layer-shell para COSMIC, Hyprland, Sway e KDE Plasma 6. O GNOME com Wayland recebe um quadro estático.",
+          "Um backend de janela de área de trabalho em qualquer sessão X11, mais um backend layer-shell para COSMIC, Hyprland, Sway e KDE Plasma 6. O GNOME com Wayland mostra um quadro estático até a extensão planejada para GNOME.",
         status: "X11 · layer-shell",
       },
       catalog: {
@@ -355,7 +355,7 @@ export const ptBr: Dictionary = {
 
   supported: {
     title: "Onde o Fresco roda.",
-    lead: "Em qualquer área de trabalho X11, incluindo o DDE do deepin 25, e nos compositores Wayland com layer-shell (COSMIC, Hyprland, Sway e KDE Plasma 6), nas distribuições Debian, Ubuntu e Kali Linux mais populares. O GNOME com Wayland recebe um quadro estático.",
+    lead: "Em qualquer área de trabalho X11, incluindo o DDE do deepin 25, e nos compositores Wayland com layer-shell (COSMIC, Hyprland, Sway e KDE Plasma 6), nas distribuições Debian, Ubuntu e Kali Linux mais populares. O GNOME com Wayland mostra, por enquanto, só um quadro estático.",
     sessionsTitle: "Sessões e compositores",
     distrosTitle: (n: number) => `Distribuições testadas · ${n}`,
     formatsTitle: (n: number) => `Formatos suportados · ${n}`,
@@ -377,7 +377,7 @@ export const ptBr: Dictionary = {
       },
       gnome: {
         label: "GNOME no Wayland",
-        detail: "Quadro estático (o Mutter não tem superfície animada)",
+        detail: "Somente um quadro estático (o Mutter não tem superfície animada)",
       },
     },
     fieldReport: "Relato de campo · deepin 25",
@@ -439,7 +439,7 @@ export const ptBr: Dictionary = {
       },
       {
         q: "O Fresco funciona no GNOME?",
-        a: "No GNOME com sessão X11, sim, papéis de parede animados completos. No GNOME com Wayland, o Mutter não expõe uma superfície de papel de parede animado, então o Fresco mostra um quadro estático do papel de parede escolhido em vez de fingir que anima.",
+        a: "No GNOME com sessão X11, sim, papéis de parede animados completos. Mas o GNOME 49 desativou a sessão X11 e o GNOME 50 a removeu, então o Ubuntu 25.10 e mais novos (incluindo o 26.04 LTS) e o Fedora 43 e mais novos não têm essa sessão; o Ubuntu 22.04 e o 24.04 ainda oferecem “Ubuntu on Xorg”. No GNOME com Wayland, o Mutter não expõe uma superfície de papel de parede animado, então o Fresco mostra um quadro estático do papel de parede escolhido e avisa isso, em vez de fingir que anima. Vídeo animado no GNOME com Wayland precisa de uma extensão do Fresco para GNOME, que está planejada.",
       },
       {
         q: "Um papel de parede em vídeo pode ter som?",

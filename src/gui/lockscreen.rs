@@ -49,8 +49,8 @@ use crate::clock::ClockTheme;
 use crate::config::{LiveVideo, LockPreset, LockWidgets};
 use crate::ipc::{self, LockSetupState, Request, Response, StatusReply};
 use crate::lockscreen::LockWidget;
-use crate::t;
 use crate::userinfo;
+use crate::{t, tf};
 
 use super::daemon_ctl;
 use super::window::AppState;
@@ -91,14 +91,25 @@ pub fn show_lockscreen_window(parent: &adw::ApplicationWindow, state: Rc<RefCell
         page.add(&banner_group);
     }
 
-    let master_switch = add_master_group(&page, &state);
-    let status_group = add_status_group(&page, &dialog);
+    // What this desktop will actually do with the lock screen, first thing on
+    // the page (issue #37): the master switch below it must not read as if it
+    // always works. `support` is the one place the latest poll's verdict
+    // lives, shared by the notice, the switch's toast and the status poll.
+    let support = Rc::new(Cell::new(None::<LockSupport>));
+    let notice = SupportNotice::new();
+    page.add(&notice.group);
+
+    let master_switch = add_master_group(&page, &state, &dialog, &support);
+    let status_group = add_status_group(&page, &dialog, &notice, &support);
     let look_group = add_look_group(&page, &state);
     let widgets_group = add_widgets_group(&page, &state);
     let motion_group = add_motion_group(&page, &state);
     let preview_group = add_preview_group(&page, parent, &dialog);
 
     if flatpak {
+        // The banner above already says why nothing here can work; a
+        // "what reaches your lock screen" verdict would contradict it.
+        notice.hide_for_good();
         master_switch.set_sensitive(false);
         for g in [
             &status_group,
@@ -119,7 +130,17 @@ pub fn show_lockscreen_window(parent: &adw::ApplicationWindow, state: Rc<RefCell
 
 /// Master switch + one-line explainer + the trust note. Returns the switch so
 /// the caller can grey it out under Flatpak without a second lookup.
-fn add_master_group(page: &adw::PreferencesPage, state: &Rc<RefCell<AppState>>) -> gtk4::Switch {
+///
+/// Turning it on where `support` says nothing reaches the lock screen still
+/// saves the setting (it is harmless, and holds for the day the desktop gains
+/// support) but says so out loud: a switch that flips with no consequence is
+/// how people came to believe it had worked (issue #37).
+fn add_master_group(
+    page: &adw::PreferencesPage,
+    state: &Rc<RefCell<AppState>>,
+    dialog: &adw::PreferencesWindow,
+    support: &Rc<Cell<Option<LockSupport>>>,
+) -> gtk4::Switch {
     let cur = lockscreen_settings(state);
 
     let group = adw::PreferencesGroup::new();
@@ -135,9 +156,20 @@ fn add_master_group(page: &adw::PreferencesPage, state: &Rc<RefCell<AppState>>) 
     row.set_activatable_widget(Some(&sw));
     {
         let state = state.clone();
+        let support = support.clone();
+        // Weak: the switch lives inside the dialog, so a strong handle here
+        // would be a reference cycle that keeps a closed window alive.
+        let dialog = dialog.downgrade();
         sw.connect_active_notify(move |sw| {
             let on = sw.is_active();
             edit_lockscreen(&state, |l| l.enabled = on);
+            if let Some(msg) = enable_notice(on, support.get()) {
+                if let Some(dialog) = dialog.upgrade() {
+                    let toast = adw::Toast::new(msg);
+                    toast.set_timeout(ENABLE_NOTICE_TIMEOUT_SECS);
+                    dialog.add_toast(toast);
+                }
+            }
         });
     }
     group.add(&row);
@@ -146,6 +178,232 @@ fn add_master_group(page: &adw::PreferencesPage, state: &Rc<RefCell<AppState>>) 
     )));
     page.add(&group);
     sw
+}
+
+// ─── What reaches the real lock screen ────────────────────────────────────────
+
+/// How long the "turned on, but nothing changes here" toast stays up. Longer
+/// than libadwaita's default: it is a sentence to read, not a confirmation.
+const ENABLE_NOTICE_TIMEOUT_SECS: u32 = 8;
+
+/// What Fresco can put on this desktop's real lock screen — the one-line
+/// answer the page, the switch's toast and the app menu all give, so they can
+/// never disagree with each other (issue #37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LockSupport {
+    /// Live video and Fresco's widgets.
+    Full,
+    /// A still frame of the wallpaper, no widgets.
+    StillFrame,
+    /// Nothing: the desktop's lock screen keeps its own background.
+    Nothing,
+}
+
+impl LockSupport {
+    /// The summary sentence, shared verbatim by every surface that states it.
+    pub(super) fn summary(self) -> &'static str {
+        match self {
+            LockSupport::Full => t!("Live video and widgets"),
+            LockSupport::StillFrame => t!("Still frame only"),
+            LockSupport::Nothing => {
+                t!("Nothing yet — the lock screen keeps your desktop’s own background")
+            }
+        }
+    }
+}
+
+/// Pure selection of [`LockSupport`] from the capability data the status tags
+/// show (`live_video`, `widgets`) plus [`ipc::LockStatus::still_frame`] — the
+/// only datum that tells "still frame only" from "nothing" once the first two
+/// are both off.
+///
+/// `None` means the daemon did not say (it predates `still_frame`): the page
+/// stays quiet rather than claim "nothing" for a desktop that may well get a
+/// frame. No host is named here — a desktop that gains a still-frame writer
+/// moves from `Nothing` to `StillFrame` purely by the daemon reporting it.
+///
+/// `live_video` and `widgets` are two flags but one tier on every host today
+/// (the daemon sets both from one `capable` test), so either one being on is
+/// [`LockSupport::Full`].
+pub(super) fn lock_support(
+    live_video: bool,
+    widgets: bool,
+    still_frame: Option<bool>,
+) -> Option<LockSupport> {
+    if live_video || widgets {
+        return Some(LockSupport::Full);
+    }
+    match still_frame {
+        Some(true) => Some(LockSupport::StillFrame),
+        Some(false) => Some(LockSupport::Nothing),
+        None => None,
+    }
+}
+
+/// [`lock_support`] over a daemon's [`ipc::LockStatus`].
+pub(super) fn lock_support_of(ls: &ipc::LockStatus) -> Option<LockSupport> {
+    lock_support(ls.live_video, ls.widgets, ls.still_frame)
+}
+
+/// The desktop's name as the notice words it. `"unsupported"` is not a
+/// desktop anyone recognises, and [`host_label`]'s sentence for it would read
+/// as nonsense after "On", so it becomes plain "this desktop".
+fn notice_desktop(host: &str) -> String {
+    match host {
+        "unsupported" => t!("this desktop").to_string(),
+        other => host_label(other),
+    }
+}
+
+/// The page-top notice's text: `On GNOME: Still frame only`.
+fn support_notice_text(host: &str, support: LockSupport) -> String {
+    tf!(
+        "On {desktop}: {summary}",
+        "desktop" => notice_desktop(host),
+        "summary" => support.summary()
+    )
+}
+
+/// The toast shown when the master switch is turned on, or `None` when no
+/// toast is due: only for a switch going on, on a desktop where `support` is
+/// known to be [`LockSupport::Nothing`]. An unknown verdict (daemon down) and
+/// every desktop with something to show stay silent.
+fn enable_notice(on: bool, support: Option<LockSupport>) -> Option<&'static str> {
+    (on && support == Some(LockSupport::Nothing)).then(|| {
+        t!(
+            "Saved, but this desktop can’t show Fresco on the lock screen yet — it keeps using its own background"
+        )
+    })
+}
+
+/// The trailing tag on the app menu's "Lock Screen…" row: nothing when the
+/// desktop gets everything (or we do not know yet), otherwise a short dim
+/// mark so the limit is visible before the page is even opened.
+pub(super) fn menu_tag(support: Option<LockSupport>) -> Option<&'static str> {
+    match support {
+        Some(LockSupport::StillFrame) => Some(t!("Still frame only")),
+        Some(LockSupport::Nothing) => Some(t!("Not supported yet")),
+        Some(LockSupport::Full) | None => None,
+    }
+}
+
+/// The menu row's tooltip: what the entry is, then — once known — what the
+/// desktop will do with it.
+pub(super) fn menu_tooltip(support: Option<LockSupport>) -> String {
+    let base = t!("Show Fresco on the lock screen");
+    match support {
+        Some(s) => format!("{base}\n{}", s.summary()),
+        None => base.to_string(),
+    }
+}
+
+/// Give the app menu's "Lock Screen…" row (a `window::menu_item`, whose child
+/// is a lone label) its support hint: a trailing tag and a tooltip carrying
+/// the same summary the page shows, refreshed from the last status poll each
+/// time the menu opens. A row of any other shape is left untouched.
+pub(super) fn decorate_menu_row(btn: &gtk4::Button, popover: &gtk4::Popover) {
+    let Some(label) = btn.child().and_downcast::<gtk4::Label>() else {
+        return;
+    };
+    let tag = gtk4::Label::new(None);
+    tag.set_visible(false);
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    btn.set_child(None::<&gtk4::Widget>);
+    row.append(&label);
+    row.append(&tag);
+    btn.set_child(Some(&row));
+
+    let refresh = {
+        let btn = btn.clone();
+        move || {
+            let support = super::status::cached_lock_support();
+            btn.set_tooltip_text(Some(&menu_tooltip(support)));
+            match menu_tag(support) {
+                Some(text) => {
+                    let nothing = support == Some(LockSupport::Nothing);
+                    tag.set_label(text);
+                    // The unsupported case is the one worth a colour.
+                    let (add, remove) = if nothing {
+                        ("warning", "dim")
+                    } else {
+                        ("dim", "warning")
+                    };
+                    tag.remove_css_class(remove);
+                    tag.add_css_class(add);
+                    tag.set_visible(true);
+                }
+                None => tag.set_visible(false),
+            }
+        }
+    };
+    refresh();
+    popover.connect_show(move |_| refresh());
+}
+
+/// The notice at the top of the page, owned by one dialog. Hidden until the
+/// first successful poll names a verdict; hidden again if a later poll cannot.
+#[derive(Clone)]
+struct SupportNotice {
+    group: adw::PreferencesGroup,
+    icon: gtk4::Image,
+    label: gtk4::Label,
+    /// Set under Flatpak, where the page explains itself differently and every
+    /// later poll must leave the notice hidden.
+    suppressed: Rc<Cell<bool>>,
+}
+
+impl SupportNotice {
+    fn new() -> Self {
+        let label = gtk4::Label::new(None);
+        label.set_wrap(true);
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        // The same `.capability-banner` shape as `info_banner_widget`, built
+        // by hand because this one needs to swap its icon.
+        let banner = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        banner.add_css_class("capability-banner");
+        let icon = gtk4::Image::from_icon_name("dialog-information-symbolic");
+        icon.set_valign(gtk4::Align::Start);
+        banner.append(&icon);
+        banner.append(&label);
+        let group = adw::PreferencesGroup::new();
+        group.add(&banner);
+        group.set_visible(false);
+        SupportNotice {
+            group,
+            icon,
+            label,
+            suppressed: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// Show `support` for `host`, or hide the notice when there is no verdict.
+    /// The "nothing" case gets a warning icon and colour: it is the one the
+    /// reporter of issue #37 needed to notice.
+    fn show(&self, host: &str, support: Option<LockSupport>) {
+        let Some(support) = support.filter(|_| !self.suppressed.get()) else {
+            self.group.set_visible(false);
+            return;
+        };
+        self.label.set_label(&support_notice_text(host, support));
+        let nothing = support == LockSupport::Nothing;
+        self.icon.set_icon_name(Some(if nothing {
+            "dialog-warning-symbolic"
+        } else {
+            "dialog-information-symbolic"
+        }));
+        if nothing {
+            self.label.add_css_class("warning");
+        } else {
+            self.label.remove_css_class("warning");
+        }
+        self.group.set_visible(true);
+    }
+
+    fn hide_for_good(&self) {
+        self.suppressed.set(true);
+        self.group.set_visible(false);
+    }
 }
 
 // ─── Host status ──────────────────────────────────────────────────────────────
@@ -251,11 +509,17 @@ struct StatusWidgets {
     setup_row: adw::ActionRow,
     setup_btn: gtk4::Button,
     snippets_box: gtk4::Box,
+    /// The page-top verdict, refreshed by the same poll as everything above.
+    notice: SupportNotice,
+    /// Where each poll leaves the verdict for the master switch's toast.
+    support: Rc<Cell<Option<LockSupport>>>,
 }
 
 fn add_status_group(
     page: &adw::PreferencesPage,
     dialog: &adw::PreferencesWindow,
+    notice: &SupportNotice,
+    support: &Rc<Cell<Option<LockSupport>>>,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title(t!("Status"));
@@ -311,6 +575,8 @@ fn add_status_group(
         setup_row,
         setup_btn,
         snippets_box,
+        notice: notice.clone(),
+        support: support.clone(),
     });
     let action = Rc::new(Cell::new(None::<SetupAction>));
 
@@ -397,10 +663,16 @@ fn apply_status(
         w.muted.set_visible(true);
         w.content.set_visible(false);
         action.set(None);
+        w.support.set(None);
+        w.notice.show("", None);
         return;
     };
     w.muted.set_visible(false);
     w.content.set_visible(true);
+
+    let support = lock_support_of(&ls);
+    w.support.set(support);
+    w.notice.show(&ls.host, support);
 
     w.host_row
         .set_subtitle(&glib::markup_escape_text(&host_label(&ls.host)));
@@ -672,14 +944,14 @@ fn add_look_group(
         });
     }
 
-    // The real name needs `userinfo::current()` (a couple of bounded but
+    // The real name needs `userinfo::current_identity()` (a couple of bounded but
     // real `gdbus` round trips), so it is resolved exactly once, off the GTK
     // thread, and only ever *upgrades* the placeholder already showing the
     // time-only phrase — never blocks opening this page on it.
     {
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let info = userinfo::current();
+            let info = userinfo::current_identity();
             let _ = tx.send_blocking(userinfo::first_name(&info));
         });
         glib::spawn_future_local(async move {
@@ -706,10 +978,18 @@ fn add_look_group(
         t!("Blur"),
         t!("Still images only"),
         (0.0, 1.0, 0.01),
-        f64::from(cur.blur),
+        // Slider position on the curved scale (see `blur_radius_for`), read
+        // through `blur_percent` so a not-yet-migrated config shows where its
+        // old look now lives rather than a number on the wrong scale.
+        f64::from(crate::lockscreen::blur_percent(&cur) / 100.0),
         {
             let state = state.clone();
-            move |v| edit_lockscreen(&state, |l| l.blur = v as f32)
+            move |v| {
+                edit_lockscreen(&state, |l| {
+                    l.blur = v as f32;
+                    l.blur_curve = crate::config::LOCK_BLUR_CURVE;
+                })
+            }
         },
     );
     group.add(&blur_row);
@@ -882,7 +1162,13 @@ fn add_preview_group(
                     btn.set_sensitive(true);
                     match result {
                         Ok(Response::LockPreview { path }) => {
-                            open_preview_window(&parent, width, height, path);
+                            // A frame that cannot be loaded would otherwise
+                            // open as an empty, black full-screen window.
+                            if !open_preview_window(&parent, width, height, path) {
+                                dialog2.add_toast(adw::Toast::new(t!(
+                                    "Couldn't load the preview image"
+                                )));
+                            }
                         }
                         Ok(Response::Err { message }) => {
                             dialog2.add_toast(adw::Toast::new(&message));
@@ -959,12 +1245,28 @@ fn load_preview_frame(picture: &gtk4::Picture, path: &str) {
 /// daemon request this path (or its 1Hz refresh) ever sends is
 /// [`Request::LockPreview`], which the daemon answers with a rendered PNG and
 /// nothing else — see this module's top-level docs.
+///
+/// Returns `false`, opening nothing, when the first frame cannot be loaded —
+/// the daemon always writes an opaque PNG with a background, so an unreadable
+/// one is a real fault to tell the user about, not a window to show black.
 fn open_preview_window(
     parent: &adw::ApplicationWindow,
     width: u32,
     height: u32,
     initial_path: String,
-) {
+) -> bool {
+    let first_frame = match gtk4::gdk::Texture::from_filename(&initial_path) {
+        Ok(texture) => texture,
+        Err(e) => {
+            log::warn!("lock screen preview: couldn't load {initial_path}: {e}");
+            return false;
+        }
+    };
+    log::info!(
+        "lock screen preview: {width}x{height} frame ({}x{}) from {initial_path}",
+        first_frame.width(),
+        first_frame.height()
+    );
     let win = gtk4::Window::new();
     win.set_transient_for(Some(parent));
     win.set_modal(true);
@@ -983,7 +1285,7 @@ fn open_preview_window(
     picture.set_can_shrink(true);
     picture.set_hexpand(true);
     picture.set_vexpand(true);
-    load_preview_frame(&picture, &initial_path);
+    picture.set_paintable(Some(&first_frame));
     overlay.set_child(Some(&picture));
 
     let hint = gtk4::Label::new(Some(t!("Press any key to close")));
@@ -1056,6 +1358,7 @@ fn open_preview_window(
     });
 
     win.present();
+    true
 }
 
 // ─── Small GTK helpers ────────────────────────────────────────────────────────
@@ -1252,6 +1555,121 @@ mod tests {
         );
         assert_eq!(setup_button_spec(LockSetupState::NotNeeded), None);
         assert_eq!(setup_button_spec(LockSetupState::Unavailable), None);
+    }
+
+    // -- lock_support (issue #37) ---------------------------------------------
+
+    fn lock_status(host: &str, live: bool, widgets: bool, still: Option<bool>) -> ipc::LockStatus {
+        ipc::LockStatus {
+            enabled: true,
+            host: host.into(),
+            live_video: live,
+            widgets,
+            still_frame: still,
+            locked: false,
+            setup: LockSetupState::NotNeeded,
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lock_support_picks_the_tier_the_capability_data_names() {
+        // Live video / widgets win over everything, whatever `still_frame` says.
+        for still in [None, Some(false), Some(true)] {
+            assert_eq!(lock_support(true, true, still), Some(LockSupport::Full));
+            // One flag alone is still the live-surface tier (the daemon sets
+            // both from one test; this pins what a future split would do).
+            assert_eq!(lock_support(true, false, still), Some(LockSupport::Full));
+            assert_eq!(lock_support(false, true, still), Some(LockSupport::Full));
+        }
+        assert_eq!(
+            lock_support(false, false, Some(true)),
+            Some(LockSupport::StillFrame)
+        );
+        assert_eq!(
+            lock_support(false, false, Some(false)),
+            Some(LockSupport::Nothing)
+        );
+        // An older daemon said nothing about frames: claim nothing.
+        assert_eq!(lock_support(false, false, None), None);
+    }
+
+    #[test]
+    fn lock_support_of_follows_the_daemon_not_the_host_name() {
+        // Same host, flipped only by the reported capability: a desktop that
+        // gains a still-frame writer moves tier with no GUI change.
+        let before = lock_status("deepin", false, false, Some(false));
+        let after = lock_status("deepin", false, false, Some(true));
+        assert_eq!(lock_support_of(&before), Some(LockSupport::Nothing));
+        assert_eq!(lock_support_of(&after), Some(LockSupport::StillFrame));
+        // And the reverse for a host that is "still frame" today.
+        let gnome = lock_status("gnome", false, false, Some(true));
+        assert_eq!(lock_support_of(&gnome), Some(LockSupport::StillFrame));
+        let cosmic = lock_status("cosmic", true, true, Some(true));
+        assert_eq!(lock_support_of(&cosmic), Some(LockSupport::Full));
+        let unsupported = lock_status("unsupported", false, false, Some(false));
+        assert_eq!(lock_support_of(&unsupported), Some(LockSupport::Nothing));
+    }
+
+    #[test]
+    fn lock_support_summaries_are_the_three_documented_sentences() {
+        assert_eq!(LockSupport::Full.summary(), "Live video and widgets");
+        assert_eq!(LockSupport::StillFrame.summary(), "Still frame only");
+        assert_eq!(
+            LockSupport::Nothing.summary(),
+            "Nothing yet — the lock screen keeps your desktop’s own background"
+        );
+    }
+
+    #[test]
+    fn support_notice_names_the_desktop_and_the_verdict() {
+        assert_eq!(
+            support_notice_text("gnome", LockSupport::StillFrame),
+            "On GNOME: Still frame only"
+        );
+        assert_eq!(
+            support_notice_text("deepin", LockSupport::Nothing),
+            "On Deepin: Nothing yet — the lock screen keeps your desktop’s own background"
+        );
+        // "unsupported" is not a desktop name: it must not read "On Not
+        // supported on this desktop yet: …".
+        assert_eq!(
+            support_notice_text("unsupported", LockSupport::Nothing),
+            "On this desktop: Nothing yet — the lock screen keeps your desktop’s own background"
+        );
+    }
+
+    #[test]
+    fn enable_notice_fires_only_for_switching_on_where_nothing_applies() {
+        let msg = enable_notice(true, Some(LockSupport::Nothing));
+        assert!(msg.is_some_and(|m| m.starts_with("Saved, but this desktop can’t")));
+        // Turning it off, or any desktop with something to show, or an
+        // unknown verdict: no toast.
+        assert_eq!(enable_notice(false, Some(LockSupport::Nothing)), None);
+        assert_eq!(enable_notice(true, Some(LockSupport::StillFrame)), None);
+        assert_eq!(enable_notice(true, Some(LockSupport::Full)), None);
+        assert_eq!(enable_notice(true, None), None);
+    }
+
+    #[test]
+    fn menu_row_hint_marks_only_what_is_limited() {
+        assert_eq!(menu_tag(Some(LockSupport::Full)), None);
+        assert_eq!(menu_tag(None), None);
+        assert_eq!(
+            menu_tag(Some(LockSupport::StillFrame)),
+            Some("Still frame only")
+        );
+        assert_eq!(
+            menu_tag(Some(LockSupport::Nothing)),
+            Some("Not supported yet")
+        );
+
+        assert_eq!(menu_tooltip(None), "Show Fresco on the lock screen");
+        assert_eq!(
+            menu_tooltip(Some(LockSupport::StillFrame)),
+            "Show Fresco on the lock screen\nStill frame only"
+        );
+        assert!(menu_tooltip(Some(LockSupport::Nothing)).ends_with(LockSupport::Nothing.summary()));
     }
 
     // -- host_label -------------------------------------------------------------

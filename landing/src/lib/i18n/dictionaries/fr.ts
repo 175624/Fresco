@@ -114,7 +114,7 @@ export const fr: Dictionary = {
     labelInstall: "Installation",
     what: "Fresco est une application gratuite et open source de fonds d'écran animés pour Linux : elle met des vidéos, des GIF, des images, des diaporamas et des playlists en fond de bureau animé, avec décodage matériel sur le GPU. Une alternative gratuite à Wallpaper Engine, et une interface graphique pour mpvpaper sous Wayland.",
     platforms:
-      "N'importe quel bureau X11 (Ubuntu, Pop!_OS, Linux Mint, Debian, Kali Linux), ainsi que les compositeurs Wayland avec layer-shell : COSMIC, Hyprland, Sway, KDE Plasma 6. Sous GNOME avec Wayland, repli sur une image fixe.",
+      "N'importe quel bureau X11 (Ubuntu, Pop!_OS, Linux Mint, Debian, Kali Linux), ainsi que les compositeurs Wayland avec layer-shell : COSMIC, Hyprland, Sway, KDE Plasma 6. Sous GNOME avec Wayland, Fresco n'affiche qu'une image fixe tant que son extension GNOME n'est pas disponible.",
     widgets:
       "Quatre widgets dessinés dans le fond d'écran lui-même, pas dans une fenêtre : paroles synchronisées, une horloge à six thèmes, un visualiseur audio et la pochette de l'album sur un disque qui tourne. Rien ne flotte au-dessus de tes fenêtres et rien n'intercepte un clic. Tous désactivés par défaut. Indisponibles sous GNOME avec Wayland, qui n'offre pas de surface de fond animé.",
     licenseLead: "GPL-3.0, gratuit pour toujours.",
@@ -133,7 +133,7 @@ export const fr: Dictionary = {
     thWhatYouGet: "Ce que tu obtiens",
     thStatus: "Statut",
     footnote:
-      "GNOME Wayland : repli sur une image fixe (Mutter n'expose pas de surface animée), et les widgets ont besoin de cette même surface, donc ils n'y sont pas disponibles. Tout le reste ci-dessus fonctionne.",
+      "GNOME Wayland : image fixe uniquement. Mutter n'expose pas de surface animée, et GNOME 50, Ubuntu 25.10+ et Fedora 43+ n'installent plus de session Xorg vers laquelle se replier. Les widgets ont besoin de cette même surface, donc ils n'y sont pas disponibles, et la vidéo animée attend une extension GNOME pour Fresco, qui est prévue. Tout le reste ci-dessus fonctionne.",
     tally: (shipping: number, total: number, soon: number) =>
       `${shipping} sur ${total} disponibles · ${soon} en préversion · 0 abandonnée`,
     rows: {
@@ -148,7 +148,7 @@ export const fr: Dictionary = {
         tag: "Sessions",
         title: "X11 et Wayland",
         description:
-          "Un backend fenêtre de bureau sur n'importe quelle session X11, plus un backend layer-shell pour COSMIC, Hyprland, Sway et KDE Plasma 6. GNOME avec Wayland reçoit une image fixe.",
+          "Un backend fenêtre de bureau sur n'importe quelle session X11, plus un backend layer-shell pour COSMIC, Hyprland, Sway et KDE Plasma 6. GNOME avec Wayland affiche une image fixe en attendant l'extension GNOME prévue.",
         status: "X11 · layer-shell",
       },
       catalog: {
@@ -355,7 +355,7 @@ export const fr: Dictionary = {
 
   supported: {
     title: "Où tourne Fresco.",
-    lead: "Sur n'importe quel bureau X11, y compris le DDE de deepin 25, et sur les compositeurs Wayland avec layer-shell (COSMIC, Hyprland, Sway et KDE Plasma 6), à travers les distributions Debian, Ubuntu et Kali Linux les plus répandues. GNOME avec Wayland reçoit une image fixe.",
+    lead: "Sur n'importe quel bureau X11, y compris le DDE de deepin 25, et sur les compositeurs Wayland avec layer-shell (COSMIC, Hyprland, Sway et KDE Plasma 6), à travers les distributions Debian, Ubuntu et Kali Linux les plus répandues. GNOME avec Wayland n'affiche pour l'instant qu'une image fixe.",
     sessionsTitle: "Sessions et compositeurs",
     distrosTitle: (n: number) => `Distributions testées · ${n}`,
     formatsTitle: (n: number) => `Formats pris en charge · ${n}`,
@@ -377,7 +377,7 @@ export const fr: Dictionary = {
       },
       gnome: {
         label: "GNOME sous Wayland",
-        detail: "Repli sur une image fixe (Mutter n'a pas de surface animée)",
+        detail: "Image fixe uniquement (Mutter n'a pas de surface animée)",
       },
     },
     fieldReport: "Retour de terrain · deepin 25",
@@ -439,7 +439,7 @@ export const fr: Dictionary = {
       },
       {
         q: "Fresco fonctionne-t-il sous GNOME ?",
-        a: "Sous GNOME en session X11, oui, avec des fonds d'écran animés complets. Sous GNOME avec Wayland, Mutter n'expose pas de surface de fond animé : Fresco affiche donc une image fixe du fond choisi plutôt que de faire semblant d'animer.",
+        a: "Sous GNOME en session X11, oui, avec des fonds d'écran animés complets. Mais GNOME 49 a désactivé sa session X11 et GNOME 50 l'a supprimée : Ubuntu 25.10 et suivantes (dont la 26.04 LTS) et Fedora 43 et suivantes n'en ont donc aucune, alors qu'Ubuntu 22.04 et 24.04 proposent encore « Ubuntu on Xorg ». Sous GNOME avec Wayland, Mutter n'expose pas de surface de fond animé : Fresco affiche donc une image fixe du fond choisi, et le dit, plutôt que de faire semblant d'animer. La vidéo animée sous GNOME avec Wayland demande une extension GNOME pour Fresco, qui est prévue.",
       },
       {
         q: "Un fond d'écran vidéo peut-il émettre du son ?",
