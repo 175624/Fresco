@@ -16,8 +16,8 @@
 //! # Where the avatar comes from
 //!
 //! Desktops do not agree on where a user's picture lives, so [`current`] walks
-//! an ordered list ([`avatar_source_order`]) and takes the first candidate that
-//! is a readable PNG/JPEG/WebP ([`avatar_file_ok`]):
+//! an ordered list (`avatar_source_order`) and takes the first candidate that
+//! is a readable PNG/JPEG/WebP (`avatar_file_ok`):
 //!
 //! 1. **dde-daemon's own account service** — `org.deepin.dde.Accounts1`
 //!    (deepin 25; `com.deepin.daemon.Accounts` on deepin 20/23), user object
@@ -32,7 +32,7 @@
 //!    The value is a **`file://` URI** (`defaultUserIcon` is
 //!    `file:///var/lib/AccountsService/icons/default`, a symlink into
 //!    `dde-account-faces`' `icons/animal/*.png` set), so it has to be decoded
-//!    before it is a path ([`parse_icon_location`]). On deepin this source is
+//!    before it is a path (`parse_icon_location`). On deepin this source is
 //!    tried first; elsewhere it is a cheap last resort (the call fails fast
 //!    with `ServiceUnknown`).
 //! 2. **dde-daemon's per-user keyfile**, `/var/lib/AccountsService/deepin/
@@ -78,8 +78,8 @@
 //! [`first_name`], [`initials`] and [`greeting`] take already-resolved data
 //! and do no I/O at all, so the lock-screen card layout can call them straight
 //! from a render function without worrying about blocking. The avatar
-//! resolver is built the same way: [`parse_icon_location`],
-//! [`keyfile_value`], [`avatar_source_order`] and [`pick_avatar`] are pure and
+//! resolver is built the same way: `parse_icon_location`,
+//! `keyfile_value`, `avatar_source_order` and `pick_avatar` are pure and
 //! unit-tested; only the thin layer that actually asks `gdbus` or the
 //! filesystem is not.
 
