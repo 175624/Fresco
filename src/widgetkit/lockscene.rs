@@ -982,9 +982,12 @@ fn cover_scale(dst: Size, src_w: u32, src_h: u32) -> f32 {
 /// live video underneath it at all (a still-frame desktop, the KDE plugin
 /// layer, an in-app preview).
 ///
-/// `blur` is `0..1`, a fraction of the output's height, matching the ratio
-/// every other blur radius in this toolkit is quoted against
-/// ([`crate::widgetkit::blur`]'s own convention). `dim` is `0..0.8`, the black
+/// `blur` is the blur *radius* (Gaussian σ) as a `0..1` fraction of the
+/// output's height, matching the ratio every other blur radius in this toolkit
+/// is quoted against ([`crate::widgetkit::blur`]'s own convention). It is not
+/// the user's blur setting: that is a slider position, and
+/// [`crate::lockscreen::blur_radius_for`] (via `ResolvedLock::blur`) is the one
+/// place it becomes a radius. `dim` is `0..0.8`, the black
 /// veil's alpha — never `1.0`, because a fully opaque veil is a black screen
 /// with widgets on it, not a dimmed wallpaper.
 ///
