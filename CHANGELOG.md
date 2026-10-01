@@ -18,6 +18,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`fresco doctor` now reports your GNOME Shell version and whether an Xorg
   GNOME/Ubuntu session is installed** on GNOME Wayland, and gives advice
   that fits what your system actually has.
+- **The deepin lock screen now shows a still frame of your wallpaper**
+  (issue #37). It used to keep deepin's default picture. Fresco renders a
+  still of the current wallpaper and sets it as the lock screen's
+  background, so deepin's own blur applies to it. Your original lock screen
+  picture is saved first and put back when Fresco stops, quits or restarts
+  after a crash, unless you picked a different picture yourself in the
+  meantime.
+- **The Lock Screen page now says what actually reaches the lock screen on
+  your desktop** (issue #37): live video and widgets, a still frame only, or
+  nothing yet. The same summary sits on the app menu's "Lock Screen…" row,
+  and turning the switch on where nothing can be shown tells you so instead
+  of looking as if it worked.
 
 ### Changed
 - **Hover previews play a small stand-in clip instead of the original
@@ -45,6 +57,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   #33). Icons were cut out with a rough one-bit mask, which dropped dark
   detail and left dark fringes; the mask now keeps enclosed dark areas of an
   icon and trims the fringe around it.
+- **The lock screen's Blur slider now uses a curve so its low range is
+  usable** (issue #37). It used to be linear, so only the first quarter of
+  the slider was usable and the rest was an unrecognisable smear; now the low
+  range gets most of the travel, and 100% is the old 30%. Settings you
+  already saved are converted once and keep their current look.
 
 ### Fixed
 - **On COSMIC, an external monitor no longer shows a still frame while the
@@ -83,6 +100,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decoded the full-size video, making a new full-size picture for every
   frame, which used up GPU memory under GTK's Vulkan renderer. The small
   stand-in clips above fix this.
+- **The Avatar widget on the lock screen now shows your real account
+  picture** (issue #37). On deepin it showed a grey disc with a single
+  letter, because Fresco asked the wrong accounts service for the picture.
+  It now asks deepin's own accounts service first, then the standard one,
+  and picks up a new picture when you change it. If you have no picture, it
+  shows your initials.
+- **The lock screen preview is no longer black for large wallpapers and
+  always has a background** (issue #37). A wallpaper wider than 4096 px, such
+  as a photo or a 5K video frame, was dropped, leaving only the widgets on a
+  black window. The preview now shrinks it to fit, and when the wallpaper
+  can't be read it falls back to the Library thumbnail and then to a plain
+  gradient. If the preview image still can't be loaded, you get a message
+  instead of an empty window.
 
 ## [1.1.46] — 2026-09-30
 

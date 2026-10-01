@@ -23,17 +23,31 @@
 //! draw — the two are never two independent implementations of "what does
 //! this config look like".
 //!
+//! # Always a background
+//!
+//! [`background`] decides where the picture behind the widgets comes from and
+//! guarantees there is one: the wallpaper's own still (an image decoded
+//! in-process, a video's poster frame extracted on demand), else the Library's
+//! cached thumbnail, else a generated gradient — logging *why* whenever it is
+//! not the first choice. Whatever it finds is shrunk to what the canvas can
+//! draw (a source past 4096 px on a side used to be silently dropped, leaving
+//! a transparent PNG that a GTK window shows as black — issue #37), and the
+//! finished PNG is flattened to fully opaque.
+//!
 //! # Caching and throttling
 //!
-//! The wallpaper decode is the expensive part (a video/slideshow wallpaper's
-//! still frame costs an `ffmpeg`/`ffmpegthumbnailer` spawn via
-//! `daemon::overview::render_still`) and is cached across calls, re-decoded
-//! only when the [`crate::config::Wallpaper`] itself changes — not on every
-//! render, which a GUI slider (`dim`, `blur`, a preset switch) can trigger
-//! several times a second. [`THROTTLE`] additionally caps the *whole* render
-//! (background reuse included) to ≤4/s at an unchanged size: a burst of
-//! requests while a slider is being dragged reuses the file already on disk
-//! rather than re-rasterising for each one.
+//! The wallpaper decode is the expensive part (a video wallpaper's still frame
+//! costs an `ffmpegthumbnailer`/`ffmpeg` spawn) and is cached across calls,
+//! re-decoded only when the [`crate::config::Wallpaper`] itself changes — not
+//! on every render, which a GUI slider (`dim`, `blur`, a preset switch) can
+//! trigger several times a second. A *degraded* result (thumbnail or gradient)
+//! is retried after [`background::DEGRADED_RETRY`] so a transient failure heals.
+//! [`THROTTLE`] additionally caps the *whole* render (background reuse
+//! included) to ≤4/s at an unchanged size: a burst of requests while a slider
+//! is being dragged reuses the file already on disk rather than re-rasterising
+//! for each one.
+
+mod background;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,12 +55,13 @@ use std::time::{Duration, Instant};
 
 use image::RgbaImage;
 
-use crate::config::{Kind, Wallpaper};
+use crate::config::Wallpaper;
 use crate::lockscreen::LockWidget;
 use crate::userinfo::{self, UserInfo};
 use crate::widgetkit::lockscene::LockSceneSpec;
 use crate::widgetkit::{FontStack, Rect, Size, Theme};
 
+use self::background::{BgOrigin, Resolved};
 use super::super::widgets::Snapshot;
 use super::avatar::AvatarCache;
 use super::engine::{self, ReservedZoneKind};
@@ -112,10 +127,28 @@ pub struct PreviewRenderer {
     /// which resolves the avatar afresh each time the screen locks, this lives
     /// as long as the daemon.
     avatar: AvatarCache,
-    cached_wallpaper: Option<Wallpaper>,
-    background: Option<Arc<RgbaImage>>,
+    /// The Library directory thumbnails are looked up in — the real per-user
+    /// one in production, a temp directory in tests (so a test can never read
+    /// the developer's own Library).
+    library_dir: Option<PathBuf>,
+    /// The decoded background and what it was decoded for; see
+    /// [`PreviewRenderer::ensure_background`].
+    background: Option<CachedBackground>,
+    /// `background`, fitted to the canvas for one requested size — recomputed
+    /// only when the size or the background changes.
+    fitted: Option<((u32, u32), Arc<RgbaImage>)>,
     last_render: Option<Instant>,
     last_size: Option<(u32, u32)>,
+}
+
+/// A resolved background plus the wallpaper it belongs to.
+struct CachedBackground {
+    wallpaper: Wallpaper,
+    image: Arc<RgbaImage>,
+    origin: BgOrigin,
+    /// When it was resolved: a degraded one is retried
+    /// [`background::DEGRADED_RETRY`] later.
+    at: Instant,
 }
 
 impl PreviewRenderer {
@@ -125,8 +158,9 @@ impl PreviewRenderer {
             fonts: FontStack::system(),
             user: userinfo::current_identity(),
             avatar: AvatarCache::new(),
-            cached_wallpaper: None,
+            library_dir: background::default_library_dir(),
             background: None,
+            fitted: None,
             last_render: None,
             last_size: None,
         }
@@ -144,6 +178,14 @@ impl PreviewRenderer {
         self.last_size = None; // a fresh path has never been rendered to.
     }
 
+    /// Point thumbnail lookups at `dir` instead of the real Library. Test-only.
+    #[cfg(test)]
+    fn set_library_dir(&mut self, dir: PathBuf) {
+        self.library_dir = Some(dir);
+        self.background = None;
+        self.fitted = None;
+    }
+
     /// Render `resolved` (already `lockscreen::resolve`d, so the GUI can
     /// preview a preset before saving it) at `width`x`height` for `host`, and
     /// write it atomically to [`preview_path`]. `np` is the desktop widget
@@ -152,8 +194,11 @@ impl PreviewRenderer {
     ///
     /// Returns the path on success (whether freshly rendered or reused from
     /// the throttle window) and a human-readable message on failure — there
-    /// is nothing to lock or unlock here, so every error is one of "couldn't
-    /// decode/write an image", never a permissions or authentication failure.
+    /// is nothing to lock or unlock here, so every error is one of "bad size"
+    /// or "couldn't write the PNG", never a permissions or authentication
+    /// failure. A wallpaper that cannot be read is *not* an error: the preview
+    /// falls back to the Library thumbnail or a gradient (see the module docs'
+    /// "Always a background") and logs why.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -204,11 +249,10 @@ impl PreviewRenderer {
             }
         }
 
-        self.ensure_background(wallpaper)?;
-        let background = self
-            .background
-            .clone()
-            .ok_or_else(|| "no wallpaper available to preview".to_string())?;
+        // Never fails: a missing or unreadable wallpaper degrades to the
+        // library thumbnail or a gradient (logged), not to an error toast.
+        self.ensure_background(wallpaper, now);
+        let background = self.fitted_background(width, height);
 
         let slots = engine::slots_for(resolved);
         let wants_avatar = resolved.widgets.contains(&LockWidget::Avatar);
@@ -256,6 +300,10 @@ impl PreviewRenderer {
             resolved.dim,
         );
         let mut rgba = engine::bgra_to_rgba_image(&bgra);
+        // The window behind a transparent pixel is whatever the toolkit paints
+        // there — black. Whatever went wrong upstream, the frame leaves here
+        // fully opaque.
+        background::flatten_opaque(&mut rgba, background::BACKDROP);
         if let Some(&placeholder) = spec.reserved.first() {
             draw_placeholder(&mut rgba, placeholder);
         }
@@ -266,29 +314,96 @@ impl PreviewRenderer {
         Ok(path)
     }
 
-    /// Decode (or reuse) the wallpaper's still frame. Re-decodes only when
-    /// `wallpaper` itself differs from what was cached last time — see the
-    /// module docs' "Caching and throttling".
-    fn ensure_background(&mut self, wallpaper: &Wallpaper) -> Result<(), String> {
-        if self.cached_wallpaper.as_ref() == Some(wallpaper) && self.background.is_some() {
-            return Ok(());
+    /// Resolve (or reuse) the wallpaper's background picture. Re-resolves only
+    /// when `wallpaper` itself differs from what was cached, or — for a
+    /// degraded result — once [`background::DEGRADED_RETRY`] has passed. See
+    /// the module docs' "Always a background" and "Caching and throttling".
+    fn ensure_background(&mut self, wallpaper: &Wallpaper, now: Instant) {
+        let previous = self
+            .background
+            .as_ref()
+            .filter(|c| &c.wallpaper == wallpaper);
+        if let Some(c) = previous {
+            let fresh = c.origin == BgOrigin::Wallpaper
+                || now.saturating_duration_since(c.at) < background::DEGRADED_RETRY;
+            if fresh {
+                return;
+            }
         }
-        let source = match wallpaper.kind {
-            // An image needs no still-frame extraction at all.
-            Kind::Image => wallpaper.effective_path().map(|p| p.to_path_buf()),
-            // Video and slideshow both go through the same still-frame path
-            // the GNOME overview sync already uses — one `ffmpeg`/
-            // `ffmpegthumbnailer` implementation, not a second one here.
-            _ => super::super::overview::render_still(wallpaper),
+        let previous_origin = previous.map(|c| c.origin);
+
+        let slideshow_images = wallpaper
+            .slideshow
+            .as_ref()
+            .map(super::super::slideshow_images)
+            .unwrap_or_default();
+        let thumbnail = self
+            .library_dir
+            .as_deref()
+            .and_then(|dir| background::library_thumbnail_in(dir, wallpaper));
+        let plan = background::plan_sources(wallpaper, &slideshow_images, thumbnail);
+        let deadline = Instant::now() + background::BUDGET;
+        let rotation = wallpaper.rotation;
+        let frames =
+            |path: &std::path::Path| background::extract_frame_with_tools(path, rotation, deadline);
+        let Resolved {
+            image,
+            origin,
+            failures,
+        } = background::resolve(&plan, deadline, &frames);
+
+        // Say why whenever the first choice did not work — once per change,
+        // not once per retry tick.
+        let note = failures.join("; ");
+        match origin {
+            BgOrigin::Wallpaper if failures.is_empty() => {
+                if previous_origin.is_some_and(|o| o != BgOrigin::Wallpaper) {
+                    log::info!("lock preview: the wallpaper is readable again");
+                }
+            }
+            BgOrigin::Wallpaper => {
+                log::warn!("lock preview: used a later wallpaper source after: {note}")
+            }
+            BgOrigin::Thumbnail if previous_origin == Some(BgOrigin::Thumbnail) => {
+                log::debug!("lock preview: still on the library thumbnail: {note}");
+            }
+            BgOrigin::Thumbnail => log::warn!(
+                "lock preview: wallpaper unreadable ({note}); showing the library \
+                 thumbnail instead (low resolution)"
+            ),
+            BgOrigin::Placeholder if previous_origin == Some(BgOrigin::Placeholder) => {
+                log::debug!("lock preview: still on the placeholder: {note}");
+            }
+            BgOrigin::Placeholder => log::warn!(
+                "lock preview: no usable wallpaper picture ({note}); showing a placeholder"
+            ),
+        }
+
+        let image = background::shrink_to_longest(image, background::MAX_CACHED_SIDE);
+        self.fitted = None;
+        self.background = Some(CachedBackground {
+            wallpaper: wallpaper.clone(),
+            image: Arc::new(image),
+            origin,
+            at: now,
+        });
+    }
+
+    /// The cached background fitted to a `width`x`height` render. Always
+    /// present once [`PreviewRenderer::ensure_background`] has run.
+    fn fitted_background(&mut self, width: u32, height: u32) -> Arc<RgbaImage> {
+        if let Some((size, img)) = &self.fitted {
+            if *size == (width, height) {
+                return img.clone();
+            }
+        }
+        let source = match &self.background {
+            Some(c) => c.image.clone(),
+            None => Arc::new(background::fallback_gradient()),
         };
-        let Some(source) = source else {
-            return Err("no wallpaper configured to preview".to_string());
-        };
-        let img = image::open(&source)
-            .map_err(|e| format!("failed to decode {}: {e}", source.display()))?;
-        self.background = Some(Arc::new(img.into_rgba8()));
-        self.cached_wallpaper = Some(wallpaper.clone());
-        Ok(())
+        let fitted = background::fit_background(&source, width, height);
+        self.fitted = Some(((width, height), fitted.clone()));
+        fitted
     }
 }
 
@@ -360,7 +475,7 @@ fn alpha_over(src: [u8; 4], dst: [u8; 4]) -> image::Rgba<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LockScreen, LockWidgets};
+    use crate::config::{Kind, LockScreen, LockWidgets};
     use crate::lockscreen::resolve;
     use crate::widgetkit::theme::Mode;
 
@@ -402,7 +517,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut r = PreviewRenderer::new();
         r.set_path(path.clone());
+        // Never read the developer's real Library: an empty, absent directory.
+        r.set_library_dir(std::env::temp_dir().join(format!(
+            "fresco-lock-preview-NOLIB-{}-{tag}",
+            std::process::id()
+        )));
         (r, path)
+    }
+
+    /// Straight-RGBA pixel of a rendered PNG.
+    fn pixel(path: &std::path::Path, x: u32, y: u32) -> [u8; 4] {
+        image::open(path).unwrap().to_rgba8().get_pixel(x, y).0
+    }
+
+    /// Every pixel of the render is fully opaque.
+    fn assert_opaque(path: &std::path::Path) {
+        let img = image::open(path).unwrap().to_rgba8();
+        let min_alpha = img.pixels().map(|p| p.0[3]).min().unwrap();
+        assert_eq!(min_alpha, 255, "the preview PNG must be fully opaque");
     }
 
     // -- Never locks anything: the assertion, not just the claim ------------
@@ -507,8 +639,57 @@ mod tests {
         let _ = std::fs::remove_file(&out_path);
     }
 
+    // -- issue #37: the preview must always have a visible background -------
+
+    /// A solid-colour PNG of an arbitrary size, e.g. one the canvas refuses.
+    fn big_fixture(tag: &str, w: u32, h: u32, rgb: [u8; 3]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "fresco-lock-preview-big-{}-{tag}.png",
+            std::process::id()
+        ));
+        RgbaImage::from_pixel(w, h, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+            .save(&path)
+            .unwrap();
+        path
+    }
+
     #[test]
-    fn missing_wallpaper_is_a_clean_error_not_a_panic() {
+    fn an_oversize_wallpaper_is_shown_not_dropped_to_black() {
+        // Regression for #37. The canvas silently refuses a cover image past
+        // 4096 px on a side, so a 5K frame / 6000 px photograph rendered with
+        // NO background: just the 20 % black dim veil on a transparent PNG,
+        // which a GTK window shows as black. (Wide-and-short keeps the
+        // fixture's memory tiny while still exceeding the cap.)
+        let img_path = big_fixture("oversize", 4200, 120, [200, 90, 40]);
+        let wallpaper = image_wallpaper(img_path.clone());
+        let resolved = resolve(&LockScreen::default());
+        let (mut renderer, out_path) = test_renderer("oversize");
+
+        let out = renderer
+            .render(
+                HostKind::Cosmic { live: true },
+                &wallpaper,
+                &resolved,
+                None,
+                theme(),
+                320,
+                200,
+            )
+            .unwrap();
+        assert_opaque(&out);
+        let corner = pixel(&out, 4, 4);
+        // 200,90,40 under a 0.2 black veil is ~160,72,32 — nowhere near black.
+        assert!(
+            corner[0] > 120 && corner[0] > corner[2],
+            "background must be the wallpaper's colour, got {corner:?}"
+        );
+
+        let _ = std::fs::remove_file(&img_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn a_missing_wallpaper_renders_a_visible_placeholder_instead_of_failing() {
         let wallpaper = Wallpaper {
             kind: Kind::Image,
             path: Some(PathBuf::from("/does/not/exist/fresco-preview-test.png")),
@@ -516,7 +697,7 @@ mod tests {
         };
         let resolved = resolve(&LockScreen::default());
         let (mut renderer, out_path) = test_renderer("missing-wallpaper");
-        let err = renderer
+        let out = renderer
             .render(
                 HostKind::Gnome,
                 &wallpaper,
@@ -526,8 +707,157 @@ mod tests {
                 320,
                 200,
             )
-            .unwrap_err();
-        assert!(!err.is_empty());
+            .expect("an unreadable wallpaper must not fail the preview");
+        assert_opaque(&out);
+        let corner = pixel(&out, 4, 4);
+        let luma = u32::from(corner[0]) + u32::from(corner[1]) + u32::from(corner[2]);
+        assert!(luma > 90, "placeholder must not be black, got {corner:?}");
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn no_wallpaper_configured_at_all_still_renders() {
+        for kind in [Kind::Video, Kind::Image, Kind::Playlist, Kind::Slideshow] {
+            let wallpaper = Wallpaper {
+                kind,
+                ..Default::default()
+            };
+            let resolved = resolve(&LockScreen::default());
+            let (mut renderer, out_path) = test_renderer(&format!("empty-{kind:?}"));
+            let out = renderer
+                .render(HostKind::Kde, &wallpaper, &resolved, None, theme(), 160, 90)
+                .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            assert_opaque(&out);
+            let _ = std::fs::remove_file(&out_path);
+        }
+    }
+
+    #[test]
+    fn a_dead_video_falls_back_to_its_library_thumbnail() {
+        // The wallpaper file is gone (unmounted drive), but the Library still
+        // has a thumbnail of it: show that, not a black screen.
+        let lib = std::env::temp_dir().join(format!(
+            "fresco-lock-preview-LIB-{}-thumbfallback",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&lib);
+        std::fs::create_dir_all(lib.join("thumbs")).unwrap();
+        RgbaImage::from_pixel(64, 36, image::Rgba([30, 150, 220, 255]))
+            .save(lib.join("thumbs").join("vid1.png"))
+            .unwrap();
+        std::fs::write(
+            lib.join("entries.json"),
+            r#"[{"id":"vid1","name":"Gone","kind":"video","path":"/gone/video.mp4"}]"#,
+        )
+        .unwrap();
+
+        let wallpaper = Wallpaper {
+            kind: Kind::Video,
+            path: Some(PathBuf::from("/gone/video.mp4")),
+            ..Default::default()
+        };
+        let resolved = resolve(&LockScreen::default());
+        let (mut renderer, out_path) = test_renderer("thumbfallback");
+        renderer.set_library_dir(lib.clone());
+        let out = renderer
+            .render(
+                HostKind::Xfce,
+                &wallpaper,
+                &resolved,
+                None,
+                theme(),
+                320,
+                180,
+            )
+            .unwrap();
+        assert_opaque(&out);
+        let corner = pixel(&out, 4, 4);
+        assert!(
+            corner[2] > corner[0] && corner[2] > 100,
+            "expected the thumbnail's blue, got {corner:?}"
+        );
+        let _ = std::fs::remove_dir_all(&lib);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn a_transparent_wallpaper_never_leaves_a_see_through_frame() {
+        // Even a source that is itself transparent must come out opaque.
+        let path = std::env::temp_dir().join(format!(
+            "fresco-lock-preview-clear-{}.png",
+            std::process::id()
+        ));
+        RgbaImage::from_pixel(32, 32, image::Rgba([255, 255, 255, 0]))
+            .save(&path)
+            .unwrap();
+        let resolved = resolve(&LockScreen::default());
+        let (mut renderer, out_path) = test_renderer("clear");
+        let out = renderer
+            .render(
+                HostKind::Kde,
+                &image_wallpaper(path.clone()),
+                &resolved,
+                None,
+                theme(),
+                160,
+                90,
+            )
+            .unwrap();
+        assert_opaque(&out);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn a_degraded_background_is_retried_only_after_the_retry_window() {
+        let img_path = std::env::temp_dir().join(format!(
+            "fresco-lock-preview-late-{}.png",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&img_path);
+        let wallpaper = image_wallpaper(img_path.clone());
+        let resolved = resolve(&LockScreen::default());
+        let (mut renderer, out_path) = test_renderer("late");
+        let t0 = Instant::now();
+        let render = |r: &mut PreviewRenderer, w: u32, at: Instant| {
+            r.render_at(
+                HostKind::Kde,
+                &wallpaper,
+                &resolved,
+                None,
+                theme(),
+                w,
+                90,
+                at,
+            )
+            .unwrap()
+        };
+
+        // 1. The file is missing: a placeholder, not a black frame.
+        let out = render(&mut renderer, 160, t0);
+        let placeholder = pixel(&out, 4, 4);
+
+        // 2. The file appears. Inside the retry window nothing is re-read,
+        //    even though the size (so the throttle) changed...
+        RgbaImage::from_pixel(32, 32, image::Rgba([220, 40, 40, 255]))
+            .save(&img_path)
+            .unwrap();
+        let out = render(&mut renderer, 170, t0 + Duration::from_secs(5));
+        assert_eq!(pixel(&out, 4, 4), placeholder, "no retry inside the window");
+
+        // 3. ...and past it the real wallpaper takes over.
+        let out = render(
+            &mut renderer,
+            180,
+            t0 + background::DEGRADED_RETRY + Duration::from_secs(1),
+        );
+        let now_px = pixel(&out, 4, 4);
+        assert!(
+            now_px[0] > 120 && now_px[0] > now_px[2],
+            "expected the wallpaper's red, got {now_px:?}"
+        );
+
+        let _ = std::fs::remove_file(&img_path);
         let _ = std::fs::remove_file(&out_path);
     }
 
