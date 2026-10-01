@@ -107,7 +107,7 @@ export const zhCn: Dictionary = {
     labelInstall: "安装",
     what: "Fresco 是一款面向 Linux 的免费开源动态壁纸应用：可以把视频、GIF、图片、幻灯片和播放列表设为动态桌面背景，并使用 GPU 硬件解码。它既是免费的 Wallpaper Engine 替代方案，也是 Wayland 上 mpvpaper 的图形界面。",
     platforms:
-      "任何 X11 桌面（Ubuntu、Pop!_OS、Linux Mint、Debian、Kali Linux），以及支持 layer-shell 的 Wayland 合成器：COSMIC、Hyprland、Sway、KDE Plasma 6。GNOME Wayland 下会回退为静态画面。",
+      "任何 X11 桌面（Ubuntu、Pop!_OS、Linux Mint、Debian、Kali Linux），以及支持 layer-shell 的 Wayland 合成器：COSMIC、Hyprland、Sway、KDE Plasma 6。在 Fresco 的 GNOME 扩展推出之前，GNOME Wayland 下只会显示静止画面。",
     widgets:
       "四个直接绘制在壁纸上而非窗口里的组件：时间同步歌词、六种主题的时钟、音频可视化，以及旋转唱片上的专辑封面。它们不会浮在窗口上方，也不会拦截点击。四个默认都关闭。GNOME Wayland 没有动态壁纸绘制面，因此无法使用。",
     licenseLead: "GPL-3.0，永久免费。",
@@ -126,7 +126,7 @@ export const zhCn: Dictionary = {
     thWhatYouGet: "具体内容",
     thStatus: "状态",
     footnote:
-      "GNOME Wayland：回退为静态画面（Mutter 未提供动态绘制面），桌面组件同样需要这个绘制面，因此在该环境下不可用。上表其余功能均可正常使用。",
+      "GNOME Wayland：只显示静止画面。Mutter 未提供动态绘制面，而 GNOME 50、Ubuntu 25.10+ 和 Fedora 43+ 也不再提供可退回的 Xorg 会话。桌面组件同样需要这个绘制面，因此在该环境下不可用，动态视频则要等待计划中的 Fresco GNOME 扩展。上表其余功能均可正常使用。",
     tally: (shipping: number, total: number, soon: number) =>
       `${total} 项中已发布 ${shipping} 项 · ${soon} 项预览中 · 0 项已废弃`,
     rows: {
@@ -141,7 +141,7 @@ export const zhCn: Dictionary = {
         tag: "会话",
         title: "X11 与 Wayland",
         description:
-          "在任意 X11 桌面上使用桌面窗口后端，并为 COSMIC、Hyprland、Sway 和 KDE Plasma 6 提供 layer-shell 后端。GNOME Wayland 会回退为静态画面。",
+          "在任意 X11 桌面上使用桌面窗口后端，并为 COSMIC、Hyprland、Sway 和 KDE Plasma 6 提供 layer-shell 后端。GNOME Wayland 在计划中的 GNOME 扩展推出之前只显示静止画面。",
         status: "X11 · layer-shell",
       },
       catalog: {
@@ -343,7 +343,7 @@ export const zhCn: Dictionary = {
 
   supported: {
     title: "Fresco 能在哪里运行。",
-    lead: "支持任意 X11 桌面（包括 deepin 25 的 DDE），以及支持 layer-shell 的 Wayland 合成器（COSMIC、Hyprland、Sway 和 KDE Plasma 6），覆盖主流的 Debian、Ubuntu 与 Kali Linux 发行版。GNOME Wayland 下会回退为静态画面。",
+    lead: "支持任意 X11 桌面（包括 deepin 25 的 DDE），以及支持 layer-shell 的 Wayland 合成器（COSMIC、Hyprland、Sway 和 KDE Plasma 6），覆盖主流的 Debian、Ubuntu 与 Kali Linux 发行版。GNOME Wayland 目前只显示静止画面。",
     sessionsTitle: "会话与合成器",
     distrosTitle: (n: number) => `已测试发行版 · ${n}`,
     formatsTitle: (n: number) => `支持格式 · ${n}`,
@@ -365,7 +365,7 @@ export const zhCn: Dictionary = {
       },
       gnome: {
         label: "GNOME on Wayland",
-        detail: "回退为静态画面（Mutter 没有动态绘制面）",
+        detail: "仅显示静止画面（Mutter 没有动态绘制面）",
       },
     },
     fieldReport: "实地反馈 · deepin 25",
@@ -426,7 +426,7 @@ export const zhCn: Dictionary = {
       },
       {
         q: "Fresco 支持 GNOME 吗？",
-        a: "在 GNOME 的 X11 会话下完全支持动态壁纸。在 GNOME 的 Wayland 会话下，Mutter 不提供动态壁纸绘制面，因此 Fresco 会显示所选壁纸的一帧静态画面，而不是假装在播放动画。",
+        a: "在 GNOME 的 X11 会话下完全支持动态壁纸。但 GNOME 49 已停用 X11 会话，GNOME 50 则将其移除，因此 Ubuntu 25.10 及更新版本（包括 26.04 LTS）和 Fedora 43 及更新版本都没有该会话；Ubuntu 22.04 和 24.04 仍提供“Ubuntu on Xorg”。在 GNOME 的 Wayland 会话下，Mutter 不提供动态壁纸绘制面，因此 Fresco 会显示所选壁纸的一帧静止画面并明确告知，而不是假装在播放动画。要在 GNOME Wayland 上播放动态视频，需要计划中的 Fresco GNOME 扩展。",
       },
       {
         q: "视频壁纸可以播放声音吗？",

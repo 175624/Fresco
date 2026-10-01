@@ -345,11 +345,15 @@ fn build_ui(app: &adw::Application) {
     stack.add_named(&editor_view, Some("editor"));
 
     toast.set_child(Some(&stack));
-    // Only a still-frame session needs to know whether an Xorg session exists to
-    // log into; skip the xsessions scan everywhere else.
-    let gnome_x11_session = capability == crate::capability::Capability::WaylandGnomeStatic
-        && crate::capability::gnome_x11_session_available();
-    match capability_banner_text(capability, gnome_x11_session) {
+    // The still-frame backend is not only GNOME's: an older Cinnamon, or any
+    // compositor without layer-shell, lands in it too, and GNOME's advice (an
+    // Xorg session, a Fresco GNOME extension) would be wrong for them. Only a
+    // real GNOME session needs to know whether an Xorg session exists to log
+    // into; skip the xsessions scan everywhere else.
+    let is_gnome = capability == crate::capability::Capability::WaylandGnomeStatic
+        && crate::capability::is_gnome_session();
+    let gnome_x11_session = is_gnome && crate::capability::gnome_x11_session_available();
+    match capability_banner_text(capability, is_gnome, gnome_x11_session) {
         Some(text) => {
             // Stack the capability banner above the toast-wrapped content.
             let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -513,17 +517,26 @@ fn build_ui(app: &adw::Application) {
 
 /// Informational banner text for sessions where live playback is limited.
 /// `None` for X11 and layer-shell compositors (full live support — no banner
-/// needed). On GNOME Wayland the advice depends on `gnome_x11_session`
-/// (whether an Xorg GNOME/Ubuntu session is installed to log into): pointing
-/// at an "Xorg session" that Ubuntu 25.10+ / 26.04 LTS, Fedora 43+ and GNOME 50
-/// no longer ship would send the user hunting for something that does not exist.
+/// needed). The still-frame backend serves any Wayland compositor without
+/// layer-shell, and what to say depends on which one it is:
+///
+/// * GNOME (`is_gnome`): the advice depends on `gnome_x11_session` (whether an
+///   Xorg GNOME/Ubuntu session is installed to log into). Pointing at an "Xorg
+///   session" that Ubuntu 25.10+ / 26.04 LTS, Fedora 43+ and GNOME 50 no longer
+///   ship would send the user hunting for something that does not exist, and a
+///   Fresco GNOME extension is only relevant on GNOME.
+/// * Anything else (an older Cinnamon, another compositor): just say why.
 fn capability_banner_text(
     cap: crate::capability::Capability,
+    is_gnome: bool,
     gnome_x11_session: bool,
 ) -> Option<&'static str> {
     use crate::capability::Capability;
     match cap {
         Capability::X11 | Capability::WaylandLayerShell => None,
+        Capability::WaylandGnomeStatic if !is_gnome => Some(
+            t!("This compositor has no layer-shell support, so Fresco shows a still frame."),
+        ),
         Capability::WaylandGnomeStatic if gnome_x11_session => Some(
             t!("GNOME on Wayland can only show a still frame. For a live wallpaper, log out and choose the GNOME/Ubuntu on Xorg session."),
         ),
@@ -1582,7 +1595,11 @@ fn build_behavior_page(state: &Rc<RefCell<AppState>>) -> gtk4::Box {
                         st.config.clone()
                     };
                     redraw_library(&state2);
-                    daemon_ctl::apply_async(&config, |_| {});
+                    daemon_ctl::apply_async(&config, |outcome| {
+                        if !outcome.superseded {
+                            status::poll_soon();
+                        }
+                    });
                 }
             },
         ));
@@ -4958,6 +4975,9 @@ pub(crate) fn apply_entry_by_idx(state: Rc<RefCell<AppState>>, idx: usize) {
         let kind = wallpaper.kind;
         s.config.wallpaper = wallpaper;
         s.config.enabled = true;
+        // The status cache still names the wallpaper this replaces (it is only
+        // refreshed every few seconds): see `status::forget_playing_path`.
+        status::forget_playing_path();
         save_entries(&s.entries).ok();
         (name, kind, s.config.clone())
     };
@@ -4968,6 +4988,7 @@ pub(crate) fn apply_entry_by_idx(state: Rc<RefCell<AppState>>, idx: usize) {
         if outcome.superseded {
             return;
         }
+        status::poll_soon();
         match outcome.result {
             Ok(()) => {
                 crate::telemetry::event(
@@ -5337,6 +5358,9 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
                 if let Some(e) = s.entries.get(idx) {
                     s.config.wallpaper = library::wallpaper_from_editor(e, &values);
                     s.config.enabled = true;
+                    // The status cache still names the wallpaper this
+                    // replaces: see `status::forget_playing_path`.
+                    status::forget_playing_path();
                 }
                 // Saved as soon as it's committed, whether or not the apply
                 // below succeeds — the entry stays in the library even if
@@ -5358,6 +5382,7 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
                 if outcome.superseded {
                     return;
                 }
+                status::poll_soon();
                 match outcome.result {
                     Ok(()) => {
                         log::info!("Wallpaper set; close this window, it keeps playing");
@@ -5842,6 +5867,7 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
                 let service_row = service_row.clone();
                 daemon_ctl::apply_async(&config, move |outcome| {
                     if !outcome.superseded {
+                        status::poll_soon();
                         if let Err(e) = outcome.result {
                             log::error!("failed to apply the day/night schedule: {e}");
                             show_toast(
@@ -5929,6 +5955,7 @@ fn start_schedule_service(state: &Rc<RefCell<AppState>>, done: impl FnOnce() + '
     let state = state.clone();
     daemon_ctl::apply_async(&config, move |outcome| {
         if !outcome.superseded {
+            status::poll_soon();
             match outcome.result {
                 Ok(()) => show_toast(&state, t!("Fresco’s background service started")),
                 Err(e) => {
@@ -6012,6 +6039,9 @@ fn sync_wallpaper_to_schedule(cfg: &mut Config) {
     let off = now.offset().fix().local_minus_utc() / 60;
     if let Some(w) = crate::schedule::desired(sch, now.naive_local(), off) {
         cfg.wallpaper = w.clone();
+        // Every caller applies this right away, which replaces what the status
+        // cache names: see `status::forget_playing_path`.
+        status::forget_playing_path();
     }
 }
 
@@ -8429,13 +8459,20 @@ pub(crate) fn show_toast(state: &Rc<RefCell<AppState>>, msg: &str) {
     state.borrow().toast.add_toast(toast);
 }
 
-/// A toast that stays until the user dismisses it: for a message too long to
-/// read in four seconds and too consequential to miss. The button carries no
+/// How long a [`show_sticky_toast`] stays up if the user does not dismiss it.
+const STICKY_TOAST_SECS: u32 = 20;
+
+/// A toast that outlasts the usual four seconds: for a message too long to
+/// read that quickly and too consequential to miss. The button carries no
 /// action of its own; pressing it just closes the toast.
+///
+/// The timeout is finite on purpose. `AdwToastOverlay` shows one toast at a
+/// time and queues the rest, so a toast with no timeout would hold every later
+/// one (a "wallpaper set" confirmation, an error) back until it was dismissed.
 pub(crate) fn show_sticky_toast(state: &Rc<RefCell<AppState>>, msg: &str) {
     let toast = adw::Toast::new(msg);
     toast.set_button_label(Some(t!("Dismiss")));
-    toast.set_timeout(0);
+    toast.set_timeout(STICKY_TOAST_SECS);
     state.borrow().toast.add_toast(toast);
 }
 
@@ -10465,12 +10502,18 @@ mod tests {
     fn capability_banner_variant_follows_xorg_session_availability() {
         use crate::capability::Capability;
         for cap in [Capability::X11, Capability::WaylandLayerShell] {
-            for x11 in [false, true] {
-                assert_eq!(capability_banner_text(cap, x11), None, "{cap:?} {x11}");
+            for gnome in [false, true] {
+                for x11 in [false, true] {
+                    assert_eq!(
+                        capability_banner_text(cap, gnome, x11),
+                        None,
+                        "{cap:?} {gnome} {x11}"
+                    );
+                }
             }
         }
-        let with_xorg = capability_banner_text(Capability::WaylandGnomeStatic, true).unwrap();
-        let without = capability_banner_text(Capability::WaylandGnomeStatic, false).unwrap();
+        let with_xorg = capability_banner_text(Capability::WaylandGnomeStatic, true, true).unwrap();
+        let without = capability_banner_text(Capability::WaylandGnomeStatic, true, false).unwrap();
         assert_ne!(with_xorg, without);
         assert!(with_xorg.contains("Xorg session"), "{with_xorg}");
         assert!(with_xorg.contains("still frame"), "{with_xorg}");
@@ -10480,6 +10523,22 @@ mod tests {
             "{without}"
         );
         assert!(without.contains("extension is planned"), "{without}");
+    }
+
+    /// An older Cinnamon, or any compositor without layer-shell, shares the
+    /// still-frame backend with GNOME but must hear nothing GNOME-specific:
+    /// no Xorg session to log into, no Fresco GNOME extension.
+    #[test]
+    fn capability_banner_for_a_non_gnome_still_frame_session_is_neutral() {
+        use crate::capability::Capability;
+        for x11 in [false, true] {
+            let text = capability_banner_text(Capability::WaylandGnomeStatic, false, x11).unwrap();
+            assert!(text.contains("no layer-shell support"), "{text}");
+            assert!(text.contains("still frame"), "{text}");
+            for gnome_only in ["GNOME", "Xorg", "extension", "log out"] {
+                assert!(!text.contains(gnome_only), "{gnome_only:?} in {text}");
+            }
+        }
     }
 
     /// The rename box (#21) should never write back blank, whitespace-only,

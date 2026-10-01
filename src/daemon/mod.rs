@@ -1541,10 +1541,22 @@ impl Daemon {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned()),
             Kind::Playlist => Some(format!("Playlist ({} items)", w.paths.len())),
-            Kind::Slideshow => w
-                .slideshow
-                .as_ref()
-                .map(|s| slideshow_status_label(slideshow_images(s).len())),
+            Kind::Slideshow => w.slideshow.as_ref().map(|_| {
+                // Ask the renderer that is playing it, never the disk: the
+                // renderer resolved the folder when it was built, and a scan
+                // here would run on every status poll (every few seconds,
+                // from the main loop) and, with "Include subfolders", walk a
+                // whole tree each time. No renderer holding it means nothing
+                // could be drawn (the backend skips an output with no
+                // images), which is exactly the "no images found" label.
+                let images = self
+                    .renderers
+                    .iter()
+                    .filter(|r| std::ptr::eq(self.config.wallpaper_for(&r.window.connector), w))
+                    .find_map(|r| r.slideshow.as_ref())
+                    .map_or(0, |s| s.images.len());
+                slideshow_status_label(images)
+            }),
         }
     }
 

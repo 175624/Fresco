@@ -166,6 +166,20 @@ pub fn is_cinnamon() -> bool {
     .any(|v| is_cinnamon_name(Some(v)))
 }
 
+/// Is this a real GNOME session (the desktop name says so)? The still-frame
+/// backend is GNOME's, but any Wayland compositor without layer-shell lands in
+/// it too (an older Cinnamon, say); GNOME-specific advice (log into an Xorg
+/// session, wait for a Fresco GNOME extension) must not be shown to those.
+pub fn is_gnome_session() -> bool {
+    [
+        std::env::var("XDG_CURRENT_DESKTOP").ok(),
+        std::env::var("XDG_SESSION_DESKTOP").ok(),
+    ]
+    .iter()
+    .flatten()
+    .any(|v| is_gnome(Some(v)))
+}
+
 fn is_cinnamon_name(desktop: Option<&str>) -> bool {
     desktop
         .map(|d| d.to_ascii_lowercase().contains("cinnamon"))

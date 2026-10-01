@@ -111,7 +111,7 @@ export const ja: Dictionary = {
     labelInstall: "インストール",
     what: "Fresco は Linux 向けの無料オープンソースのライブ壁紙アプリです。動画・GIF・画像・スライドショー・プレイリストを、GPU ハードウェア デコードで動くデスクトップ背景として設定できます。無料の Wallpaper Engine 代替であり、Wayland では mpvpaper の GUI としても使えます。",
     platforms:
-      "あらゆる X11 デスクトップ（Ubuntu、Pop!_OS、Linux Mint、Debian、Kali Linux）に加えて、Wayland の layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）に対応。GNOME Wayland では静止フレームにフォールバックします。",
+      "あらゆる X11 デスクトップ（Ubuntu、Pop!_OS、Linux Mint、Debian、Kali Linux）に加えて、Wayland の layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）に対応。GNOME Wayland では、Fresco の GNOME 拡張機能が登場するまで静止フレームのみの表示になります。",
     widgets:
       "ウィンドウではなく壁紙そのものに描画される 4 つのウィジェット。時間同期の歌詞、6 テーマの時計、オーディオ ビジュアライザー、回転するレコード上のアルバム アート。ウィンドウの上に浮かぶことも、クリックを奪うこともありません。すべて既定でオフ。ライブ壁紙のサーフェスがない GNOME Wayland では利用できません。",
     licenseLead: "GPL-3.0、ずっと無料。",
@@ -130,7 +130,7 @@ export const ja: Dictionary = {
     thWhatYouGet: "内容",
     thStatus: "ステータス",
     footnote:
-      "GNOME Wayland: 静止フレームへのフォールバック（Mutter がライブ サーフェスを公開しないため）。ウィジェットも同じサーフェスを必要とするので、ここでは利用できません。上記のそれ以外はすべて動作します。",
+      "GNOME Wayland: 静止フレームのみ。Mutter がライブ サーフェスを公開せず、GNOME 50、Ubuntu 25.10 以降、Fedora 43 以降には切り替え先となる Xorg セッションもありません。ウィジェットも同じサーフェスを必要とするので、ここでは利用できません。動画のライブ再生は、計画中の Fresco 用 GNOME 拡張機能を待つことになります。上記のそれ以外はすべて動作します。",
     tally: (shipping: number, total: number, soon: number) =>
       `${total} 件中 ${shipping} 件がリリース済み · ${soon} 件がプレビュー · 廃止 0 件`,
     rows: {
@@ -145,7 +145,7 @@ export const ja: Dictionary = {
         tag: "セッション",
         title: "X11 と Wayland",
         description:
-          "あらゆる X11 デスクトップ向けのデスクトップ ウィンドウ バックエンドに加えて、COSMIC・Hyprland・Sway・KDE Plasma 6 向けの layer-shell バックエンド。GNOME Wayland は静止フレームにフォールバックします。",
+          "あらゆる X11 デスクトップ向けのデスクトップ ウィンドウ バックエンドに加えて、COSMIC・Hyprland・Sway・KDE Plasma 6 向けの layer-shell バックエンド。GNOME Wayland は、計画中の GNOME 拡張機能が登場するまで静止フレームを表示します。",
         status: "X11 · layer-shell",
       },
       catalog: {
@@ -351,7 +351,7 @@ export const ja: Dictionary = {
 
   supported: {
     title: "Fresco が動く場所。",
-    lead: "Deepin 25 の DDE を含むあらゆる X11 デスクトップと、Wayland の layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）で、主要な Debian 系・Ubuntu 系・Kali Linux ディストリビューションに対応します。GNOME Wayland では静止フレームにフォールバックします。",
+    lead: "Deepin 25 の DDE を含むあらゆる X11 デスクトップと、Wayland の layer-shell コンポジタ（COSMIC、Hyprland、Sway、KDE Plasma 6）で、主要な Debian 系・Ubuntu 系・Kali Linux ディストリビューションに対応します。GNOME Wayland では当面、静止フレームのみの表示になります。",
     sessionsTitle: "セッションとコンポジタ",
     distrosTitle: (n: number) => `検証済みディストリビューション · ${n}`,
     formatsTitle: (n: number) => `対応形式 · ${n}`,
@@ -373,7 +373,7 @@ export const ja: Dictionary = {
       },
       gnome: {
         label: "GNOME on Wayland",
-        detail: "静止フレームへのフォールバック（Mutter にライブ サーフェスがないため）",
+        detail: "静止フレームのみ（Mutter にライブ サーフェスがないため）",
       },
     },
     fieldReport: "実地レポート · deepin 25",
@@ -434,7 +434,7 @@ export const ja: Dictionary = {
       },
       {
         q: "Fresco は GNOME で動きますか？",
-        a: "GNOME の X11 セッションなら、ライブ壁紙がすべて動きます。GNOME の Wayland では Mutter がライブ壁紙のサーフェスを提供しないため、動いているふりをするのではなく、選んだ壁紙の静止フレームを表示するフォールバックになります。",
+        a: "GNOME の X11 セッションなら、ライブ壁紙がすべて動きます。ただし GNOME 49 で X11 セッションが無効化され、GNOME 50 で削除されたため、Ubuntu 25.10 以降（26.04 LTS を含む）と Fedora 43 以降には X11 セッションがありません。Ubuntu 22.04 と 24.04 では今も「Ubuntu on Xorg」を選べます。GNOME の Wayland では Mutter がライブ壁紙のサーフェスを提供しないため、動いているふりをするのではなく、選んだ壁紙の静止フレームを表示し、そのことをアプリ上でお知らせします。GNOME の Wayland でのライブ再生には、計画中の Fresco 用 GNOME 拡張機能が必要です。",
       },
       {
         q: "動画の壁紙から音は出せますか？",

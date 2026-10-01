@@ -34,7 +34,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use crate::capability::{
-    detect, gnome_shell_version, gnome_x11_session_available, is_cinnamon, Capability,
+    detect, gnome_shell_version, gnome_x11_session_available, is_gnome_session, Capability,
 };
 use crate::config::Config;
 use crate::ipc::{request, request_with_timeout, Request, Response, StatusReply};
@@ -98,10 +98,11 @@ fn doctor() -> i32 {
     let cap = detect();
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into());
     let st = daemon_status();
-    // The still-frame backend is GNOME's, bar the rare old-muffin Cinnamon
-    // that lands in it too: only a real GNOME session has a Shell to ask the
-    // version of or an Xorg GNOME/Ubuntu session to log into instead.
-    let gnome_static = matches!(cap, Capability::WaylandGnomeStatic) && !is_cinnamon();
+    // The still-frame backend is GNOME's, bar the rare old-muffin Cinnamon (or
+    // any other compositor without layer-shell) that lands in it too: only a
+    // real GNOME session has a Shell to ask the version of or an Xorg
+    // GNOME/Ubuntu session to log into instead.
+    let gnome_static = matches!(cap, Capability::WaylandGnomeStatic) && is_gnome_session();
     let x11_session = gnome_static && gnome_x11_session_available();
 
     println!("{BOLD}Fresco doctor{RESET}\n");

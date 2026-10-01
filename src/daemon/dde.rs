@@ -518,6 +518,14 @@ pub fn apply<C: Connection>(
     let strategy = select_strategy(pref, depth.is_some());
     log::info!("DDE: preference {pref:?}, chosen strategy {strategy:?}");
 
+    if strategy != Strategy::Mirror {
+        // A mirror run that crashed (or was killed) leaves DDE's desktop window
+        // at opacity 0. If this run uses transparency or restack instead, nothing
+        // else would ever un-hide it, and the desktop would stay invisible.
+        // Idempotent, and a no-op without the mirror's state file.
+        super::caja_mirror::restore_desktop_opacity();
+    }
+
     if strategy == Strategy::Mirror {
         // The background is NOT touched here: `apply` runs on every rebuild,
         // and the daemon (`sync_caja_mirror`) sets the key-colour wallpaper

@@ -35,6 +35,24 @@ thread_local! {
     /// Redraws the library when `LAST_PLAYING` changes; installed once by the
     /// library view (mirrors `NOTICE_HOOK`).
     static PLAYING_HOOK: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// The pill the poll loop feeds, kept so [`poll_soon`] can poll on demand.
+    static POLL_WIDGETS: RefCell<Option<Rc<PillWidgets>>> = const { RefCell::new(None) };
+}
+
+/// How long [`poll_soon`] waits: long enough for the daemon to have finished
+/// the apply that prompted it, short enough to feel immediate.
+const POLL_SOON_MS: u64 = 500;
+
+/// Poll the daemon shortly, instead of at the next 4 s tick. Call after the GUI
+/// changed what plays (see [`forget_playing_path`]) so the pill and the library
+/// learn the new state promptly. A no-op before the pill exists.
+pub(crate) fn poll_soon() {
+    let Some(widgets) = POLL_WIDGETS.with(|w| w.borrow().clone()) else {
+        return;
+    };
+    glib::timeout_add_local_once(Duration::from_millis(POLL_SOON_MS), move || {
+        poll_once(widgets);
+    });
 }
 
 /// What the daemon reported as playing on the last status poll. `None` before
@@ -42,6 +60,22 @@ thread_local! {
 /// single file to name (playlist/slideshow, or an older daemon). Never blocks.
 pub(crate) fn cached_playing_path() -> Option<PathBuf> {
     LAST_PLAYING.with(|p| p.borrow().clone())
+}
+
+/// Drop the cached playing path *without* running the hook, because the GUI is
+/// about to change which wallpaper plays (a Set, a schedule being switched on)
+/// and the cache describes the one it is replacing.
+///
+/// The cache is only refreshed by the 4 s status poll. Left alone after a Set,
+/// it would keep naming the old file for up to that long: the library would
+/// highlight the old card for a schedule's sake, and an Off or Pause in that
+/// window would adopt the old wallpaper as "what is playing" and re-apply it,
+/// flipping the screen back. Unknown (`None`) is the safe answer meanwhile —
+/// callers then fall back to the config / the schedule's clock — and the caller
+/// redraws on its own, so no hook is needed. Follow with [`poll_soon`] to
+/// learn the truth sooner than the next tick.
+pub(crate) fn forget_playing_path() {
+    LAST_PLAYING.with(|p| *p.borrow_mut() = None);
 }
 
 /// Register the callback fired when [`cached_playing_path`] changes — and only
@@ -264,6 +298,7 @@ pub fn build_status_pill() -> gtk4::Widget {
         });
     }
 
+    POLL_WIDGETS.with(|w| *w.borrow_mut() = Some(widgets.clone()));
     poll_once(widgets.clone());
     // Runs for the life of the process: the single window (build_ui guards
     // against duplicates) closing quits the app, taking the timer with it.
@@ -508,6 +543,41 @@ mod tests {
         ))));
         assert!(set_cached_playing_path(None), "daemon went away");
         assert_eq!(cached_playing_path(), None);
+    }
+
+    /// After the GUI's own Set the cache still names the wallpaper that was
+    /// replaced. Forgetting it must make the answer "unknown" at once, and must
+    /// not run the hook: the caller redraws itself, and a redraw from inside
+    /// the hook would read the half-updated state.
+    #[test]
+    fn forgetting_the_playing_path_clears_it_without_firing_the_hook() {
+        let calls = Rc::new(Cell::new(0u32));
+        {
+            let calls = calls.clone();
+            on_playing_path_changed(move || calls.set(calls.get() + 1));
+        }
+        note_playing_path(Some(PathBuf::from("/walls/old.mp4")));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cached_playing_path(), Some(PathBuf::from("/walls/old.mp4")));
+
+        forget_playing_path();
+        assert_eq!(
+            cached_playing_path(),
+            None,
+            "still naming the replaced file"
+        );
+        assert_eq!(calls.get(), 1, "forgetting must not fire the hook");
+
+        // The next poll reports the new wallpaper and is a change again.
+        note_playing_path(Some(PathBuf::from("/walls/new.mp4")));
+        assert_eq!(cached_playing_path(), Some(PathBuf::from("/walls/new.mp4")));
+        assert_eq!(calls.get(), 2);
+
+        // Forgetting an already-unknown cache is harmless.
+        forget_playing_path();
+        forget_playing_path();
+        assert_eq!(cached_playing_path(), None);
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

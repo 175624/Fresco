@@ -1429,6 +1429,80 @@ mod tests {
         assert!(std::fs::read_to_string(&path).is_err());
     }
 
+    // ---- signal cleanup -------------------------------------------------------
+
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    /// Set in the re-executed copy of this test binary that plays the part of
+    /// Fresco with a preview showing.
+    const SIGNAL_CHILD_ENV: &str = "FRESCO_TEST_HOVER_SIGNAL_CHILD";
+
+    /// `install_signal_cleanup` replaces the process-wide disposition of three
+    /// signals, which a test must not do to the harness it runs in. So the test
+    /// re-runs itself as a child process that installs the handler and arms the
+    /// sentinel exactly as a preview does, and the parent signals that child
+    /// from outside, the way a logout, `pkill` or Ctrl+C would.
+    #[test]
+    fn a_terminating_signal_clears_the_sentinel_and_still_ends_the_process() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+
+        if std::env::var_os(SIGNAL_CHILD_ENV).is_some() {
+            install_signal_cleanup();
+            arm_sentinel();
+            // Wait to be signalled; only reached again if no signal kills us.
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(99);
+        }
+
+        for sig in [SIGHUP, SIGINT, SIGTERM] {
+            let state =
+                std::env::temp_dir().join(format!("fresco-signal-{}-{sig}", std::process::id()));
+            std::fs::remove_dir_all(&state).ok();
+            let sentinel = state.join("fresco").join("hover-active");
+
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "gui::hover_preview::tests::a_terminating_signal_clears_the_sentinel_and_still_ends_the_process",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(SIGNAL_CHILD_ENV, "1")
+                .env("XDG_STATE_HOME", &state)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            // The child writes the sentinel after the handler is installed, so
+            // its appearance means a signal is now safe to send.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !sentinel.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "signal {sig}: the child never armed the sentinel"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // SAFETY: plain `kill(2)` on a child we spawned and still hold.
+            assert_eq!(unsafe { kill(child.id() as i32, sig) }, 0);
+
+            let status = child.wait().unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(sig),
+                "signal {sig}: the child must die of the signal, not exit ({status:?})"
+            );
+            assert!(
+                !sentinel.exists(),
+                "signal {sig}: the sentinel was left behind and would read as a crash"
+            );
+            std::fs::remove_dir_all(&state).ok();
+        }
+    }
+
     #[test]
     fn this_test_process_is_not_mistaken_for_fresco() {
         // The cargo test binary is not named `fresco`; the name check is what
