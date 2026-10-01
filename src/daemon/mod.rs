@@ -1527,6 +1527,9 @@ impl Daemon {
             monitors_info: monitors_info_from(&self.monitors),
             gave_up: Vec::new(), // X11 backend has no give-up fallback
             lockscreen: Some(self.lock.status(&ctx, &self.config)),
+            // `check_schedule` writes the swapped slot into this in-memory copy
+            // (never to disk), so it — not config.toml — is what is on screen.
+            wallpaper_path: playing_media_path(&self.config.wallpaper),
         }
     }
 
@@ -2187,6 +2190,17 @@ impl SchedState {
     }
 }
 
+/// The single media file a wallpaper is showing, for `StatusReply::wallpaper_path`.
+/// Playlists and slideshows have no one file to name (`effective_path` would
+/// answer with a playlist's first item, which is not necessarily what is
+/// playing), so they report none and the GUI keeps going by its own config.
+fn playing_media_path(w: &Wallpaper) -> Option<PathBuf> {
+    match w.kind {
+        Kind::Video | Kind::Image => w.effective_path().map(|p| p.to_path_buf()),
+        Kind::Playlist | Kind::Slideshow => None,
+    }
+}
+
 /// Neutral Monitor list → wire MonitorInfo list (shared by all status paths).
 fn monitors_info_from(monitors: &[Monitor]) -> Vec<MonitorInfo> {
     monitors
@@ -2471,6 +2485,7 @@ fn static_status(config: &Config, lockscreen: &LockStatus) -> StatusReply {
         monitors_info: Vec::new(),
         gave_up: Vec::new(),
         lockscreen: Some(lockscreen.clone()),
+        wallpaper_path: playing_media_path(&config.wallpaper),
     }
 }
 
@@ -2783,6 +2798,7 @@ fn run_wayland_layershell() -> Result<()> {
                         Response::Status(wayland_status(
                             &monitors,
                             &outputs,
+                            &config.wallpaper,
                             user_paused || battery_paused,
                             lock_rt.status(&ctx, &config),
                         ))
@@ -4171,6 +4187,7 @@ fn holds_frame_by_design(player: &PlayerHandle) -> bool {
 fn wayland_status(
     monitors: &[Monitor],
     outputs: &std::collections::BTreeMap<String, WlOutput>,
+    default_wallpaper: &Wallpaper,
     paused: bool,
     lockscreen: LockStatus,
 ) -> StatusReply {
@@ -4222,6 +4239,10 @@ fn wayland_status(
         monitors_info: monitors_info_from(monitors),
         gave_up,
         lockscreen: Some(lockscreen),
+        // The DEFAULT wallpaper, not whichever output sorts first — that one
+        // may carry a per-monitor override. The loop's `config.wallpaper` is
+        // where a schedule swap lands (and is never saved).
+        wallpaper_path: playing_media_path(default_wallpaper),
     }
 }
 
@@ -5438,5 +5459,87 @@ mod sched_clock_jump_tests {
         assert!(st.warned_no_path); // later ticks stay quiet (flag unchanged)
         st.due_for(&cfg, wp("/day.mp4"));
         assert!(!st.warned_no_path); // re-armed by a slot with a path
+    }
+
+    /// A one-slot `times` schedule wants `/day.mp4` at every hour of the day,
+    /// so `hold_current` — which reads the real wall clock — is deterministic.
+    fn always_day_config(showing: &str) -> Config {
+        Config {
+            wallpaper: wp(showing),
+            schedule: Some(Schedule {
+                mode: ScheduleMode::Times,
+                day: None,
+                night: None,
+                day_start: "07:00".into(),
+                night_start: "19:00".into(),
+                lat: None,
+                lon: None,
+                at: vec![crate::config::TimeSlot {
+                    time: "00:00".into(),
+                    wallpaper: wp("/day.mp4"),
+                }],
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Resuming a paused schedule: the GUI points `config.wallpaper` at the
+    /// slot the schedule wants (`sync_wallpaper_to_schedule`) before applying,
+    /// so the daemon must treat that as "schedule live now", not as a manual
+    /// override to hold until the next boundary.
+    #[test]
+    fn hold_current_does_not_hold_after_a_resume_sync() {
+        let cfg = always_day_config("/day.mp4");
+        let mut st = SchedState::default();
+        st.hold_current(&cfg);
+        assert!(st.hold.is_none());
+        assert!(st.applied.is_none());
+    }
+
+    /// The failure the resume sync prevents: a stale wallpaper that differs
+    /// from the slot is an explicit user choice and is held.
+    #[test]
+    fn hold_current_holds_a_wallpaper_that_differs_from_the_slot() {
+        let cfg = always_day_config("/stale.mp4");
+        let mut st = SchedState::default();
+        st.hold_current(&cfg);
+        assert_eq!(st.hold.as_deref(), Some(std::path::Path::new("/day.mp4")));
+    }
+
+    #[test]
+    fn playing_media_path_names_single_files_only() {
+        assert_eq!(
+            playing_media_path(&wp("/day.mp4")),
+            Some(PathBuf::from("/day.mp4"))
+        );
+        let image = Wallpaper {
+            kind: Kind::Image,
+            path: Some(PathBuf::from("/a.png")),
+            ..Default::default()
+        };
+        assert_eq!(playing_media_path(&image), Some(PathBuf::from("/a.png")));
+        // A playlist's first item is not necessarily what is playing.
+        let playlist = Wallpaper {
+            kind: Kind::Playlist,
+            paths: vec![PathBuf::from("/a.mp4"), PathBuf::from("/b.mp4")],
+            ..Default::default()
+        };
+        assert_eq!(playing_media_path(&playlist), None);
+        let slideshow = Wallpaper {
+            kind: Kind::Slideshow,
+            ..Default::default()
+        };
+        assert_eq!(playing_media_path(&slideshow), None);
+        // A schedule swap only rewrites `path`, so it wins over a stale list.
+        let swapped = Wallpaper {
+            kind: Kind::Video,
+            path: Some(PathBuf::from("/night.mp4")),
+            paths: vec![PathBuf::from("/day.mp4")],
+            ..Default::default()
+        };
+        assert_eq!(
+            playing_media_path(&swapped),
+            Some(PathBuf::from("/night.mp4"))
+        );
     }
 }

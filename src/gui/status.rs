@@ -2,6 +2,7 @@
 //! `ipc::request(&Request::Status)`.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -23,6 +24,54 @@ thread_local! {
 /// read of state `poll_once` already fetched in the background.
 pub(crate) fn cached_monitors() -> Vec<MonitorInfo> {
     LAST_MONITORS.with(|m| m.borrow().clone())
+}
+
+thread_local! {
+    /// Media file the daemon last said the default wallpaper is playing
+    /// (`StatusReply::wallpaper_path`). A day/night swap changes this without
+    /// touching config.toml, so it is the only place the GUI can learn which
+    /// card is really on screen — see `cached_playing_path`.
+    static LAST_PLAYING: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    /// Redraws the library when `LAST_PLAYING` changes; installed once by the
+    /// library view (mirrors `NOTICE_HOOK`).
+    static PLAYING_HOOK: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// What the daemon reported as playing on the last status poll. `None` before
+/// the first poll lands, while the daemon isn't running, or when it has no
+/// single file to name (playlist/slideshow, or an older daemon). Never blocks.
+pub(crate) fn cached_playing_path() -> Option<PathBuf> {
+    LAST_PLAYING.with(|p| p.borrow().clone())
+}
+
+/// Register the callback fired when [`cached_playing_path`] changes — and only
+/// then, so a 4 s poll that sees the same wallpaper never rebuilds the grid.
+pub(crate) fn on_playing_path_changed(hook: impl Fn() + 'static) {
+    PLAYING_HOOK.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
+}
+
+/// Store the polled path; true when it differs from the previous one.
+fn set_cached_playing_path(path: Option<PathBuf>) -> bool {
+    LAST_PLAYING.with(|p| {
+        let mut slot = p.borrow_mut();
+        if *slot == path {
+            false
+        } else {
+            *slot = path;
+            true
+        }
+    })
+}
+
+/// Cache a poll's result and tell the library only if it moved. The hook is
+/// cloned out before it runs: it re-renders the grid, which reads the cache.
+fn note_playing_path(path: Option<PathBuf>) {
+    if set_cached_playing_path(path) {
+        let hook = PLAYING_HOOK.with(|h| h.borrow().clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// Callback that shows/hides the service notice from a reachability result.
@@ -244,6 +293,7 @@ fn poll_once(widgets: Rc<PillWidgets>) {
         match result {
             Ok(crate::ipc::Response::Status(status)) => {
                 LAST_MONITORS.with(|m| *m.borrow_mut() = status.monitors_info.clone());
+                note_playing_path(status.wallpaper_path.clone());
                 apply_status(&widgets, &status);
                 notify_reachable(status.running);
             }
@@ -252,6 +302,7 @@ fn poll_once(widgets: Rc<PillWidgets>) {
                 // Daemon not running — expected and common, not an error.
                 log::debug!("status poll: daemon unreachable: {e:#}");
                 LAST_MONITORS.with(|m| m.borrow_mut().clear());
+                note_playing_path(None);
                 apply_off(&widgets);
                 notify_reachable(false);
             }
@@ -437,5 +488,43 @@ mod tests {
     fn pause_toggle_is_hidden_only_on_a_still_frame_session() {
         assert!(pill_shows_toggle(false));
         assert!(!pill_shows_toggle(true));
+    }
+
+    /// The poll runs every few seconds; the library must only be told when the
+    /// playing file actually changes (including going to/from "unknown").
+    #[test]
+    fn playing_path_cache_reports_changes_only() {
+        // thread_local: each test thread starts empty.
+        assert_eq!(cached_playing_path(), None);
+        assert!(!set_cached_playing_path(None), "unknown -> unknown");
+
+        let day = Some(PathBuf::from("/walls/day.mp4"));
+        assert!(set_cached_playing_path(day.clone()));
+        assert_eq!(cached_playing_path(), day);
+        assert!(!set_cached_playing_path(day), "same file again");
+
+        assert!(set_cached_playing_path(Some(PathBuf::from(
+            "/walls/night.mp4"
+        ))));
+        assert!(set_cached_playing_path(None), "daemon went away");
+        assert_eq!(cached_playing_path(), None);
+    }
+
+    #[test]
+    fn note_playing_path_fires_the_hook_once_per_change() {
+        let calls = Rc::new(Cell::new(0u32));
+        {
+            let calls = calls.clone();
+            on_playing_path_changed(move || {
+                // The hook re-renders the grid, which reads the cache: it must
+                // already hold the new value by the time the hook runs.
+                assert!(cached_playing_path().is_some());
+                calls.set(calls.get() + 1);
+            });
+        }
+        let p = Some(PathBuf::from("/walls/day.mp4"));
+        note_playing_path(p.clone());
+        note_playing_path(p);
+        assert_eq!(calls.get(), 1);
     }
 }
