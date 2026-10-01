@@ -882,7 +882,13 @@ fn add_preview_group(
                     btn.set_sensitive(true);
                     match result {
                         Ok(Response::LockPreview { path }) => {
-                            open_preview_window(&parent, width, height, path);
+                            // A frame that cannot be loaded would otherwise
+                            // open as an empty, black full-screen window.
+                            if !open_preview_window(&parent, width, height, path) {
+                                dialog2.add_toast(adw::Toast::new(t!(
+                                    "Couldn't load the preview image"
+                                )));
+                            }
                         }
                         Ok(Response::Err { message }) => {
                             dialog2.add_toast(adw::Toast::new(&message));
@@ -959,12 +965,28 @@ fn load_preview_frame(picture: &gtk4::Picture, path: &str) {
 /// daemon request this path (or its 1Hz refresh) ever sends is
 /// [`Request::LockPreview`], which the daemon answers with a rendered PNG and
 /// nothing else — see this module's top-level docs.
+///
+/// Returns `false`, opening nothing, when the first frame cannot be loaded —
+/// the daemon always writes an opaque PNG with a background, so an unreadable
+/// one is a real fault to tell the user about, not a window to show black.
 fn open_preview_window(
     parent: &adw::ApplicationWindow,
     width: u32,
     height: u32,
     initial_path: String,
-) {
+) -> bool {
+    let first_frame = match gtk4::gdk::Texture::from_filename(&initial_path) {
+        Ok(texture) => texture,
+        Err(e) => {
+            log::warn!("lock screen preview: couldn't load {initial_path}: {e}");
+            return false;
+        }
+    };
+    log::info!(
+        "lock screen preview: {width}x{height} frame ({}x{}) from {initial_path}",
+        first_frame.width(),
+        first_frame.height()
+    );
     let win = gtk4::Window::new();
     win.set_transient_for(Some(parent));
     win.set_modal(true);
@@ -983,7 +1005,7 @@ fn open_preview_window(
     picture.set_can_shrink(true);
     picture.set_hexpand(true);
     picture.set_vexpand(true);
-    load_preview_frame(&picture, &initial_path);
+    picture.set_paintable(Some(&first_frame));
     overlay.set_child(Some(&picture));
 
     let hint = gtk4::Label::new(Some(t!("Press any key to close")));
@@ -1056,6 +1078,7 @@ fn open_preview_window(
     });
 
     win.present();
+    true
 }
 
 // ─── Small GTK helpers ────────────────────────────────────────────────────────

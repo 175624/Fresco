@@ -294,49 +294,42 @@ pub(super) fn render_still(w: &Wallpaper) -> Option<PathBuf> {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let out = dir.join(format!("overview-{stamp}.png"));
-    // The still must match what's on screen — INCLUDING the user's rotation,
-    // or the workspace switcher / overview shows the unrotated frame.
-    // ffmpegthumbnailer can't rotate, so rotated wallpapers go through ffmpeg
-    // when available; without ffmpeg we fall back to the unrotated frame
-    // (better than none) and say so in the log.
-    let rotation = w.rotation % 360;
-    if rotation != 0 {
-        let transpose = match rotation {
-            90 => "transpose=1", // mpv video-rotate is clockwise
-            180 => "transpose=1,transpose=1",
-            270 => "transpose=2",
-            _ => "null",
-        };
-        let ok = Command::new("ffmpeg")
-            // -nostdin + null stdio: ffmpeg reads the terminal by default, and
-            // from a shell-launched daemon that SIGTTIN-stops the WHOLE
-            // process group — daemon suspended, wallpaper frozen.
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .args([
-                "-nostdin",
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                &src.to_string_lossy(),
-                "-frames:v",
-                "1",
-                "-vf",
-                transpose,
-                &out.to_string_lossy(),
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            return Some(out);
+    extract_frame(&src, w.rotation, &out).then_some(out)
+}
+
+/// The `ffmpeg -vf` filter that undoes a clockwise `rotation` (mpv's
+/// `video-rotate` convention), `None` for an upright wallpaper.
+pub(super) fn transpose_filter(rotation: u16) -> Option<&'static str> {
+    match rotation % 360 {
+        0 => None,
+        90 => Some("transpose=1"), // mpv video-rotate is clockwise
+        180 => Some("transpose=1,transpose=1"),
+        270 => Some("transpose=2"),
+        _ => Some("null"),
+    }
+}
+
+/// Write one full-size still of `src` (a video's poster frame, or the image
+/// itself) to `out`, upright for `rotation`. Returns whether `out` was
+/// produced. Touches no other file: [`render_still`] owns the "drop the
+/// previous `overview-*` frames" bookkeeping, and a caller that must not
+/// disturb the desktop's current background frame (the lock-screen preview)
+/// calls this directly with its own scratch path.
+///
+/// The still must match what's on screen — INCLUDING the user's rotation, or
+/// the workspace switcher / overview shows the unrotated frame.
+/// ffmpegthumbnailer can't rotate, so rotated wallpapers go through ffmpeg
+/// when available; without ffmpeg we fall back to the unrotated frame
+/// (better than none) and say so in the log.
+pub(super) fn extract_frame(src: &Path, rotation: u16, out: &Path) -> bool {
+    if let Some(filter) = transpose_filter(rotation) {
+        if ffmpeg_frame(src, None, Some(filter), out) {
+            return true;
         }
         log::warn!("ffmpeg unavailable/failed; overview frame will not be rotated");
     }
     // ffmpegthumbnailer handles both video frames and images; -s 0 = full size.
-    let ok = Command::new("ffmpegthumbnailer")
+    Command::new("ffmpegthumbnailer")
         .args([
             "-i",
             &src.to_string_lossy(),
@@ -349,8 +342,34 @@ pub(super) fn render_still(w: &Wallpaper) -> Option<PathBuf> {
         ])
         .status()
         .map(|s| s.success())
-        .unwrap_or(false);
-    ok.then_some(out)
+        .unwrap_or(false)
+}
+
+/// One frame of `src` through plain `ffmpeg`, optionally `seek_s` seconds in
+/// and through the `-vf` chain `filter`. The second-chance extractor for when
+/// `ffmpegthumbnailer` is missing or hands back a black frame.
+pub(super) fn ffmpeg_frame(
+    src: &Path,
+    seek_s: Option<f32>,
+    filter: Option<&str>,
+    out: &Path,
+) -> bool {
+    let mut cmd = Command::new("ffmpeg");
+    // -nostdin + null stdio: ffmpeg reads the terminal by default, and from a
+    // shell-launched daemon that SIGTTIN-stops the WHOLE process group —
+    // daemon suspended, wallpaper frozen.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .args(["-nostdin", "-y", "-loglevel", "error"]);
+    if let Some(s) = seek_s.filter(|s| s.is_finite() && *s > 0.0) {
+        cmd.args(["-ss", &format!("{s:.2}")]);
+    }
+    cmd.arg("-i").arg(src).args(["-frames:v", "1"]);
+    if let Some(f) = filter {
+        cmd.args(["-vf", f]);
+    }
+    cmd.arg(out).status().map(|s| s.success()).unwrap_or(false)
 }
 
 fn cache_dir() -> PathBuf {
