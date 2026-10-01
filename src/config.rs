@@ -435,6 +435,13 @@ pub struct Slideshow {
     pub paths: Vec<PathBuf>,
     #[serde(default = "default_interval")]
     pub interval_s: u64,
+    /// Also scan the `folder`'s subfolders (depth-bounded; see
+    /// `media::MAX_SCAN_DEPTH`). The GUI's "Include subfolders" choice used to
+    /// apply only to importing files one by one: the daemon's folder scan was
+    /// always flat, so a slideshow made from a folder of subfolders was empty.
+    /// Absent in older configs, which stay flat.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recursive: bool,
     /// Where the transition used to live, back when only slideshows had one.
     /// Superseded by [`Wallpaper::transition`], which applies to any wallpaper
     /// change; `Config::migrate` lifts this up into it. Still parsed, still
@@ -2219,6 +2226,27 @@ mod tests {
         .unwrap();
         explicit.migrate();
         assert_eq!(explicit.wallpaper.transition, Transition::Zoom);
+    }
+
+    /// `recursive` is new: configs written before it must stay flat, and a flat
+    /// slideshow must not write the key (an older daemon ignores unknown keys,
+    /// but there is no reason to litter every config with a `false`).
+    #[test]
+    fn slideshow_recursive_defaults_off_and_round_trips() {
+        let old: Config = toml::from_str(
+            "[wallpaper]\nkind = \"slideshow\"\n[wallpaper.slideshow]\nfolder = \"/pics\"",
+        )
+        .unwrap();
+        assert!(!old.wallpaper.slideshow.as_ref().unwrap().recursive);
+        assert!(!toml::to_string(&old).unwrap().contains("recursive"));
+
+        let deep: Config = toml::from_str(
+            "[wallpaper]\nkind = \"slideshow\"\n[wallpaper.slideshow]\nfolder = \"/pics\"\nrecursive = true",
+        )
+        .unwrap();
+        assert!(deep.wallpaper.slideshow.as_ref().unwrap().recursive);
+        let back: Config = toml::from_str(&toml::to_string(&deep).unwrap()).unwrap();
+        assert!(back.wallpaper.slideshow.unwrap().recursive);
     }
 
     /// `transition = "crossfade"` is on disk for real users. It must still

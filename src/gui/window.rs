@@ -4120,9 +4120,10 @@ fn show_items_dialog(window: &adw::ApplicationWindow, state: Rc<RefCell<AppState
                 ));
             }
             let items: Vec<PathBuf> = if folder_backed {
+                // What the daemon plays, not every media file in the folder.
                 e.folder
                     .as_deref()
-                    .map(|f| library::folder_media(f, false))
+                    .map(|f| crate::media::slideshow_frames(f, e.recursive))
                     .unwrap_or_default()
             } else {
                 e.paths.clone()
@@ -4570,14 +4571,28 @@ fn two_line_choice(title: &str, sub: &str) -> gtk4::Box {
     b
 }
 
-/// Ask what a picked folder should become: the timed slideshow it has always
-/// made, or one wallpaper per image in it.
+/// Ask what a picked folder should become. What is offered depends on what is
+/// actually in it (issue #36): a timed slideshow can only show stills, so a
+/// folder of videos is offered as a playlist instead of a slideshow that would
+/// have nothing to show. "Include subfolders" applies to every choice, so
+/// ticking it re-scans and redraws the options.
 fn show_folder_import_choice(
     window: &adw::ApplicationWindow,
     state: Rc<RefCell<AppState>>,
     stack: gtk4::Stack,
     folder: PathBuf,
 ) {
+    // A folder with media only in its subfolders is not "empty": tick the box
+    // for the user instead of telling them there is nothing there.
+    let mut start_recursive = false;
+    if library::folder_media(&folder, false).is_empty() {
+        if library::folder_media(&folder, true).is_empty() {
+            show_toast(&state, t!("No supported media in that folder"));
+            return;
+        }
+        start_recursive = true;
+    }
+
     let (dialog, content) = glass_dialog(window, t!("Add folder"), 460, -1);
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
     body.set_margin_start(20);
@@ -4596,52 +4611,29 @@ fn show_folder_import_choice(
     body.append(&heading);
 
     let recursive = gtk4::CheckButton::with_label(t!("Include subfolders"));
+    recursive.set_active(start_recursive);
     body.append(&recursive);
 
-    let slideshow = gtk4::Button::new();
-    slideshow.set_child(Some(&two_line_choice(
-        t!("As a timed slideshow"),
-        t!("One wallpaper that cycles through the folder and follows what you put in it."),
-    )));
-    {
-        let state2 = state.clone();
-        let stack2 = stack.clone();
-        let folder2 = folder.clone();
-        let d = dialog.clone();
-        slideshow.connect_clicked(move |_| {
-            create_folder_slideshow(&state2, &stack2, folder2.clone());
-            d.close();
-        });
-    }
-    body.append(&slideshow);
-
-    let individual = gtk4::Button::new();
-    individual.add_css_class("suggested-action");
-    individual.set_child(Some(&two_line_choice(
-        t!("As individual wallpapers"),
-        t!("One entry per image or video in the folder, so you can pick between them."),
-    )));
-    {
-        let state2 = state.clone();
-        let folder2 = folder.clone();
-        let recursive = recursive.clone();
-        let d = dialog.clone();
-        individual.connect_clicked(move |_| {
-            let files = library::folder_media(&folder2, recursive.is_active());
-            if files.is_empty() {
-                show_toast(&state2, t!("No supported media in that folder"));
-                d.close();
-                return;
+    // The choices live in their own box so a re-scan can rebuild just them.
+    let options = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    body.append(&options);
+    let populate: Rc<dyn Fn(bool)> = {
+        let options = options.clone();
+        let dialog = dialog.clone();
+        let folder = folder.clone();
+        Rc::new(move |deep| {
+            while let Some(child) = options.first_child() {
+                options.remove(&child);
             }
-            import_individually(&state2, files);
-            let r = state2.borrow().refresh.clone();
-            if let Some(r) = r {
-                r();
-            }
-            d.close();
-        });
+            let media = library::FolderMedia::partition(library::folder_media(&folder, deep));
+            add_folder_options(&options, &dialog, &state, &stack, &folder, deep, media);
+        })
+    };
+    populate(start_recursive);
+    {
+        let populate = populate.clone();
+        recursive.connect_toggled(move |cb| populate(cb.is_active()));
     }
-    body.append(&individual);
 
     let cancel = gtk4::Button::with_label(t!("Cancel"));
     cancel.set_halign(gtk4::Align::End);
@@ -4655,12 +4647,131 @@ fn show_folder_import_choice(
     dialog.present();
 }
 
+/// The choice buttons for one scan of a folder: slideshow only when there are
+/// images, playlist only when there are videos, individual wallpapers always.
+/// `deep` is the "Include subfolders" state the scan was made with.
+fn add_folder_options(
+    options: &gtk4::Box,
+    dialog: &adw::Window,
+    state: &Rc<RefCell<AppState>>,
+    stack: &gtk4::Stack,
+    folder: &std::path::Path,
+    deep: bool,
+    media: library::FolderMedia,
+) {
+    use library::FolderShape;
+    let shape = media.shape();
+    if shape == FolderShape::Empty {
+        // Reachable by un-ticking "Include subfolders" on a folder whose media
+        // is all underneath.
+        let none = gtk4::Label::new(Some(t!("No supported media in that folder")));
+        none.add_css_class("dialog-sub");
+        none.set_xalign(0.0);
+        options.append(&none);
+        return;
+    }
+
+    if matches!(shape, FolderShape::ImagesOnly | FolderShape::Mixed) {
+        let slideshow = gtk4::Button::new();
+        slideshow.set_child(Some(&two_line_choice(
+            t!("As a timed slideshow"),
+            t!("One wallpaper that cycles through the folder and follows what you put in it."),
+        )));
+        let state = state.clone();
+        let stack = stack.clone();
+        let folder = folder.to_path_buf();
+        let d = dialog.clone();
+        slideshow.connect_clicked(move |_| {
+            create_folder_slideshow(&state, &stack, folder.clone(), deep);
+            d.close();
+        });
+        options.append(&slideshow);
+    }
+
+    if matches!(shape, FolderShape::VideosOnly | FolderShape::Mixed) {
+        let sub = if shape == FolderShape::Mixed {
+            tf!(
+                "Plays only the {count} videos, one after another. Images are left out.",
+                "count" => media.videos.len().to_string()
+            )
+        } else {
+            tf!(
+                "Plays all {count} videos one after another, on a loop.",
+                "count" => media.videos.len().to_string()
+            )
+        };
+        let playlist = gtk4::Button::new();
+        playlist.set_child(Some(&two_line_choice(t!("As a playlist"), &sub)));
+        let state = state.clone();
+        let stack = stack.clone();
+        let folder = folder.to_path_buf();
+        let videos = media.videos.clone();
+        let d = dialog.clone();
+        playlist.connect_clicked(move |_| {
+            create_folder_playlist(&state, &stack, &folder, videos.clone());
+            d.close();
+        });
+        options.append(&playlist);
+    }
+
+    let individual = gtk4::Button::new();
+    individual.add_css_class("suggested-action");
+    individual.set_child(Some(&two_line_choice(
+        t!("As individual wallpapers"),
+        t!("One entry per image or video in the folder, so you can pick between them."),
+    )));
+    {
+        let state = state.clone();
+        let folder = folder.to_path_buf();
+        let d = dialog.clone();
+        individual.connect_clicked(move |_| {
+            let files = library::folder_media(&folder, deep);
+            if files.is_empty() {
+                show_toast(&state, t!("No supported media in that folder"));
+                d.close();
+                return;
+            }
+            import_individually(&state, files);
+            let r = state.borrow().refresh.clone();
+            if let Some(r) = r {
+                r();
+            }
+            d.close();
+        });
+    }
+    options.append(&individual);
+}
+
 /// The pre-1.2 "Add folder" outcome: one folder-backed slideshow, then the
 /// editor. Unchanged behaviour, now reached through a choice — except that
 /// the slideshow lands as a draft, exactly like a single-file add: nothing
 /// is pushed to `entries`, saved, or applied until "Set as wallpaper".
-fn create_folder_slideshow(state: &Rc<RefCell<AppState>>, stack: &gtk4::Stack, folder: PathBuf) {
-    let entry = library::LibraryEntry::new_slideshow(folder);
+/// `recursive` carries the "Include subfolders" box onto the entry so the
+/// daemon scans the same files the dialog counted.
+fn create_folder_slideshow(
+    state: &Rc<RefCell<AppState>>,
+    stack: &gtk4::Stack,
+    folder: PathBuf,
+    recursive: bool,
+) {
+    let entry = library::LibraryEntry::new_slideshow(folder).with_recursive(recursive);
+    open_draft_editor(state, stack, entry);
+}
+
+/// A folder's videos as one playlist (`Kind::Playlist` loops the whole list;
+/// a slideshow would loop each clip and cut it off at the interval). Lands as
+/// a draft like every other add, and is named for the folder rather than
+/// "first clip (+N)".
+fn create_folder_playlist(
+    state: &Rc<RefCell<AppState>>,
+    stack: &gtk4::Stack,
+    folder: &std::path::Path,
+    videos: Vec<PathBuf>,
+) {
+    let mut entry = library::LibraryEntry::new_playlist(videos);
+    if let Some(name) = folder.file_name() {
+        entry.name = name.to_string_lossy().into_owned();
+    }
     open_draft_editor(state, stack, entry);
 }
 
@@ -5071,6 +5182,21 @@ fn build_editor_view(state: Rc<RefCell<AppState>>, stack: &gtk4::Stack) -> gtk4:
             let interval = interval_secs(interval_ref.selected());
             let transition = transition_from_index(transition_ref.selected());
             let power_saving = power_edit_from_index(power_ref.selected());
+            // Refuse before the draft is committed: a slideshow with no image
+            // would be saved, marked in use, and then show nothing (issue #36).
+            // Scanned now rather than trusting `broken`, so images added to the
+            // folder since the editor opened count.
+            let nothing_to_show = state_set
+                .borrow()
+                .editing_entry()
+                .is_some_and(|e| e.slideshow_is_empty());
+            if nothing_to_show {
+                show_toast(
+                    &state_set,
+                    t!("This slideshow has no images to show. Videos need a playlist."),
+                );
+                return;
+            }
             let mut reseed: Option<(PathBuf, u16)> = None;
             let mut needs_thumbnail: Option<String> = None;
             let (name, config) = {
@@ -5363,14 +5489,10 @@ fn slideshow_preview_images(entry: &LibraryEntry) -> (Option<PathBuf>, Option<Pa
     let mut imgs: Vec<PathBuf> = if !entry.paths.is_empty() {
         entry.paths.iter().take(2).cloned().collect()
     } else if let Some(folder) = &entry.folder {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(folder)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| library::is_image(p))
-            .collect();
-        v.sort();
+        // The daemon's own scan, so the demo shows frames that will really
+        // play. A folder with none (say, only videos) yields `(None, None)`
+        // and the preview stays empty instead of pointing at a video.
+        let mut v = crate::media::slideshow_frames(folder, entry.recursive);
         v.truncate(2);
         v
     } else {
@@ -10912,5 +11034,43 @@ mod tests {
         assert_eq!(dupes.len(), 2);
         // …and the fresh ones become one wallpaper each, not one playlist.
         assert_eq!(library::entries_for_each(fresh).len(), 1);
+    }
+
+    /// Issue #36: opening the editor on a folder slideshow that holds no image
+    /// (only videos, an empty or a vanished folder) must give the transition
+    /// preview nothing to draw rather than panic or point it at a video.
+    #[test]
+    fn slideshow_preview_of_a_folder_without_images_is_empty() {
+        let dir = std::env::temp_dir().join(format!("fresco-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("b.webm"), b"x").unwrap();
+
+        let videos_only = library::LibraryEntry::new_slideshow(dir.clone());
+        assert_eq!(slideshow_preview_images(&videos_only), (None, None));
+
+        let missing = library::LibraryEntry::new_slideshow(dir.join("not-there"));
+        assert_eq!(slideshow_preview_images(&missing), (None, None));
+
+        // One image stands in for both frames; two give two, in play order.
+        std::fs::write(dir.join("a.png"), b"x").unwrap();
+        let one = slideshow_preview_images(&videos_only);
+        assert_eq!(one, (Some(dir.join("a.png")), Some(dir.join("a.png"))));
+        std::fs::write(dir.join("b.jpg"), b"x").unwrap();
+        let two = slideshow_preview_images(&videos_only);
+        assert_eq!(two, (Some(dir.join("a.png")), Some(dir.join("b.jpg"))));
+
+        // Subfolders only count for an entry that asked for them.
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(nested.join("deep")).unwrap();
+        std::fs::write(nested.join("deep").join("c.png"), b"x").unwrap();
+        let flat = library::LibraryEntry::new_slideshow(nested.clone());
+        assert_eq!(slideshow_preview_images(&flat), (None, None));
+        let deep = library::LibraryEntry::new_slideshow(nested.clone()).with_recursive(true);
+        assert_eq!(
+            slideshow_preview_images(&deep).0,
+            Some(nested.join("deep").join("c.png"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
