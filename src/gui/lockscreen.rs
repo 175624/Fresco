@@ -706,10 +706,18 @@ fn add_look_group(
         t!("Blur"),
         t!("Still images only"),
         (0.0, 1.0, 0.01),
-        f64::from(cur.blur),
+        // Slider position on the curved scale (see `blur_radius_for`), read
+        // through `blur_percent` so a not-yet-migrated config shows where its
+        // old look now lives rather than a number on the wrong scale.
+        f64::from(crate::lockscreen::blur_percent(&cur) / 100.0),
         {
             let state = state.clone();
-            move |v| edit_lockscreen(&state, |l| l.blur = v as f32)
+            move |v| {
+                edit_lockscreen(&state, |l| {
+                    l.blur = v as f32;
+                    l.blur_curve = crate::config::LOCK_BLUR_CURVE;
+                })
+            }
         },
     );
     group.add(&blur_row);

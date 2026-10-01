@@ -133,10 +133,12 @@ to show that verbatim, or hide the line entirely.
 
 **Dim** darkens the wallpaper under the widgets (0–0.8; clamped short of
 fully black, since past that point the wallpaper isn't doing anything a
-plain black background wouldn't). **Blur** softens a still frame (0–1);
-it only applies when a still frame is actually showing — a playing video is
-never blurred, since that would mean re-filtering every decoded frame for as
-long as the screen stays locked.
+plain black background wouldn't). **Blur** softens a still frame; the slider
+reads 0–100 %. It is not linear: the blur radius grows with the square of the
+slider position, so the first half is gentle and fine-grained and the very end
+is a soft wash of colour. Blur only applies when a still frame is actually
+showing — a playing video is never blurred, since that would mean re-filtering
+every decoded frame for as long as the screen stays locked.
 
 ## Per-desktop setup
 
@@ -321,7 +323,8 @@ enabled     = false     # master switch
 preset      = "classic" # classic | minimal | glass | bigtype | terminal
 live_video  = "ac"      # ac | always | never
 dim         = 0.2       # 0.0-0.8, clamped
-blur        = 0.0       # 0.0-1.0, clamped; still-frame hosts only
+blur        = 0.0       # 0.0-1.0 slider position (curved), clamped; still-frame hosts only
+blur_curve  = 1         # written by Fresco; a file without it holds the old linear blur
 # clock_theme = "..."   # unset = the preset's own clock; same spellings as
                          # the desktop clock widget ("lockscreen" selects
                          # Classic's own look — not "classic")
@@ -346,7 +349,8 @@ visualizer  = false     # also needs audio_capture_consented = true, top-level
 | `preset` | `"classic"` | See [Presets](#presets) |
 | `live_video` | `"ac"` | See [Live video and battery](#live-video-and-battery) |
 | `dim` | `0.2` | Clamped to `0.0..=0.8` |
-| `blur` | `0.0` | Clamped to `0.0..=1.0`; ignored while video is actually playing |
+| `blur` | `0.0` | Slider position, clamped to `0.0..=1.0`; radius = 0.3 × position² of the screen height; ignored while video is actually playing |
+| `blur_curve` | `1` | Which scale `blur` is on. Absent (configs from 1.1.46 and earlier) means the old linear blur, which Fresco converts once on load so the look doesn't change |
 | `clock_theme` | unset | Overrides the preset's clock face |
 | `greeting` | unset | `""` hides the line; any other text is shown as-is |
 | `widgets.*` | see above | One bool per widget; see [Widgets](#widgets) |

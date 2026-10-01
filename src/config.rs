@@ -1382,8 +1382,14 @@ pub struct LockScreen {
     /// screen. See [`crate::lockscreen::resolve`].
     #[serde(default = "default_lock_dim")]
     pub dim: f32,
-    /// Gaussian blur over a still frame: `0.0` (sharp) to `1.0` (softest).
-    /// Clamped to that range on resolve.
+    /// Gaussian blur over a still frame, as a **slider position**: `0.0`
+    /// (sharp) to `1.0` (softest). Clamped to that range on resolve.
+    ///
+    /// This is *not* the blur radius. The radius grows with the square of
+    /// this value, so the low end of the slider gets fine control — see
+    /// [`crate::lockscreen::blur_radius_for`], the one place that turns this
+    /// number into a radius. Which scale a stored number is on is recorded in
+    /// [`LockScreen::blur_curve`].
     ///
     /// **Still-frame hosts only.** A live-video wallpaper would need every
     /// decoded frame pushed back through a blur filter for as long as the
@@ -1392,6 +1398,15 @@ pub struct LockScreen {
     /// blurred once, when the lock screen appears, and costs nothing after.
     #[serde(default)]
     pub blur: f32,
+    /// Which scale [`LockScreen::blur`] is stored on. `0` — what serde fills
+    /// in for every config written before this key existed — is the original
+    /// linear scale (`blur` was the radius itself, as a fraction of the output
+    /// height); [`LOCK_BLUR_CURVE`] is the curved slider position described on
+    /// `blur`. [`Config::load_from`] folds the old scale onto the new one the
+    /// first time it sees it (see [`LockScreen::migrate_blur`]), so a person's
+    /// existing look is preserved and the next save writes the new scale.
+    #[serde(default)]
+    pub blur_curve: u8,
     /// Override the preset's own clock look. `None` — the default — takes
     /// whichever [`crate::clock::ClockTheme`] the preset was designed around,
     /// so picking a preset is one decision instead of two.
@@ -1415,6 +1430,27 @@ fn default_lock_dim() -> f32 {
     0.2
 }
 
+/// The current scale of [`LockScreen::blur`]: a position on the curve
+/// [`crate::lockscreen::blur_radius_for`] defines. `0` (absent) is the old
+/// linear scale.
+pub const LOCK_BLUR_CURVE: u8 = 1;
+
+impl LockScreen {
+    /// Fold a blur stored on the old linear scale onto the current curve, so
+    /// the radius it produced is the radius it still produces. Idempotent: a
+    /// value already on [`LOCK_BLUR_CURVE`] is left alone.
+    ///
+    /// Anything the old scale allowed beyond what the curve can reach
+    /// (`blur > 0.3`, already a field of colour blobs) saturates at the new
+    /// maximum rather than being rejected.
+    pub fn migrate_blur(&mut self) {
+        if self.blur_curve < LOCK_BLUR_CURVE {
+            self.blur = crate::lockscreen::legacy_blur_to_percent(self.blur) / 100.0;
+            self.blur_curve = LOCK_BLUR_CURVE;
+        }
+    }
+}
+
 impl Default for LockScreen {
     fn default() -> Self {
         LockScreen {
@@ -1423,6 +1459,7 @@ impl Default for LockScreen {
             live_video: LiveVideo::default(),
             dim: default_lock_dim(),
             blur: 0.0,
+            blur_curve: LOCK_BLUR_CURVE,
             clock_theme: None,
             greeting: None,
             widgets: LockWidgets::default(),
@@ -2014,7 +2051,11 @@ impl Config {
         }
         // `widgets` needs nothing here: it has never shipped under another
         // name, so no released config can contain a deprecated spelling of it.
-        // `lockscreen` needs nothing here either, for the same reason.
+        // `lockscreen` has no deprecated *key*, but 1.1.46's `blur` was a
+        // linear radius and is now a position on a curve; fold it over once.
+        if let Some(l) = self.lockscreen.as_mut() {
+            l.migrate_blur();
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -3292,7 +3333,11 @@ opacity = 200
     fn empty_lockscreen_table_uses_every_default() {
         // Naming the block never by itself takes over the system lock screen,
         // and every field the table leaves out takes its pinned default.
-        let cfg: Config = toml::from_str("[lockscreen]\n").unwrap();
+        let mut cfg: Config = toml::from_str("[lockscreen]\n").unwrap();
+        // The load path, not bare serde: a table with no `blur_curve` is a
+        // pre-curve config, and loading is what stamps it as current. (Its
+        // blur is 0, so nothing else about it changes.)
+        cfg.migrate();
         let l = cfg.lockscreen.expect("[lockscreen] table must deserialize");
         assert_eq!(l, LockScreen::default());
         assert!(!l.enabled, "lockscreen must default to OFF");
@@ -3382,6 +3427,7 @@ visualizer = true
             live_video: LiveVideo::Always,
             dim: 0.65,
             blur: 0.9,
+            blur_curve: LOCK_BLUR_CURVE,
             clock_theme: Some(crate::clock::ClockTheme::Lock),
             greeting: Some(String::new()),
             widgets: LockWidgets {
@@ -3407,6 +3453,69 @@ visualizer = true
             "every lockscreen field must survive a round trip"
         );
         assert_eq!(back.lockscreen.unwrap(), l);
+    }
+
+    /// Load `toml` the way every process does: through `load_from`, so the
+    /// migrations run.
+    fn load_lockscreen_toml(tag: &str, toml: &str) -> (Config, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("fresco-lockblur-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        (Config::load_from(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn lockscreen_blur_from_before_the_curve_keeps_its_radius_and_migrates_once() {
+        use crate::lockscreen::{blur_radius_for, resolve};
+        // 1.1.46 wrote `blur` only: a linear radius.
+        for old in [0.0_f32, 0.02, 0.1, 0.2, 0.3] {
+            let (cfg, path) = load_lockscreen_toml(
+                &format!("legacy{old}"),
+                &format!("[lockscreen]\nenabled = true\nblur = {old}\n"),
+            );
+            let l = cfg.lockscreen.clone().unwrap();
+            assert_eq!(l.blur_curve, LOCK_BLUR_CURVE, "stamped as migrated");
+            // The picture does not change: same radius before and after.
+            assert!(
+                (resolve(&l).blur - old).abs() < 1e-5,
+                "{old} -> {}",
+                resolve(&l).blur
+            );
+            // And the slider now sits where that radius lives on the curve.
+            assert!((blur_radius_for(l.blur * 100.0) - old).abs() < 1e-5);
+
+            // Persist, reload: the stored number is now final, not migrated
+            // again (which would compound the conversion).
+            cfg.save_to(&path).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("blur_curve = 1"), "{text}");
+            let again = Config::load_from(&path).unwrap().lockscreen.unwrap();
+            assert_eq!(again, l, "second load must be a no-op");
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+    }
+
+    #[test]
+    fn lockscreen_blur_already_on_the_curve_is_left_alone() {
+        let (cfg, path) =
+            load_lockscreen_toml("current", "[lockscreen]\nblur = 0.25\nblur_curve = 1\n");
+        assert_eq!(cfg.lockscreen.unwrap().blur, 0.25);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn lockscreen_blur_past_the_new_maximum_saturates_when_migrated() {
+        // Old 0.6 asked for a blur no slider position reaches any more.
+        let (cfg, path) = load_lockscreen_toml("over", "[lockscreen]\nblur = 0.6\n");
+        assert_eq!(cfg.lockscreen.unwrap().blur, 1.0);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        // And junk stays harmless.
+        let (cfg, path) = load_lockscreen_toml("nan", "[lockscreen]\nblur = nan\n");
+        assert_eq!(cfg.lockscreen.unwrap().blur, 0.0);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
