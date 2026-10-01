@@ -174,7 +174,7 @@ pub struct SavedWallpapers {
     pub monitors: BTreeMap<String, String>,
 }
 
-fn state_dir() -> PathBuf {
+pub(super) fn state_dir() -> PathBuf {
     dirs::state_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(std::env::temp_dir)
@@ -207,6 +207,15 @@ fn key_uri() -> Option<String> {
         std::fs::write(&path, &png).ok()?;
     }
     Some(format!("file://{}", path.display()))
+}
+
+/// `FRESCO_DDE_MIRROR_PROBE=alpha`: a diagnostic for the icon mirror. The
+/// mirror then sets the transparent wallpaper instead of the key colour and its
+/// diagnostics log the alpha range of DDE's desktop window, which tells whether
+/// that window ever carries real per-pixel alpha (it would allow smooth icon
+/// edges; today's opaque key background cannot).
+pub(super) fn probe_alpha() -> bool {
+    std::env::var("FRESCO_DDE_MIRROR_PROBE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("alpha"))
 }
 
 /// Run `gdbus call --session` and return stdout on success.
@@ -322,8 +331,18 @@ pub(super) fn apply_key_background(monitors: &[String]) -> Option<String> {
         );
         return None;
     }
+    // The alpha probe swaps the key PNG for the transparent one; everything
+    // else (saving the original, restoring it) is the same.
+    let probe = probe_alpha();
+    let shown = if probe { &transparent } else { &key };
+    if probe {
+        log::warn!(
+            "DDE: FRESCO_DDE_MIRROR_PROBE=alpha — setting the transparent wallpaper instead of \
+             the key colour; the mirror logs the desktop window's alpha range"
+        );
+    }
     for m in monitors {
-        if !set_background(m, &key) {
+        if !set_background(m, shown) {
             log::warn!("DDE: SetMonitorBackground failed on {m}");
             restore();
             return None;
@@ -331,10 +350,15 @@ pub(super) fn apply_key_background(monitors: &[String]) -> Option<String> {
     }
     let readback = monitors.first().and_then(|m| get_background(m));
     log::info!(
-        "DDE: key-colour wallpaper {key} set; DDE reports {readback:?} (matches: {})",
-        readback.as_deref() == Some(key.as_str())
+        "DDE: {} wallpaper {shown} set; DDE reports {readback:?} (matches: {})",
+        if probe {
+            "transparent (probe)"
+        } else {
+            "key-colour"
+        },
+        readback.as_deref() == Some(shown.as_str())
     );
-    Some(key)
+    Some(shown.clone())
 }
 
 /// The strategy chosen for this rebuild, before we try to enact it.
@@ -662,6 +686,11 @@ pub fn render_self_check<C: Connection>(conn: &C, windows: &[Window]) {
 /// on startup paths where the daemon will not be showing a wallpaper (crash
 /// recovery).
 pub fn restore() {
+    // The mirror hides DDE's desktop window from the compositor while it runs
+    // (`caja_mirror::opacity`); a crashed run leaves it hidden. Undo that
+    // first: it is a no-op without its state file, and an invisible desktop is
+    // worse than a wrong wallpaper.
+    super::caja_mirror::restore_desktop_opacity();
     let path = saved_path();
     let Ok(bytes) = std::fs::read(&path) else {
         return; // nothing saved — nothing to restore
