@@ -447,6 +447,7 @@ fn launch(state: &Rc<RefCell<AppState>>, queued: Queued) {
 fn apply(state: &Rc<RefCell<AppState>>, done: Done, progress: &mut Progress) {
     unpend(&done.id);
     progress.record(done.ok);
+    let previews_on = state.borrow().config.hover_previews;
     let meta_line = {
         let mut s = state.borrow_mut();
         match s.entries.iter_mut().find(|e| e.id == done.id) {
@@ -461,6 +462,15 @@ fn apply(state: &Rc<RefCell<AppState>>, done: Done, progress: &mut Progress) {
                     e.fps = m.fps;
                     e.size_bytes = m.size_bytes;
                 }
+                // A hover preview of a large video plays a small proxy clip;
+                // make it now, at low priority, so the first hover is already
+                // alive. Capped inside `prefetch`, so a big folder only gets
+                // the first few eagerly and the rest on first hover.
+                if previews_on {
+                    if let Some(request) = super::preview_proxy::request_for(e) {
+                        super::preview_proxy::prefetch(request);
+                    }
+                }
                 e.meta_line()
             }
             None => {
@@ -468,6 +478,7 @@ fn apply(state: &Rc<RefCell<AppState>>, done: Done, progress: &mut Progress) {
                 if let Some(t) = &done.thumbnail {
                     std::fs::remove_file(t).ok();
                 }
+                super::preview_proxy::remove_for(&done.id);
                 None
             }
         }

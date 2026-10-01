@@ -6,6 +6,7 @@ mod import_queue;
 mod library;
 mod lockscreen;
 mod preview;
+mod preview_proxy;
 mod status;
 mod theme;
 mod transition_preview;
