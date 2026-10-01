@@ -1,23 +1,68 @@
 //! COSMIC lock-screen background sync — the same problem `overview` solves
 //! for GNOME/Cinnamon/MATE, adapted to how COSMIC stores its background.
 //!
-//! On COSMIC, Fresco's patched mpvpaper draws the live wallpaper on
-//! `wlr-layer-shell` surfaces ABOVE `cosmic-bg`, the desktop's own background
-//! renderer — so on the live desktop itself nothing here is even necessary.
-//! The catch is the lock screen: `cosmic-greeter`'s in-session locker does not
-//! show whatever is composited on screen, it draws its own surface and reads
-//! `cosmic-bg`'s config directly to decide what picture to show
-//! (cosmic-greeter PR #528, "locker: Rely on cosmic-bg for showing background
-//! by ids"). `cosmic-bg`'s config still points at whatever the user had before
-//! Fresco — a stock distro image on a fresh install — so the lock screen shows
-//! that instead of the live wallpaper. This module keeps `cosmic-bg`'s config
-//! pointed at a still frame of Fresco's own wallpaper, the way `overview`
-//! keeps `org.gnome.desktop.background` pointed at one.
+//! On COSMIC, Fresco's patched mpvpaper draws the live wallpaper on a
+//! `wlr-layer-shell` Background-layer surface next to `cosmic-bg`'s own, the
+//! desktop's background renderer. Nothing here is needed to *see* the live
+//! wallpaper; the catch is the lock screen. This module keeps `cosmic-bg`'s
+//! config pointed at a still frame of Fresco's own wallpaper, the way
+//! `overview` keeps `org.gnome.desktop.background` pointed at one, so the lock
+//! screen shows the wallpaper the user chose instead of a stock distro image.
 //!
 //! HARD RULE (feature-wide, not just this file): Fresco never touches
 //! authentication. `cosmic-greeter` still owns the password prompt and PAM;
 //! this module only ever writes an image path into `cosmic-bg`'s own config
 //! files, the same files its own settings UI would write.
+//!
+//! # What the lock screen actually shows
+//!
+//! Since cosmic-greeter PR #528 ("locker: Rely on cosmic-bg for showing
+//! background", with cosmic-bg PR #144 and cosmic-comp PR #2792, merged
+//! 2026-09-11) the locker draws **no image of its own**: `view_window` returns
+//! an empty space, and `cosmic-bg` marks its wallpaper surfaces show-on-lock
+//! through `cosmic-session-lock-layer-v1`. So the lock screen is whatever
+//! pixels `cosmic-bg` last rendered — its in-memory image, not a file read at
+//! lock time. (Before #528 the locker read `cosmic-bg`'s state file and loaded
+//! the image bytes when the screen locked.)
+//!
+//! # The stacking trap — why this module is careful about WHEN it writes
+//!
+//! `cosmic-bg` watches its config directory. In `src/main.rs`'s watch
+//! callback, a write to `backgrounds`, `same-on-all` or `output.<name>`
+//! *always* counts as a change, and a write to `all` counts when the parsed
+//! entry differs. Any change calls `apply_backgrounds()`, which drops every
+//! `Wallpaper` and creates a brand-new layer surface on **every** output —
+//! not just the one whose entry changed. cosmic-comp stacks a newer surface
+//! above an older one in the same layer, so those fresh `cosmic-bg` surfaces
+//! land ABOVE a running mpvpaper and hide the video behind a still picture
+//! (the 1.1.46 regression: video on the laptop, a frozen image on HDMI). The
+//! first version of this module assumed mpvpaper always stays above
+//! `cosmic-bg`; it does not, and nothing but creation order decides it.
+//!
+//! Three rules follow, and everything below exists to uphold them:
+//!
+//! 1. **Stable paths, write only on change.** The still lives at a fixed path
+//!    per target (`cosmic-bg-all.png`, `cosmic-bg-<connector>.png`), replaced
+//!    atomically, and a config file is rewritten only when its text would
+//!    actually change. After the first sync, playback never touches
+//!    `cosmic-bg`'s config, so `cosmic-bg` never reloads.
+//! 2. **When config does change, mpvpaper goes last.** [`apply`] reports
+//!    whether it changed anything ([`SyncOutcome`]); [`ReloadTracker`] turns
+//!    that into "wait [`SETTLE`], then respawn every mpvpaper", or into a
+//!    pre-spawn sleep at daemon start. Every reload recreates the surface on
+//!    every output, so the respawn is for all of them.
+//! 3. **A new still alone does not reach the lock screen.** `cosmic-bg`'s file
+//!    watcher only edits its slideshow queue, so replacing the PNG at the same
+//!    path (a new wallpaper, same config text) leaves the old pixels on the
+//!    lock screen. Forcing a reload to fix that would hide the video, so the
+//!    reload is deferred to the moment the session locks
+//!    ([`refresh_for_lock`]), when nobody sees the desktop; the mpvpaper
+//!    respawn that restores the stacking then happens behind the lock screen.
+//!    Trade-off: after switching wallpaper, the lock screen can briefly show
+//!    the previous frame for about a second after locking before the new one
+//!    appears. Skipped when mpvpaper itself is shown on the lock screen
+//!    (`[lockscreen].enabled` on a live-capable COSMIC) — the live video is
+//!    what's displayed then, and respawning it would blink it.
 //!
 //! # The on-disk format
 //!
@@ -70,11 +115,16 @@
 //! never mistaken for the original (e.g. if the state directory was lost
 //! while Fresco's frame was live) — it is simply left untracked rather than
 //! restored, the same honest gap `overview` accepts for the same reason.
+//! "Fresco's own frame" means any `cosmic-bg-*` file in Fresco's cache
+//! directory, so the timestamped names 1.1.46 wrote (`cosmic-bg-all-<ms>.png`)
+//! are still recognised after the switch to fixed names.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::config::Config;
+use crate::config::{Config, Wallpaper};
 
 /// `cosmic-config` application id `cosmic-bg` stores its settings under.
 const COSMIC_BG_NAME: &str = "com.system76.CosmicBackground";
@@ -85,6 +135,16 @@ const COSMIC_BG_NAME: &str = "com.system76.CosmicBackground";
 /// harmless in practice (a session is only ever one desktop) but free to keep
 /// separate.
 const OUR_FRAME_PREFIX: &str = "cosmic-bg-";
+
+/// How long `cosmic-bg` is given, after a config write, to reload, recreate
+/// its layer surfaces and map them — decoding and Lanczos-scaling a 4K still
+/// is most of it — before mpvpaper's surface may be created. mpvpaper only
+/// maps after mpv has initialised GL and rendered a frame, so the two
+/// together put its surface after `cosmic-bg`'s with margin on typical
+/// hardware. It is a delay, not a handshake: nothing reports "cosmic-bg has
+/// finished", so a very slow machine could still lose the race (the symptom
+/// is the 1.1.46 one, and a manual Apply repairs it).
+pub const SETTLE: Duration = Duration::from_millis(800);
 
 const DEFAULT_ROTATION_FREQUENCY: u64 = 300;
 const DEFAULT_FILTER_METHOD: &str = "Lanczos";
@@ -109,13 +169,114 @@ fn is_active() -> bool {
     is_cosmic(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref())
 }
 
+/// What one sync did to `cosmic-bg`'s configuration — the facts the daemon
+/// needs in order to put mpvpaper back on top (see [`ReloadTracker`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncOutcome {
+    /// Names of the `cosmic-bg` config files whose text actually changed on
+    /// this sync (`all`, `output.<connector>`, `backgrounds`, `same-on-all`).
+    /// Empty when `cosmic-bg`'s config was already exactly right — the steady
+    /// state during playback, and the reason `cosmic-bg` stays quiet.
+    pub config_written: Vec<String>,
+    /// At least one still frame's bytes changed on disk. Without a config
+    /// change that is invisible to `cosmic-bg` (see the module doc, rule 3).
+    pub still_changed: bool,
+}
+
+impl SyncOutcome {
+    /// Whether `cosmic-bg` will have reloaded and recreated its surfaces on
+    /// every output, i.e. any mpvpaper surface that already exists is now
+    /// stacked below a newer `cosmic-bg` one.
+    pub fn reloads_cosmic_bg(&self) -> bool {
+        !self.config_written.is_empty()
+    }
+}
+
+/// The daemon-side bookkeeping for [`SyncOutcome`]s: when mpvpaper must be
+/// respawned to get back above `cosmic-bg`, and whether the lock-screen frame
+/// is older than the still on disk. Pure and `Instant`-driven, like
+/// `cinnamon_bg::RestackScheduler`, so the decisions are unit-testable.
+#[derive(Debug, Default)]
+pub struct ReloadTracker {
+    /// When the respawn is due. Pushed out by every further reload, so a burst
+    /// of syncs (several Applies in a row) collapses into one respawn that
+    /// follows the LAST reload — the one whose surfaces are newest.
+    respawn_at: Option<Instant>,
+    /// A newer still than the one `cosmic-bg` has loaded sits on disk.
+    frame_stale: bool,
+}
+
+impl ReloadTracker {
+    /// Record a sync made while mpvpaper surfaces already exist.
+    pub fn note(&mut self, outcome: &SyncOutcome, now: Instant) {
+        if outcome.reloads_cosmic_bg() {
+            self.respawn_at = Some(now + SETTLE);
+            // The reload re-read the still from disk.
+            self.frame_stale = false;
+        } else if outcome.still_changed {
+            self.frame_stale = true;
+        }
+    }
+
+    /// Record the sync made at daemon start, before any mpvpaper exists.
+    /// Nothing needs respawning then; the returned delay is how long to wait
+    /// before spawning so the new mpvpaper surfaces are created after
+    /// `cosmic-bg`'s. `None` when `cosmic-bg` did not reload.
+    pub fn note_before_spawn(&mut self, outcome: &SyncOutcome, now: Instant) -> Option<Duration> {
+        self.note(outcome, now);
+        self.respawn_at = None;
+        outcome.reloads_cosmic_bg().then_some(SETTLE)
+    }
+
+    /// Whether mpvpaper must be respawned now. Consumes the request.
+    #[must_use]
+    pub fn respawn_due(&mut self, now: Instant) -> bool {
+        match self.respawn_at {
+            Some(at) if now >= at => {
+                self.respawn_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the lock-screen frame is older than the still on disk — the
+    /// hint [`refresh_for_lock`] takes.
+    pub fn frame_stale(&self) -> bool {
+        self.frame_stale
+    }
+
+    /// Forget everything (the config was restored; nothing is pending).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Keep `cosmic-bg`'s config pointed at a still frame of `config`'s
 /// wallpaper(s). No-op off COSMIC — see the module doc.
-pub fn apply(config: &Config) {
+///
+/// Cheap and quiet when nothing changed: the still is re-rendered only when
+/// its source changed, and a config file is rewritten only when its text would
+/// differ. The returned [`SyncOutcome`] says what, if anything, was touched.
+pub fn apply(config: &Config) -> SyncOutcome {
     if !is_active() {
-        return;
+        return SyncOutcome::default();
     }
-    apply_in(&config_root(), &state_root(), config);
+    apply_in(&config_root(), &state_root(), config)
+}
+
+/// [`apply`], plus — if the lock-screen frame is out of date — a forced
+/// `cosmic-bg` reload so the lock screen shows the current wallpaper.
+///
+/// Meant to run when the session locks, the one moment the reload's side
+/// effect (new `cosmic-bg` surfaces stacked above mpvpaper) is invisible. It
+/// re-runs [`apply`] first so a wallpaper that changed without an Apply (the
+/// schedule) is picked up too. `frame_stale` is [`ReloadTracker::frame_stale`].
+pub fn refresh_for_lock(config: &Config, frame_stale: bool) -> SyncOutcome {
+    if !is_active() {
+        return SyncOutcome::default();
+    }
+    refresh_in(&config_root(), &state_root(), config, frame_stale)
 }
 
 /// Put every `cosmic-bg` file this module has ever written back exactly as it
@@ -157,16 +318,19 @@ fn own_cache_dir() -> PathBuf {
 /// `ffmpegthumbnailer`/`ffmpeg` through `overview::render_still`, can stay
 /// thin and untested, the same way `overview::apply` itself is never
 /// unit-tested.
-fn apply_in(root: &Path, state: &Path, config: &Config) {
+fn apply_in(root: &Path, state: &Path, config: &Config) -> SyncOutcome {
     let dir = own_cache_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         log::warn!("cosmic-bg: could not create {}", dir.display());
-        return;
+        return SyncOutcome::default();
     }
-    clear_previous_frames(&dir);
 
-    let all_still = super::overview::render_still(&config.wallpaper)
-        .and_then(|frame| stash_still(&frame, &dir, "all"));
+    let mut still_changed = false;
+    // Every frame name this sync owns, whether or not it could be rendered
+    // this time: a frame `cosmic-bg`'s config already points at must survive a
+    // transient `ffmpegthumbnailer` failure.
+    let mut keep = BTreeSet::from([frame_name("all")]);
+    let all_still = sync_still(&config.wallpaper, &dir, "all", &mut still_changed);
 
     let mut per_output = Vec::new();
     for (connector, wallpaper) in &config.monitors {
@@ -174,67 +338,227 @@ fn apply_in(root: &Path, state: &Path, config: &Config) {
             log::warn!("cosmic-bg: skipping monitor key {connector:?} — not a safe connector name");
             continue;
         }
-        let Some(frame) = super::overview::render_still(wallpaper) else {
+        keep.insert(frame_name(connector));
+        let Some(still) = sync_still(wallpaper, &dir, connector, &mut still_changed) else {
             log::debug!("cosmic-bg: no still available for output {connector}; leaving it as-is");
             continue;
         };
-        if let Some(still) = stash_still(&frame, &dir, connector) {
-            per_output.push((connector.clone(), still));
-        }
+        per_output.push((connector.clone(), still));
     }
 
     let same_on_all = config.monitors.is_empty();
-    write_backgrounds(root, state, same_on_all, all_still.as_deref(), &per_output);
+    let config_written =
+        write_backgrounds(root, state, same_on_all, all_still.as_deref(), &per_output);
+    // After the config points at the fixed names, never before: `cosmic-bg`
+    // may still be showing (and, on reload, re-reading) a timestamped frame
+    // from an older Fresco until this sync's write lands.
+    clear_stale_frames(&dir, &keep);
 
-    if same_on_all {
-        log::info!("cosmic-bg: background synced (same-on-all)");
+    let outcome = SyncOutcome {
+        config_written,
+        still_changed,
+    };
+    let mode = if same_on_all {
+        "same-on-all".to_string()
     } else {
+        format!("{} output(s), per-output", per_output.len())
+    };
+    if outcome.reloads_cosmic_bg() || outcome.still_changed {
         log::info!(
-            "cosmic-bg: background synced ({} output(s), per-output)",
-            per_output.len()
+            "cosmic-bg: background synced ({mode}); rewrote [{}]{}",
+            outcome.config_written.join(", "),
+            if outcome.still_changed {
+                ", new still frame"
+            } else {
+                ""
+            }
         );
+    } else {
+        log::debug!("cosmic-bg: background already in sync ({mode})");
     }
+    outcome
 }
 
-/// Delete every still frame this module previously produced. Mirrors
-/// `overview::render_still`'s own "drop previous frames" pass, scoped to
-/// [`OUR_FRAME_PREFIX`] so the two modules never touch each other's files.
-fn clear_previous_frames(dir: &Path) {
+/// [`refresh_for_lock`] against explicit directories (see [`apply_in`] for why
+/// the split exists).
+fn refresh_in(root: &Path, state: &Path, config: &Config, frame_stale: bool) -> SyncOutcome {
+    let mut outcome = apply_in(root, state, config);
+    if needs_forced_reload(&outcome, frame_stale) && force_reload_in(root, state) {
+        log::info!("cosmic-bg: reloading so the lock screen shows the current wallpaper");
+        outcome.config_written.push(RELOAD_KEY.to_string());
+    }
+    outcome
+}
+
+/// Whether the lock-time refresh must force a `cosmic-bg` reload itself: the
+/// lock screen is out of date (a still was just re-rendered, or an earlier
+/// sync left it stale) and this sync did not already reload `cosmic-bg`.
+fn needs_forced_reload(outcome: &SyncOutcome, frame_stale: bool) -> bool {
+    !outcome.reloads_cosmic_bg() && (frame_stale || outcome.still_changed)
+}
+
+/// The `cosmic-bg` config key a forced reload rewrites. `cosmic-bg` treats a
+/// `same-on-all` event as a change unconditionally — it does not compare the
+/// value — and recreates every output's surface in response.
+const RELOAD_KEY: &str = "same-on-all";
+
+/// Make `cosmic-bg` reload by rewriting `same-on-all` with the text it already
+/// has: `cosmic-config`'s watcher reports any data event on the file, with no
+/// content comparison. Touches only a file this module wrote and backed up —
+/// nothing happens unless a backup manifest exists — and never changes its
+/// content, so [`restore_in`] is unaffected.
+fn force_reload_in(root: &Path, state: &Path) -> bool {
+    if !state.join("manifest").exists() {
+        return false;
+    }
+    let Ok(current) = std::fs::read(root.join(RELOAD_KEY)) else {
+        return false;
+    };
+    write_atomic(&root.join(RELOAD_KEY), &current)
+}
+
+/// Delete every `cosmic-bg-*` file in `dir` whose name is not in `keep`: the
+/// timestamped frames older Fresco versions wrote, frames of monitor overrides
+/// that no longer exist, and any half-written `.cosmic-bg-*` temp file a
+/// crashed run left behind. Scoped to [`OUR_FRAME_PREFIX`] so it never touches
+/// `overview`'s files.
+fn clear_stale_frames(dir: &Path, keep: &BTreeSet<String>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
+    let hidden_prefix = format!(".{OUR_FRAME_PREFIX}");
     for entry in rd.flatten() {
         let path = entry.path();
-        let is_ours = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(OUR_FRAME_PREFIX));
-        if is_ours {
-            std::fs::remove_file(path).ok();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let ours = name.starts_with(OUR_FRAME_PREFIX) || name.starts_with(&hidden_prefix);
+        if ours && !keep.contains(name) {
+            std::fs::remove_file(&path).ok();
         }
     }
 }
 
-/// Copy `rendered` (an `overview::render_still` scratch file) into our own
-/// timestamped, tagged cache file.
-///
-/// A copy rather than reusing that path directly, for two reasons: (1)
-/// `overview::render_still` deletes every `overview-*` file at the START of
-/// its NEXT call, so calling it in a loop for several monitors would delete
-/// an earlier monitor's frame before `cosmic-bg` ever read it; (2) a fresh
-/// filename each time is what makes a live-reloading reader reliably pick up
-/// the change — the same reason `render_still` itself always mints a new one.
-fn stash_still(rendered: &Path, dir: &Path, tag: &str) -> Option<PathBuf> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let dest = dir.join(format!(
-        "{OUR_FRAME_PREFIX}{}-{stamp}.png",
-        sanitize_filename_tag(tag)
-    ));
-    std::fs::copy(rendered, &dest).ok()?;
+/// File name of `tag`'s still: fixed, so `cosmic-bg`'s config text never has
+/// to change just because the picture did.
+fn frame_name(tag: &str) -> String {
+    format!("{OUR_FRAME_PREFIX}{}.png", sanitize_filename_tag(tag))
+}
+
+fn frame_path(dir: &Path, tag: &str) -> PathBuf {
+    dir.join(frame_name(tag))
+}
+
+/// What a rendered still was made from. Two equal keys mean the frame on disk
+/// is still the right one, so the render (an `ffmpegthumbnailer`/`ffmpeg`
+/// run) can be skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StillKey {
+    source: PathBuf,
+    modified: Option<SystemTime>,
+    /// `Wallpaper::rotation % 360` — the frame is rotated to match playback.
+    rotation: u16,
+}
+
+fn still_key(w: &Wallpaper) -> Option<StillKey> {
+    let source = super::overview::still_source(w)?;
+    let modified = std::fs::metadata(&source).and_then(|m| m.modified()).ok();
+    Some(StillKey {
+        source,
+        modified,
+        rotation: w.rotation % 360,
+    })
+}
+
+/// Whether the frame already at the fixed path can be reused: it exists, and
+/// it was rendered from exactly this source, at this modification time, with
+/// this rotation. A key that cannot be formed (source missing) never reuses.
+fn can_reuse_still(rendered_from: Option<&StillKey>, now: Option<&StillKey>, exists: bool) -> bool {
+    exists && matches!((rendered_from, now), (Some(a), Some(b)) if a == b)
+}
+
+/// Key each fixed frame was last rendered from. Process-wide: a frame left by
+/// a previous daemon run has no entry and is simply rendered once, then found
+/// byte-identical by [`install_still`] and left alone.
+static RENDERED: Mutex<BTreeMap<String, StillKey>> = Mutex::new(BTreeMap::new());
+
+/// Bring `tag`'s fixed frame up to date with `w`, rendering only if needed.
+/// Sets `still_changed` when the frame's bytes actually changed. `None` when
+/// there is no frame to point `cosmic-bg` at.
+fn sync_still(w: &Wallpaper, dir: &Path, tag: &str, still_changed: &mut bool) -> Option<PathBuf> {
+    let dest = frame_path(dir, tag);
+    let key = still_key(w);
+    let rendered_from = RENDERED.lock().ok().and_then(|m| m.get(tag).cloned());
+    if can_reuse_still(rendered_from.as_ref(), key.as_ref(), dest.exists()) {
+        return Some(dest);
+    }
+    let rendered = super::overview::render_still(w)?;
+    let changed = install_still(&rendered, &dest);
+    // The scratch file is ours to drop now; `render_still` would only delete
+    // it at the start of its next call, which on COSMIC may be much later.
+    std::fs::remove_file(&rendered).ok();
+    *still_changed |= changed?;
+    if let (Some(key), Ok(mut memo)) = (key, RENDERED.lock()) {
+        memo.insert(tag.to_string(), key);
+    }
     Some(dest)
+}
+
+/// Put `rendered` (an `overview::render_still` scratch file) at `dest`.
+///
+/// Returns `Some(false)` when `dest` already holds exactly these bytes (it is
+/// then not touched at all), `Some(true)` when it was replaced, `None` when it
+/// could not be.
+///
+/// A copy rather than reusing `rendered` directly: `overview::render_still`
+/// deletes every `overview-*` file at the START of its NEXT call, so rendering
+/// several monitors in a row would delete an earlier monitor's frame before
+/// `cosmic-bg` ever read it. Replacement is tmp-file-plus-rename in the same
+/// directory, so a reader (`cosmic-bg` re-decoding after a reload) sees the
+/// old frame or the new one, never half of either.
+fn install_still(rendered: &Path, dest: &Path) -> Option<bool> {
+    if files_equal(rendered, dest) {
+        return Some(false);
+    }
+    let tmp = dest.with_file_name(format!(
+        ".{}.tmp-{}",
+        dest.file_name().and_then(|n| n.to_str())?,
+        std::process::id()
+    ));
+    std::fs::copy(rendered, &tmp).ok()?;
+    if std::fs::rename(&tmp, dest).is_err() {
+        std::fs::remove_file(&tmp).ok();
+        return None;
+    }
+    Some(true)
+}
+
+/// Whether two files have identical content; any I/O problem reads as "no".
+fn files_equal(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    if meta_a.len() != meta_b.len() {
+        return false;
+    }
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let mut buf_a = vec![0u8; 64 * 1024];
+    let mut buf_b = vec![0u8; 64 * 1024];
+    loop {
+        let n = match fa.read(&mut buf_a) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if n == 0 {
+            return true; // equal lengths, so `b` is at its end too
+        }
+        if fb.read_exact(&mut buf_b[..n]).is_err() || buf_a[..n] != buf_b[..n] {
+            return false;
+        }
+    }
 }
 
 /// Make `tag` (a connector name, or `"all"`) safe as a filename component.
@@ -265,7 +589,7 @@ const MAX_CONNECTOR_LEN: usize = 64;
 /// check existed).
 ///
 /// Unlike [`sanitize_filename_tag`] (which *replaces* unsafe characters so
-/// `stash_still`'s own cache filenames always succeed), this is a strict
+/// `frame_name`'s cache filenames always succeed), this is a strict
 /// allow-list gate: `write_backgrounds` skips (and logs) any connector that
 /// fails it entirely, rather than silently writing to some mangled-but-still
 /// real path. A hand-edited monitor key containing `/` or `..` could
@@ -288,7 +612,10 @@ const MAX_CONNECTOR_LEN: usize = 64;
 /// [`is_valid_relname`] for the second, independent gate on the restore
 /// side, in case a bad relname ever reaches the manifest some other way.
 fn is_valid_connector(connector: &str) -> bool {
+    // `all` is `cosmic-bg`'s name for the default entry and the tag of the
+    // global still: an output called `all` would share that frame file.
     !connector.is_empty()
+        && connector != "all"
         && connector.len() <= MAX_CONNECTOR_LEN
         && !connector.starts_with('.')
         && connector
@@ -463,14 +790,14 @@ fn render_string_list(names: &[String]) -> String {
 /// Write `bytes` to `path` atomically (temp file in the same directory, then
 /// rename). `cosmic-config` watches these files for live reload, so a torn
 /// write could hand `cosmic-bg` (or `cosmic-greeter`, mid-lock-screen render)
-/// a half-written RON blob.
-fn write_atomic(path: &Path, bytes: &[u8]) {
+/// a half-written RON blob. Returns whether the new content is in place.
+fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     let Some(dir) = path.parent() else {
-        return;
+        return false;
     };
     if let Err(e) = std::fs::create_dir_all(dir) {
         log::warn!("cosmic-bg: could not create {}: {e}", dir.display());
-        return;
+        return false;
     }
     let tmp = dir.join(format!(
         ".{}.tmp-{}",
@@ -481,14 +808,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) {
     ));
     if let Err(e) = std::fs::write(&tmp, bytes) {
         log::warn!("cosmic-bg: could not write {}: {e}", tmp.display());
-        return;
+        return false;
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         log::warn!(
             "cosmic-bg: could not replace {} with the new version: {e}",
             path.display()
         );
+        return false;
     }
+    true
 }
 
 /// Whether `text` (an existing `all`/`output.*` file's content) already
@@ -496,7 +825,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) {
 /// `overview::is_own_frame_list` does for the GNOME/Cinnamon schema. Used so a
 /// file already holding Fresco's own output is never mistaken for "the
 /// original" (e.g. the state directory was lost while Fresco's frame was
-/// live).
+/// live). A prefix match on purpose: it recognises the fixed names
+/// (`cosmic-bg-all.png`) and the timestamped ones 1.1.46 wrote
+/// (`cosmic-bg-all-<ms>.png`) alike, so an upgrade mid-session cannot make
+/// Fresco record its own old frame as the user's original.
 fn is_own_source(text: &str) -> bool {
     let marker = own_cache_dir().join(OUR_FRAME_PREFIX);
     text.contains(&marker.to_string_lossy().into_owned())
@@ -569,15 +901,31 @@ fn backup_and_write(root: &Path, state: &Path, relname: &str, bytes: &[u8]) {
     write_atomic(&root.join(relname), bytes);
 }
 
-fn write_entry(root: &Path, state: &Path, relname: &str, output_name: &str, still: &Path) {
+/// [`backup_and_write`], unless the file already holds exactly `bytes`.
+///
+/// This is what keeps `cosmic-bg` quiet: it reloads on any write event to its
+/// config files, even one that changes nothing, and a reload puts a new
+/// `cosmic-bg` surface above mpvpaper's (see the module doc). Returns whether
+/// the file was written.
+fn write_if_changed(root: &Path, state: &Path, relname: &str, bytes: &[u8]) -> bool {
+    if std::fs::read(root.join(relname)).is_ok_and(|current| current == bytes) {
+        return false;
+    }
+    backup_and_write(root, state, relname, bytes);
+    true
+}
+
+fn write_entry(root: &Path, state: &Path, relname: &str, output_name: &str, still: &Path) -> bool {
     let existing = std::fs::read_to_string(root.join(relname)).ok();
     let preserved = preserved_fields_from(existing.as_deref());
     let text = render_entry(output_name, still, &preserved);
-    backup_and_write(root, state, relname, text.as_bytes());
+    write_if_changed(root, state, relname, text.as_bytes())
 }
 
 /// The pure state-machine core: given already-rendered still-frame paths,
-/// decide exactly what to write and in what order.
+/// decide exactly what to write and in what order. Returns the names of the
+/// files whose text actually changed — empty when `cosmic-bg`'s config was
+/// already exactly right, in which case nothing at all is written.
 ///
 /// Kept free of `overview::render_still` (see [`apply_in`]) so it can be
 /// exercised with plain temp-directory fixtures and fake paths — no
@@ -598,9 +946,12 @@ fn write_backgrounds(
     same_on_all: bool,
     all_still: Option<&Path>,
     per_output: &[(String, PathBuf)],
-) {
+) -> Vec<String> {
+    let mut written = Vec::new();
     if let Some(still) = all_still {
-        write_entry(root, state, "all", "all", still);
+        if write_entry(root, state, "all", "all", still) {
+            written.push("all".to_string());
+        }
     }
     if !per_output.is_empty() {
         // Re-validated here, not just trusted from the caller: this is the
@@ -620,22 +971,29 @@ fn write_backgrounds(
                 continue;
             }
             let relname = format!("output.{connector}");
-            write_entry(root, state, &relname, connector, still);
+            if write_entry(root, state, &relname, connector, still) {
+                written.push(relname);
+            }
             names.push(connector.clone());
         }
-        backup_and_write(
+        if write_if_changed(
             root,
             state,
             "backgrounds",
             render_string_list(&names).as_bytes(),
-        );
+        ) {
+            written.push("backgrounds".to_string());
+        }
     }
-    backup_and_write(
+    if write_if_changed(
         root,
         state,
         "same-on-all",
         if same_on_all { b"true" } else { b"false" },
-    );
+    ) {
+        written.push("same-on-all".to_string());
+    }
+    written
 }
 
 /// Put every file recorded in `state`'s manifest back exactly, delete the
@@ -688,6 +1046,7 @@ fn restore_in(root: &Path, state: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     /// A fresh, empty temp directory for one test. Never under `~/.config` or
     /// `~/.local` — always `std::env::temp_dir()`, mirroring
@@ -1291,5 +1650,656 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&state).ok();
+    }
+
+    // --- stable frame paths ---------------------------------------------------
+
+    #[test]
+    fn frame_names_are_fixed_per_target_and_carry_no_timestamp() {
+        assert_eq!(frame_name("all"), "cosmic-bg-all.png");
+        assert_eq!(frame_name("eDP-1"), "cosmic-bg-eDP-1.png");
+        assert_eq!(frame_name("HDMI-A-1"), "cosmic-bg-HDMI-A-1.png");
+        // Asking twice must give the same answer — the whole point is that
+        // `cosmic-bg`'s config text stops changing between syncs.
+        assert_eq!(frame_name("eDP-1"), frame_name("eDP-1"));
+        let dir = Path::new("/home/u/.cache/fresco");
+        assert_eq!(
+            frame_path(dir, "all"),
+            Path::new("/home/u/.cache/fresco/cosmic-bg-all.png")
+        );
+    }
+
+    #[test]
+    fn distinct_targets_never_share_a_frame_file() {
+        let names: BTreeSet<String> = ["all", "eDP-1", "HDMI-A-1", "DP-2"]
+            .iter()
+            .map(|t| frame_name(t))
+            .collect();
+        assert_eq!(names.len(), 4);
+        // An output literally named `all` would collide with the global
+        // frame, so it is not a valid connector at all.
+        assert!(!is_valid_connector("all"));
+        assert!(is_valid_connector("all-1"));
+    }
+
+    // --- write only on change -------------------------------------------------
+
+    fn two_output_inputs() -> (PathBuf, Vec<(String, PathBuf)>) {
+        (
+            PathBuf::from("/fake/cache/cosmic-bg-all.png"),
+            vec![
+                (
+                    "eDP-1".to_string(),
+                    PathBuf::from("/fake/cache/cosmic-bg-eDP-1.png"),
+                ),
+                (
+                    "HDMI-A-1".to_string(),
+                    PathBuf::from("/fake/cache/cosmic-bg-HDMI-A-1.png"),
+                ),
+            ],
+        )
+    }
+
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().ino()
+    }
+
+    #[test]
+    fn an_unchanged_config_is_not_written_again() {
+        let root = tempdir("root-stable");
+        let state = tempdir("state-stable");
+        let (all, outs) = two_output_inputs();
+
+        let first = write_backgrounds(&root, &state, false, Some(&all), &outs);
+        assert_eq!(
+            first,
+            [
+                "all",
+                "output.eDP-1",
+                "output.HDMI-A-1",
+                "backgrounds",
+                "same-on-all"
+            ]
+        );
+
+        let names = [
+            "all",
+            "output.eDP-1",
+            "output.HDMI-A-1",
+            "backgrounds",
+            "same-on-all",
+        ];
+        let before: Vec<(String, u64)> = names
+            .iter()
+            .map(|n| (n.to_string(), inode(&root.join(n))))
+            .collect();
+        let manifest_before = std::fs::read_to_string(state.join("manifest")).unwrap();
+
+        // Same inputs again — what every sync after the first one looks like.
+        let second = write_backgrounds(&root, &state, false, Some(&all), &outs);
+        assert!(
+            second.is_empty(),
+            "nothing changed, nothing to write: {second:?}"
+        );
+
+        // A write is a tmp-file rename, which gives the file a new inode, so
+        // an unchanged inode proves no filesystem event reached `cosmic-bg`.
+        for (name, ino) in before {
+            assert_eq!(inode(&root.join(&name)), ino, "{name} was rewritten");
+        }
+        assert_eq!(
+            std::fs::read_to_string(state.join("manifest")).unwrap(),
+            manifest_before,
+            "an unchanged sync must not touch the backup record either"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn same_on_all_mode_is_equally_quiet_on_repeat() {
+        let root = tempdir("root-quiet-soa");
+        let state = tempdir("state-quiet-soa");
+        let all = PathBuf::from("/fake/cache/cosmic-bg-all.png");
+
+        let first = write_backgrounds(&root, &state, true, Some(&all), &[]);
+        assert_eq!(first, ["all", "same-on-all"]);
+        let second = write_backgrounds(&root, &state, true, Some(&all), &[]);
+        assert!(second.is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn only_the_file_whose_text_changed_is_rewritten() {
+        let root = tempdir("root-partial");
+        let state = tempdir("state-partial");
+        let (all, mut outs) = two_output_inputs();
+        write_backgrounds(&root, &state, false, Some(&all), &outs);
+        let edp_inode = inode(&root.join("output.eDP-1"));
+
+        // HDMI now points somewhere else; everything else is as before.
+        outs[1].1 = PathBuf::from("/fake/cache/elsewhere.png");
+        let changed = write_backgrounds(&root, &state, false, Some(&all), &outs);
+        assert_eq!(changed, ["output.HDMI-A-1"]);
+        assert_eq!(inode(&root.join("output.eDP-1")), edp_inode);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn switching_between_per_output_and_same_on_all_reports_the_mode_flip() {
+        let root = tempdir("root-flip");
+        let state = tempdir("state-flip");
+        let (all, outs) = two_output_inputs();
+        write_backgrounds(&root, &state, false, Some(&all), &outs);
+
+        // Overrides removed: `all` is unchanged, `backgrounds` is left inert,
+        // and only the mode flag differs.
+        let to_same = write_backgrounds(&root, &state, true, Some(&all), &[]);
+        assert_eq!(to_same, ["same-on-all"]);
+        // And back again: entries unchanged, only the flag differs.
+        let to_per_output = write_backgrounds(&root, &state, false, Some(&all), &outs);
+        assert_eq!(to_per_output, ["same-on-all"]);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn a_monitor_set_change_is_reported() {
+        let root = tempdir("root-monset");
+        let state = tempdir("state-monset");
+        let (all, mut outs) = two_output_inputs();
+        write_backgrounds(&root, &state, false, Some(&all), &outs);
+
+        outs.pop(); // HDMI override removed from Fresco's config
+        let changed = write_backgrounds(&root, &state, false, Some(&all), &outs);
+        assert_eq!(changed, ["backgrounds"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("backgrounds")).unwrap(),
+            "[\"eDP-1\"]"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn rendered_entries_are_a_fixed_point_of_the_preserved_field_round_trip() {
+        // Write-if-changed only works if rendering an entry from its own
+        // rendering gives the same text back; otherwise every sync would see
+        // a "change" and reload `cosmic-bg`.
+        let still = Path::new("/fake/cache/cosmic-bg-all.png");
+        for p in [
+            PreservedFields::default(),
+            PreservedFields {
+                rotation_frequency: 900,
+                filter_method: "Nearest".to_string(),
+                scaling_mode: "Fit((1.0, 0.5, 0.0))".to_string(),
+                sampling_method: "Random".to_string(),
+            },
+        ] {
+            let once = render_entry("all", still, &p);
+            let again = render_entry("all", still, &preserved_fields_from(Some(&once)));
+            assert_eq!(once, again);
+        }
+    }
+
+    #[test]
+    fn a_users_cosmetic_settings_survive_and_the_second_sync_is_still_quiet() {
+        let root = tempdir("root-cosmetic");
+        let state = tempdir("state-cosmetic");
+        let original = "(\n    output: \"all\",\n    source: Path(\"/usr/share/backgrounds/cosmic/orion.jpg\"),\n    filter_by_theme: true,\n    rotation_frequency: 900,\n    filter_method: Nearest,\n    scaling_mode: Fit((0.0, 0.0, 0.0)),\n    sampling_method: Random,\n)";
+        std::fs::write(root.join("all"), original).unwrap();
+        let all = PathBuf::from("/fake/cache/cosmic-bg-all.png");
+
+        assert_eq!(
+            write_backgrounds(&root, &state, true, Some(&all), &[]),
+            ["all", "same-on-all"]
+        );
+        let text = std::fs::read_to_string(root.join("all")).unwrap();
+        assert!(text.contains("rotation_frequency: 900"));
+        assert!(text.contains("filter_method: Nearest"));
+        assert!(text.contains("scaling_mode: Fit((0.0, 0.0, 0.0))"));
+        assert!(text.contains("sampling_method: Random"));
+
+        assert!(write_backgrounds(&root, &state, true, Some(&all), &[]).is_empty());
+
+        restore_in(&root, &state);
+        assert_eq!(std::fs::read_to_string(root.join("all")).unwrap(), original);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn many_stable_syncs_then_restore_still_returns_the_exact_originals() {
+        let root = tempdir("root-many");
+        let state = tempdir("state-many");
+        let original_all = "(\n    output: \"all\",\n    source: Path(\"/usr/share/backgrounds/original.jpg\"),\n    filter_by_theme: true,\n    rotation_frequency: 300,\n    filter_method: Lanczos,\n    scaling_mode: Zoom,\n    sampling_method: Alphanumeric,\n)";
+        std::fs::write(root.join("all"), original_all).unwrap();
+        std::fs::write(root.join("same-on-all"), "true").unwrap();
+        let (all, outs) = two_output_inputs();
+
+        write_backgrounds(&root, &state, false, Some(&all), &outs);
+        for _ in 0..5 {
+            assert!(write_backgrounds(&root, &state, false, Some(&all), &outs).is_empty());
+        }
+
+        restore_in(&root, &state);
+        assert_eq!(
+            std::fs::read_to_string(root.join("all")).unwrap(),
+            original_all
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("same-on-all")).unwrap(),
+            "true"
+        );
+        assert!(!root.join("output.eDP-1").exists());
+        assert!(!root.join("output.HDMI-A-1").exists());
+        assert!(!root.join("backgrounds").exists());
+        assert!(!state.exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- old timestamped frames are still Fresco's own --------------------------
+
+    #[test]
+    fn old_timestamped_and_new_fixed_frames_are_both_recognised_as_ours() {
+        let dir = own_cache_dir();
+        for name in [
+            "cosmic-bg-all-1790000000000.png",      // 1.1.46
+            "cosmic-bg-HDMI-A-1-1790000000001.png", // 1.1.46, per output
+            "cosmic-bg-all.png",                    // fixed name
+            "cosmic-bg-HDMI-A-1.png",
+        ] {
+            let text = format!("(\n    source: Path(\"{}\"),\n)", dir.join(name).display());
+            assert!(is_own_source(&text), "{name} should count as ours");
+        }
+        for foreign in [
+            "(\n    source: Path(\"/usr/share/backgrounds/cosmic/orion.jpg\"),\n)",
+            "(\n    source: Path(\"/home/u/Pictures/cosmic-bg-fan.png\"),\n)",
+        ] {
+            assert!(!is_own_source(foreign), "{foreign} is the user's");
+        }
+        // `overview`'s frames are a different module's.
+        let overview = format!(
+            "source: Path(\"{}\")",
+            dir.join("overview-1790000000000.png").display()
+        );
+        assert!(!is_own_source(&overview));
+    }
+
+    #[test]
+    fn a_file_holding_a_1_1_46_timestamped_frame_is_never_backed_up_as_the_original() {
+        let root = tempdir("root-old-ts");
+        let state = tempdir("state-old-ts");
+        let old = own_cache_dir().join("cosmic-bg-HDMI-A-1-1790000000001.png");
+        std::fs::write(
+            root.join("output.HDMI-A-1"),
+            format!(
+                "(\n    output: \"HDMI-A-1\",\n    source: Path(\"{}\"),\n)",
+                old.display()
+            ),
+        )
+        .unwrap();
+
+        backup_before_write(&root, &state, "output.HDMI-A-1");
+        let manifest = std::fs::read_to_string(state.join("manifest")).unwrap_or_default();
+        assert!(!manifest_has(&manifest, "output.HDMI-A-1"));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn upgrading_from_timestamped_to_fixed_names_keeps_the_true_original() {
+        // 1.1.46 left `all` pointing at a timestamped frame and recorded the
+        // user's real original in the manifest. The first sync with fixed
+        // names must rewrite the entry (the text differs) without disturbing
+        // that backup, and restore must still return the real original.
+        let root = tempdir("root-upgrade");
+        let state = tempdir("state-upgrade");
+        let user_original = "(\n    output: \"all\",\n    source: Path(\"/usr/share/backgrounds/cosmic/orion.jpg\"),\n    filter_by_theme: true,\n    rotation_frequency: 300,\n    filter_method: Lanczos,\n    scaling_mode: Zoom,\n    sampling_method: Alphanumeric,\n)";
+        std::fs::write(root.join("all"), user_original).unwrap();
+        std::fs::write(root.join("same-on-all"), "true").unwrap();
+
+        // What 1.1.46 would have done.
+        let old_frame = own_cache_dir().join("cosmic-bg-all-1790000000000.png");
+        write_backgrounds(&root, &state, true, Some(&old_frame), &[]);
+
+        let fixed = frame_path(&own_cache_dir(), "all");
+        let changed = write_backgrounds(&root, &state, true, Some(&fixed), &[]);
+        assert_eq!(changed, ["all"], "the entry moves to the fixed name once");
+        assert!(std::fs::read_to_string(root.join("all"))
+            .unwrap()
+            .contains("cosmic-bg-all.png"));
+
+        restore_in(&root, &state);
+        assert_eq!(
+            std::fs::read_to_string(root.join("all")).unwrap(),
+            user_original
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    // --- frame cache housekeeping -------------------------------------------------
+
+    #[test]
+    fn clear_stale_frames_drops_old_names_and_keeps_the_current_ones() {
+        let dir = tempdir("cache-clear");
+        for name in [
+            "cosmic-bg-all.png",
+            "cosmic-bg-eDP-1.png",
+            "cosmic-bg-all-1790000000000.png",
+            "cosmic-bg-eDP-1-1790000000000.png",
+            "cosmic-bg-DP-3.png", // an override that no longer exists
+            ".cosmic-bg-all.png.tmp-4242",
+            "overview-1790000000000.png",
+            "unrelated.txt",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let keep = BTreeSet::from([frame_name("all"), frame_name("eDP-1")]);
+
+        clear_stale_frames(&dir, &keep);
+
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "cosmic-bg-all.png",
+                "cosmic-bg-eDP-1.png",
+                "overview-1790000000000.png",
+                "unrelated.txt"
+            ]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_still_replaces_atomically_and_leaves_identical_bytes_alone() {
+        let dir = tempdir("cache-install");
+        let scratch = dir.join("scratch.png");
+        let dest = dir.join("cosmic-bg-all.png");
+
+        // First install creates the file.
+        std::fs::write(&scratch, b"frame one").unwrap();
+        assert_eq!(install_still(&scratch, &dest), Some(true));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"frame one");
+
+        // Same bytes again: reported unchanged and not touched.
+        let ino = inode(&dest);
+        assert_eq!(install_still(&scratch, &dest), Some(false));
+        assert_eq!(inode(&dest), ino);
+
+        // New bytes replace it, and no temp file is left behind.
+        std::fs::write(&scratch, b"frame two!").unwrap();
+        assert_eq!(install_still(&scratch, &dest), Some(true));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"frame two!");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // A missing source is a failure, and the existing frame survives it.
+        assert_eq!(install_still(&dir.join("absent.png"), &dest), None);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"frame two!");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn files_equal_compares_content_across_chunk_boundaries() {
+        let dir = tempdir("cache-equal");
+        let big = vec![7u8; 64 * 1024 * 2 + 5];
+        let mut other = big.clone();
+        *other.last_mut().unwrap() = 8; // differs only in the final byte
+        std::fs::write(dir.join("a"), &big).unwrap();
+        std::fs::write(dir.join("b"), &big).unwrap();
+        std::fs::write(dir.join("c"), &other).unwrap();
+        std::fs::write(dir.join("d"), &big[..big.len() - 1]).unwrap();
+
+        assert!(files_equal(&dir.join("a"), &dir.join("b")));
+        assert!(!files_equal(&dir.join("a"), &dir.join("c")));
+        assert!(
+            !files_equal(&dir.join("a"), &dir.join("d")),
+            "length differs"
+        );
+        assert!(!files_equal(&dir.join("a"), &dir.join("missing")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_rendered_still_is_reused_only_for_the_identical_source() {
+        let key = |src: &str, secs: u64, rot: u16| StillKey {
+            source: PathBuf::from(src),
+            modified: Some(UNIX_EPOCH + Duration::from_secs(secs)),
+            rotation: rot,
+        };
+        let a = key("/v/a.mp4", 10, 0);
+        assert!(can_reuse_still(Some(&a), Some(&a), true));
+        assert!(!can_reuse_still(Some(&a), Some(&a), false), "frame deleted");
+        assert!(!can_reuse_still(None, Some(&a), true), "never rendered");
+        assert!(!can_reuse_still(Some(&a), None, true), "source gone");
+        assert!(!can_reuse_still(
+            Some(&a),
+            Some(&key("/v/b.mp4", 10, 0)),
+            true
+        ));
+        assert!(!can_reuse_still(
+            Some(&a),
+            Some(&key("/v/a.mp4", 11, 0)),
+            true
+        ));
+        assert!(!can_reuse_still(
+            Some(&a),
+            Some(&key("/v/a.mp4", 10, 90)),
+            true
+        ));
+    }
+
+    // --- change -> respawn decision -----------------------------------------------
+
+    fn outcome(written: &[&str], still_changed: bool) -> SyncOutcome {
+        SyncOutcome {
+            config_written: written.iter().map(|s| s.to_string()).collect(),
+            still_changed,
+        }
+    }
+
+    #[test]
+    fn only_a_config_write_counts_as_a_cosmic_bg_reload() {
+        assert!(!outcome(&[], false).reloads_cosmic_bg());
+        assert!(
+            !outcome(&[], true).reloads_cosmic_bg(),
+            "a new PNG alone is invisible"
+        );
+        assert!(outcome(&["all"], false).reloads_cosmic_bg());
+        assert!(outcome(&["same-on-all"], true).reloads_cosmic_bg());
+    }
+
+    #[test]
+    fn a_reload_schedules_one_respawn_after_the_settle_delay() {
+        let t0 = Instant::now();
+        let mut t = ReloadTracker::default();
+        assert!(!t.respawn_due(t0), "nothing pending at the start");
+
+        t.note(&outcome(&["output.HDMI-A-1", "backgrounds"], false), t0);
+        assert!(
+            !t.respawn_due(t0),
+            "not before cosmic-bg has had time to draw"
+        );
+        assert!(!t.respawn_due(t0 + SETTLE - Duration::from_millis(1)));
+        assert!(t.respawn_due(t0 + SETTLE));
+        assert!(!t.respawn_due(t0 + SETTLE * 2), "consumed: it fires once");
+    }
+
+    #[test]
+    fn a_burst_of_reloads_collapses_into_one_respawn_after_the_last() {
+        let t0 = Instant::now();
+        let mut t = ReloadTracker::default();
+        t.note(&outcome(&["all"], false), t0);
+        t.note(
+            &outcome(&["same-on-all"], false),
+            t0 + Duration::from_millis(500),
+        );
+
+        // The first reload's deadline passes while the second one's has not.
+        assert!(!t.respawn_due(t0 + SETTLE));
+        assert!(t.respawn_due(t0 + Duration::from_millis(500) + SETTLE));
+    }
+
+    #[test]
+    fn a_quiet_sync_never_schedules_a_respawn() {
+        let t0 = Instant::now();
+        let mut t = ReloadTracker::default();
+        t.note(&outcome(&[], false), t0);
+        assert!(!t.respawn_due(t0 + SETTLE * 10));
+    }
+
+    #[test]
+    fn a_quiet_sync_does_not_cancel_a_respawn_already_pending() {
+        let t0 = Instant::now();
+        let mut t = ReloadTracker::default();
+        t.note(&outcome(&["all"], false), t0);
+        t.note(&outcome(&[], false), t0 + Duration::from_millis(100));
+        assert!(t.respawn_due(t0 + SETTLE));
+    }
+
+    #[test]
+    fn a_new_still_without_a_config_change_marks_the_lock_frame_stale_but_respawns_nothing() {
+        let t0 = Instant::now();
+        let mut t = ReloadTracker::default();
+        assert!(!t.frame_stale());
+        t.note(&outcome(&[], true), t0);
+        assert!(t.frame_stale());
+        assert!(
+            !t.respawn_due(t0 + SETTLE * 10),
+            "the video must not be touched"
+        );
+
+        // A quiet sync afterwards does not forget the staleness.
+        t.note(&outcome(&[], false), t0 + Duration::from_secs(5));
+        assert!(t.frame_stale());
+
+        // A reload re-reads the still, so the frame is fresh again.
+        t.note(
+            &outcome(&["same-on-all"], false),
+            t0 + Duration::from_secs(10),
+        );
+        assert!(!t.frame_stale());
+    }
+
+    #[test]
+    fn startup_waits_for_cosmic_bg_instead_of_respawning() {
+        let t0 = Instant::now();
+        let mut t = ReloadTracker::default();
+        assert_eq!(
+            t.note_before_spawn(&outcome(&["all", "same-on-all"], true), t0),
+            Some(SETTLE)
+        );
+        assert!(
+            !t.respawn_due(t0 + SETTLE * 10),
+            "no mpvpaper existed yet, so there is nothing to respawn"
+        );
+        assert!(!t.frame_stale(), "the reload read the new still");
+
+        let mut quiet = ReloadTracker::default();
+        assert_eq!(quiet.note_before_spawn(&outcome(&[], false), t0), None);
+        // A restart after a crash can find the config already right but the
+        // still changed: no wait needed, yet the lock frame is stale.
+        assert_eq!(quiet.note_before_spawn(&outcome(&[], true), t0), None);
+        assert!(quiet.frame_stale());
+    }
+
+    #[test]
+    fn reset_forgets_a_pending_respawn_and_staleness() {
+        let t0 = Instant::now();
+        let mut t = ReloadTracker::default();
+        t.note(&outcome(&["all"], true), t0);
+        t.note(&outcome(&[], true), t0);
+        t.reset();
+        assert!(!t.respawn_due(t0 + SETTLE * 10));
+        assert!(!t.frame_stale());
+    }
+
+    // --- forced reload at lock time ---------------------------------------------
+
+    #[test]
+    fn lock_time_forces_a_reload_only_when_the_frame_is_stale_and_nothing_reloaded() {
+        // (reloaded already?, still changed, tracker says stale) -> force?
+        assert!(
+            !needs_forced_reload(&outcome(&[], false), false),
+            "nothing to show"
+        );
+        assert!(
+            needs_forced_reload(&outcome(&[], true), false),
+            "new still just rendered"
+        );
+        assert!(
+            needs_forced_reload(&outcome(&[], false), true),
+            "stale from earlier"
+        );
+        assert!(
+            !needs_forced_reload(&outcome(&["all"], true), true),
+            "the sync itself already reloaded cosmic-bg"
+        );
+    }
+
+    #[test]
+    fn a_forced_reload_rewrites_same_on_all_with_identical_text() {
+        let root = tempdir("root-reload");
+        let state = tempdir("state-reload");
+        // The user had per-output mode on, so the sync really rewrites the flag.
+        let original = "false";
+        std::fs::write(root.join("same-on-all"), original).unwrap();
+
+        // Nothing applied yet (no backup record): refuse to touch anything.
+        assert!(!force_reload_in(&root, &state));
+        let untouched = inode(&root.join("same-on-all"));
+
+        let all = PathBuf::from("/fake/cache/cosmic-bg-all.png");
+        write_backgrounds(&root, &state, true, Some(&all), &[]);
+        let after_apply = inode(&root.join("same-on-all"));
+        assert_ne!(after_apply, untouched);
+
+        assert!(force_reload_in(&root, &state));
+        assert_ne!(
+            inode(&root.join("same-on-all")),
+            after_apply,
+            "a new inode is the rename event cosmic-config reports"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("same-on-all")).unwrap(),
+            "true",
+            "content must not change"
+        );
+
+        // And restore is unaffected by any number of forced reloads.
+        assert!(force_reload_in(&root, &state));
+        restore_in(&root, &state);
+        assert_eq!(
+            std::fs::read_to_string(root.join("same-on-all")).unwrap(),
+            original
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
