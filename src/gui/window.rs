@@ -121,6 +121,7 @@ fn discard_draft(state: &Rc<RefCell<AppState>>) {
     if let Some(thumb) = &draft.thumbnail {
         std::fs::remove_file(thumb).ok();
     }
+    super::preview_proxy::remove_for(&draft.id);
     let downloads_dir = library::library_dir().join("downloads");
     for p in draft.path.iter().chain(draft.paths.iter()) {
         if p.starts_with(&downloads_dir) {
@@ -327,6 +328,11 @@ fn build_ui(app: &adw::Application) {
             theme::apply(s.config.accent, theme::resolve_dark(s.config.theme_mode));
         });
     }
+
+    // Before any card exists: settles whether hover previews are on (the saved
+    // switch, or off if the last run died showing one) so the cards built below
+    // attach to the right policy.
+    super::hover_preview::startup(app.upcast_ref(), &state);
 
     let stack = gtk4::Stack::new();
     stack.set_transition_type(gtk4::StackTransitionType::SlideLeftRight);
@@ -1599,6 +1605,25 @@ fn build_behavior_page(state: &Rc<RefCell<AppState>>) -> gtk4::Box {
             }
         },
     ));
+    // Hover previews decode video inside the GUI process. Off is a complete
+    // off: nothing plays and no preview clips are made. Fresco flips this
+    // itself when it finds it crashed while one was showing (see
+    // `hover_preview::startup`).
+    popover_box.append(&switch_row(
+        t!("Video previews on hover"),
+        state.borrow().config.hover_previews,
+        {
+            let state2 = state.clone();
+            move |active| {
+                {
+                    let mut s = state2.borrow_mut();
+                    s.config.hover_previews = active;
+                    s.config.save().ok();
+                }
+                super::hover_preview::set_enabled(active);
+            }
+        },
+    ));
     popover_box.append(&switch_row(
         t!("Share anonymous usage statistics"),
         state.borrow().config.telemetry,
@@ -2696,12 +2721,19 @@ fn build_library_card(
 
     // Video/GIF cards play a muted, looping preview while hovered. Rotated
     // entries keep their static (rotated) thumbnail instead: GTK's MediaFile
-    // can't rotate, and motion in the WRONG orientation reads as a bug.
+    // can't rotate, and motion in the WRONG orientation reads as a bug
+    // (`request_for` returns nothing for them).
     // A pending card stays inert; the queue's closing refresh rebuilds it with
     // the preview attached.
-    if !pending && entry.rotation.unwrap_or(0).is_multiple_of(360) {
-        if let Some(video) = preview_video_path(entry) {
-            super::hover_preview::attach(&overlay, &pic, video);
+    //
+    // What plays is decided at hover time, not here: a large video plays a
+    // small proxy clip rather than the file itself (see `preview_proxy`), and
+    // whether that clip exists yet changes while the card is on screen.
+    if !pending {
+        if let Some(request) = super::preview_proxy::request_for(entry) {
+            super::hover_preview::attach(&overlay, &pic, move || {
+                super::preview_proxy::select(&request)
+            });
         }
     }
 
@@ -2752,16 +2784,6 @@ fn entry_category(entry: &LibraryEntry) -> Category {
                 Category::Videos
             }
         }
-    }
-}
-
-/// The video file to preview on hover, if this entry is a (non-slideshow) video
-/// or GIF. Images and slideshows have nothing to play.
-fn preview_video_path(entry: &LibraryEntry) -> Option<PathBuf> {
-    match entry.kind {
-        Kind::Video => entry.path.clone(),
-        Kind::Playlist => entry.paths.first().cloned(),
-        _ => None,
     }
 }
 
@@ -3291,6 +3313,7 @@ fn remove_entry_by_idx(state: Rc<RefCell<AppState>>, idx: usize) {
         if let Some(thumb) = &entry.thumbnail {
             std::fs::remove_file(thumb).ok();
         }
+        super::preview_proxy::remove_for(&entry.id);
         save_entries(&s.entries).ok();
     }
     // Removing the wallpaper that's on screen must also take it off screen.
@@ -3408,6 +3431,7 @@ fn remove_entries_by_ids(state: Rc<RefCell<AppState>>, ids: &std::collections::H
             if let Some(thumb) = &e.thumbnail {
                 std::fs::remove_file(thumb).ok();
             }
+            super::preview_proxy::remove_for(&e.id);
         }
         save_entries(&s.entries).ok();
         s.selection = None;
@@ -8402,6 +8426,16 @@ fn build_language_row(state: Rc<RefCell<AppState>>, subtitle: gtk4::Label) -> gt
 pub(crate) fn show_toast(state: &Rc<RefCell<AppState>>, msg: &str) {
     let toast = adw::Toast::new(msg);
     toast.set_timeout(4);
+    state.borrow().toast.add_toast(toast);
+}
+
+/// A toast that stays until the user dismisses it: for a message too long to
+/// read in four seconds and too consequential to miss. The button carries no
+/// action of its own; pressing it just closes the toast.
+pub(crate) fn show_sticky_toast(state: &Rc<RefCell<AppState>>, msg: &str) {
+    let toast = adw::Toast::new(msg);
+    toast.set_button_label(Some(t!("Dismiss")));
+    toast.set_timeout(0);
     state.borrow().toast.add_toast(toast);
 }
 

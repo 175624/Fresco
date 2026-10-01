@@ -1713,6 +1713,16 @@ pub struct Config {
     /// me" means, and a user should not have to find a TOML file to do it.
     #[serde(default = "default_true")]
     pub feedback_reminders: bool,
+    /// Library cards play a muted, looping preview while hovered.
+    ///
+    /// A Settings switch, and also the thing Fresco itself turns off when it
+    /// finds it died while a preview was showing (see
+    /// `gui::hover_preview::startup`): a preview is a GTK video decoder living
+    /// inside the GUI process, and on a few GPU/driver pairings GTK's renderer
+    /// takes the whole app down with it. Off is a complete off — no decoder,
+    /// no proxy clips generated, the card just keeps its thumbnail.
+    #[serde(default = "default_true")]
+    pub hover_previews: bool,
     /// Full anonymous usage telemetry (daily ping with a random install id,
     /// feature counts, error kinds). Opt-out via the Settings switch or
     /// config.toml. False does NOT mean total silence: see
@@ -1881,6 +1891,7 @@ impl Default for Config {
             first_run_epoch: 0,
             feedback_prompted: false,
             feedback_reminders: true,
+            hover_previews: true,
             telemetry: true,
             telemetry_prompted: false,
             telemetry_consent_version: 0,
@@ -2114,6 +2125,24 @@ mod tests {
         // get the peek — that is the whole fix for the Deepin icon report.
         assert_eq!(cfg.dde_icon_peek_secs, DEFAULT_DDE_ICON_PEEK_SECS);
         assert_ne!(DEFAULT_DDE_ICON_PEEK_SECS, 0);
+    }
+
+    /// Hover previews are on for everyone who never touched the switch — an
+    /// upgrade must not silently turn the feature off — and an explicit `false`
+    /// (the user's choice, or the crash sentinel's) survives a save/load.
+    #[test]
+    fn hover_previews_default_on_and_round_trip_off() {
+        assert!(Config::default().hover_previews);
+        let absent: Config = toml::from_str("autostart = true").unwrap();
+        assert!(
+            absent.hover_previews,
+            "an old config.toml lost the previews"
+        );
+
+        let off: Config = toml::from_str("hover_previews = false").unwrap();
+        assert!(!off.hover_previews);
+        let back: Config = toml::from_str(&toml::to_string(&off).unwrap()).unwrap();
+        assert!(!back.hover_previews, "the off switch did not persist");
     }
 
     /// An explicit `0` must survive; it is the documented "never yield" escape

@@ -125,6 +125,24 @@ fn doctor() -> i32 {
     if let Some(n) = st.as_ref().map(|s| s.monitors.len()).filter(|n| *n > 0) {
         println!("  Outputs       {n}");
     }
+    // The GUI's toolkit, as a bug report needs it. The version functions read
+    // constants out of the loaded library, so no display is opened and this
+    // works over SSH and in a container.
+    #[cfg(feature = "gui")]
+    println!("  GTK           {}", gtk_version_label());
+    if let Some(r) = std::env::var("GSK_RENDERER")
+        .ok()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+    {
+        println!("  GSK renderer  {r} {DIM}(from GSK_RENDERER){RESET}");
+    }
+    if let Ok(cfg) = Config::load() {
+        println!(
+            "  Hover preview {}",
+            if cfg.hover_previews { "on" } else { "off" }
+        );
+    }
 
     println!("\n{BOLD}Checks{RESET}");
     let mut problems = 0u32;
@@ -373,6 +391,17 @@ fn which(bin: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
         .unwrap_or(false)
+}
+
+/// The GTK runtime version, e.g. `4.14.5`. Needs no `gtk::init`.
+#[cfg(feature = "gui")]
+fn gtk_version_label() -> String {
+    format!(
+        "{}.{}.{}",
+        gtk4::major_version(),
+        gtk4::minor_version(),
+        gtk4::micro_version()
+    )
 }
 
 fn gpu_name() -> Option<String> {
