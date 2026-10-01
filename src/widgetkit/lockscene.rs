@@ -1394,6 +1394,7 @@ mod tests {
         let greeting = GreetingData {
             text: "Good evening, Roy",
             avatar: Some(&avatar),
+            initials: "R",
             text_size: 20.0,
         };
         let media = NowPlayingData {

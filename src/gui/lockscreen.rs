@@ -672,14 +672,14 @@ fn add_look_group(
         });
     }
 
-    // The real name needs `userinfo::current()` (a couple of bounded but
+    // The real name needs `userinfo::current_identity()` (a couple of bounded but
     // real `gdbus` round trips), so it is resolved exactly once, off the GTK
     // thread, and only ever *upgrades* the placeholder already showing the
     // time-only phrase — never blocks opening this page on it.
     {
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let info = userinfo::current();
+            let info = userinfo::current_identity();
             let _ = tx.send_blocking(userinfo::first_name(&info));
         });
         glib::spawn_future_local(async move {

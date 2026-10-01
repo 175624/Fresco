@@ -16,9 +16,13 @@
 //!   [`userinfo::first_name`] of a [`UserInfo`] resolved **once**, at
 //!   [`LockEngine::new`] — matching `userinfo`'s own "once per lock" contract,
 //!   not the render loop's cadence.
-//! * **Avatar** — decoded once, into an [`Arc<RgbaImage>`] cheap to clone into
-//!   a borrow every tick, and only when [`LockWidget::Avatar`] is on; a
-//!   session with it off never touches the filesystem for it at all.
+//! * **Avatar** — looked up and decoded once, into an [`Arc<RgbaImage>`] cheap
+//!   to clone into a borrow every tick, and only when [`LockWidget::Avatar`]
+//!   is on; a session with it off never looks for the picture at all
+//!   ([`userinfo::current_identity`]). The lookup lives in [`userinfo`], the
+//!   square crop and size bound in [`super::avatar`]; with no picture (or one
+//!   that does not decode) the greeting's disc carries
+//!   [`userinfo::initials`].
 //! * **Battery** — [`battery::read`] every [`BATTERY_POLL`] (10s); `None`
 //!   hides the chip rather than showing a stale or fabricated reading.
 //! * **Media** — the caller's own now-playing [`widgets::Snapshot`] (the
@@ -315,7 +319,12 @@ impl LockEngine {
         theme: Theme,
     ) -> Self {
         let wants_avatar = resolved.widgets.contains(&LockWidget::Avatar);
-        let user = userinfo::current();
+        // The picture is only looked for when the Avatar widget is on.
+        let user = if wants_avatar {
+            userinfo::current()
+        } else {
+            userinfo::current_identity()
+        };
         let avatar = if wants_avatar {
             decode_avatar(&user)
         } else {
@@ -591,10 +600,11 @@ pub(super) fn slots_for(resolved: &ResolvedLock) -> Vec<LockSlot> {
     slots
 }
 
+/// Decode the picture [`userinfo::current`] found for `user`, square-cropped
+/// and bounded (see [`super::avatar`]). `None` — no picture, or one that does
+/// not decode — is not an error: the greeting then draws the user's initials.
 pub(super) fn decode_avatar(user: &UserInfo) -> Option<Arc<RgbaImage>> {
-    let path = user.avatar.as_ref()?;
-    let img = image::open(path).ok()?;
-    Some(Arc::new(img.into_rgba8()))
+    super::avatar::decode_avatar_file(user.avatar.as_deref()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +618,8 @@ pub(super) struct OwnedData {
     clock_text: clock::ClockText,
     clock_style: ClockStyle,
     greeting: Option<String>,
+    /// The letters the greeting's avatar disc carries when `avatar` is `None`.
+    initials: String,
     avatar: Option<Arc<RgbaImage>>,
     media: Option<OwnedMedia>,
     battery: Option<BatteryData>,
@@ -635,6 +647,7 @@ impl OwnedData {
             greeting: self.greeting.as_deref().map(|text| GreetingData {
                 text,
                 avatar: self.avatar.as_deref(),
+                initials: &self.initials,
                 text_size: 0.0, // `render_slot`/`compose` size this themselves.
             }),
             media: self.media.as_ref().map(|m| NowPlayingData {
@@ -750,6 +763,7 @@ fn build_owned_data_at(
         clock_text,
         clock_style: clock_style.clone(),
         greeting,
+        initials: userinfo::initials(user),
         avatar: avatar.clone(),
         media,
         battery: battery_data,
@@ -790,7 +804,11 @@ fn slot_key(slot: LockSlot, data: &LockSceneData, out: (u32, u32)) -> ContentKey
         }
         LockSlot::Greeting => {
             let g = data.greeting.as_ref();
-            ContentKey::of((g.map(|g| g.text), g.map(|g| g.avatar.is_some()), out))
+            ContentKey::of((
+                g.map(|g| (g.text, g.initials)),
+                g.map(|g| g.avatar.is_some()),
+                out,
+            ))
         }
         LockSlot::Media => {
             let m = data.media.as_ref();
@@ -1208,6 +1226,103 @@ mod tests {
         ));
         engine.set_frames_dir(dir);
         engine
+    }
+
+    // -- the greeting's avatar / initials ---------------------------------------
+
+    fn user_with(avatar: Option<PathBuf>) -> UserInfo {
+        UserInfo {
+            login: "roy".to_string(),
+            real_name: Some("Roy Das".to_string()),
+            avatar,
+        }
+    }
+
+    fn greeting_data_for(user: &UserInfo, avatar: &Option<Arc<RgbaImage>>) -> OwnedData {
+        // A pinned instant, so the greeting text cannot change between two
+        // calls in one test because an hour boundary fell between them.
+        build_owned_data_at(
+            fixed_time(0),
+            &[LockSlot::Greeting],
+            &ClockStyle::default(),
+            &GreetingText::Auto,
+            user,
+            avatar,
+            false,
+            false,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_user_with_no_picture_gets_their_own_initials_not_the_greetings_letter() {
+        let user = user_with(None);
+        let avatar = decode_avatar(&user);
+        assert!(avatar.is_none());
+        let owned = greeting_data_for(&user, &avatar);
+        let scene = owned.as_scene_data(theme());
+        let g = scene
+            .greeting
+            .expect("a greeting slot yields greeting data");
+        assert!(g.avatar.is_none());
+        // "Good …" would have put a "G" in the disc.
+        assert_eq!(g.initials, "RD");
+        assert!(g.text.contains("Roy"), "{:?}", g.text);
+    }
+
+    #[test]
+    fn a_user_with_a_picture_gets_it_decoded_square_and_handed_to_the_greeting() {
+        let dir = test_dir("avatar-picture");
+        let path = dir.join("face.png");
+        RgbaImage::from_pixel(80, 40, image::Rgba([10, 20, 30, 255]))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        let user = user_with(Some(path));
+        let avatar = decode_avatar(&user).expect("a PNG decodes");
+        assert_eq!(avatar.dimensions(), (40, 40), "centre-cropped to a square");
+        let owned = greeting_data_for(&user, &Some(avatar));
+        let scene = owned.as_scene_data(theme());
+        assert!(scene.greeting.unwrap().avatar.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_avatar_path_that_will_not_decode_degrades_to_initials() {
+        let dir = test_dir("avatar-svg");
+        let path = dir.join("face.svg");
+        std::fs::write(&path, "<svg xmlns=\"http://www.w3.org/2000/svg\"/>").unwrap();
+        let user = user_with(Some(path));
+        assert!(decode_avatar(&user).is_none());
+        let owned = greeting_data_for(&user, &None);
+        let scene = owned.as_scene_data(theme());
+        let g = scene.greeting.unwrap();
+        assert!(g.avatar.is_none());
+        assert_eq!(g.initials, "RD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_greeting_slot_redraws_when_the_picture_or_the_initials_change() {
+        let out = (320, 200);
+        let key = |user: &UserInfo, avatar: Option<Arc<RgbaImage>>| {
+            let owned = greeting_data_for(user, &avatar);
+            let scene = owned.as_scene_data(theme());
+            slot_key(LockSlot::Greeting, &scene, out)
+        };
+        let roy = user_with(None);
+        let mut ada = user_with(None);
+        ada.real_name = Some("Ada Lovelace".to_string());
+        let pic = Some(Arc::new(RgbaImage::new(8, 8)));
+
+        assert_eq!(key(&roy, None), key(&roy, None), "stable for equal data");
+        assert_ne!(key(&roy, None), key(&roy, pic.clone()));
+        // Same greeting text ("Good …, <first name>") is not the whole story:
+        // different people differ in their initials even if a greeting repeats.
+        let mut same_first = user_with(None);
+        same_first.real_name = Some("Roy Smith".to_string());
+        assert_ne!(key(&roy, None), key(&same_first, None));
+        assert_ne!(key(&roy, None), key(&ada, None));
     }
 
     // -- arrangement_for / ReservedZoneKind -----------------------------------
