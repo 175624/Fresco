@@ -139,6 +139,12 @@ struct PillWidgets {
     hwdec: gtk4::Label,
     toggle: gtk4::Button,
     pill: gtk4::Box,
+    /// This session only ever paints a still frame (GNOME Wayland): the daemon
+    /// reports "running" for it, but nothing is playing and Pause/Resume are
+    /// no-ops, so the pill must not say PLAYING or offer a pause button.
+    /// Derived from the session capability once at build — `StatusReply`
+    /// cannot say it, and no IPC change is needed.
+    still_frame: bool,
 }
 
 /// Build the status pill (dot + wallpaper name + hwdec badge + CPU% + a
@@ -186,6 +192,8 @@ pub fn build_status_pill() -> gtk4::Widget {
         hwdec,
         toggle: toggle.clone(),
         pill: pill.clone(),
+        still_frame: crate::capability::detect()
+            == crate::capability::Capability::WaylandGnomeStatic,
     });
 
     {
@@ -292,13 +300,11 @@ fn apply_status(w: &PillWidgets, status: &StatusReply) {
     // `daemon::WlOutput::supervise`) must not say PLAYING — the dot already
     // turns amber for it via `status.error`, but the overline used to keep
     // claiming the wallpaper was animating right through a give-up.
-    w.overline.set_label(if !status.gave_up.is_empty() {
-        t!("NEEDS ATTENTION")
-    } else if status.paused {
-        t!("PAUSED")
-    } else {
-        t!("PLAYING")
-    });
+    w.overline.set_label(pill_overline(
+        !status.gave_up.is_empty(),
+        status.paused,
+        w.still_frame,
+    ));
     w.overline.set_visible(true);
     let name = status
         .wallpaper
@@ -314,7 +320,7 @@ fn apply_status(w: &PillWidgets, status: &StatusReply) {
         _ => w.hwdec.set_visible(false),
     }
 
-    w.toggle.set_visible(true);
+    w.toggle.set_visible(pill_shows_toggle(w.still_frame));
     if status.paused {
         w.toggle.set_icon_name("media-playback-start-symbolic");
         w.toggle.set_tooltip_text(Some(t!("Resume")));
@@ -329,6 +335,28 @@ fn apply_status(w: &PillWidgets, status: &StatusReply) {
         tip.push_str(err);
     }
     w.pill.set_tooltip_text(Some(&tip));
+}
+
+/// The pill's state overline for a running daemon. A give-up outranks
+/// everything; after that a still-frame session says so rather than PLAYING
+/// (GNOME Wayland paints one frame and never animates it, whatever `paused`
+/// says), then paused, then playing.
+fn pill_overline(gave_up: bool, paused: bool, still_frame: bool) -> &'static str {
+    if gave_up {
+        t!("NEEDS ATTENTION")
+    } else if still_frame {
+        t!("STILL FRAME")
+    } else if paused {
+        t!("PAUSED")
+    } else {
+        t!("PLAYING")
+    }
+}
+
+/// Pause/Resume only mean something when something is playing; on a
+/// still-frame session the daemon ignores both, so don't offer the button.
+fn pill_shows_toggle(still_frame: bool) -> bool {
+    !still_frame
 }
 
 /// Prettify the daemon-reported wallpaper name for the pill: strip a trailing
@@ -374,5 +402,40 @@ fn hwdec_label(raw: &str) -> &str {
         "vdpau" => "VDPAU",
         "drm" => "DRM",
         _ => raw,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overline_says_playing_or_paused_on_a_live_session() {
+        assert_eq!(pill_overline(false, false, false), "PLAYING");
+        assert_eq!(pill_overline(false, true, false), "PAUSED");
+    }
+
+    /// GNOME Wayland reports `running: true, paused: false` for a wallpaper
+    /// that is one frozen frame; the pill must not call that PLAYING.
+    #[test]
+    fn overline_says_still_frame_on_a_still_frame_session() {
+        assert_eq!(pill_overline(false, false, true), "STILL FRAME");
+        // `paused` is meaningless there (Pause is a no-op) and must not leak.
+        assert_eq!(pill_overline(false, true, true), "STILL FRAME");
+    }
+
+    #[test]
+    fn a_give_up_outranks_every_other_state() {
+        for paused in [false, true] {
+            for still_frame in [false, true] {
+                assert_eq!(pill_overline(true, paused, still_frame), "NEEDS ATTENTION");
+            }
+        }
+    }
+
+    #[test]
+    fn pause_toggle_is_hidden_only_on_a_still_frame_session() {
+        assert!(pill_shows_toggle(false));
+        assert!(!pill_shows_toggle(true));
     }
 }

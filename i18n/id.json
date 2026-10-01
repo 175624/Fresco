@@ -320,7 +320,6 @@
   "Of day": "Progres hari ini",
   "Off": "Nonaktif",
   "On AC power only": "Hanya saat dicolokkan",
-  "On GNOME Wayland, wallpapers are shown as a static frame. For live playback, use an X11 session or a layer-shell compositor (COSMIC, Hyprland, Sway, KDE Plasma).": "Di GNOME Wayland, wallpaper hanya ditampilkan sebagai gambar statis. Untuk pemutaran langsung, gunakan sesi X11 atau compositor layer-shell (COSMIC, Hyprland, Sway, KDE Plasma).",
   "One entry per file. Keep one up for days and switch when the mood strikes.": "Satu entri per berkas. Bisa dibiarkan sama selama berhari-hari dan diganti kapan saja Anda mau.",
   "One entry per image or video in the folder, so you can pick between them.": "Satu entri untuk setiap gambar atau video dalam folder, sehingga Anda bisa memilih di antaranya.",
   "One oversized time that fills the screen": "Satu waktu yang sangat besar dan mengisi seluruh layar",

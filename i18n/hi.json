@@ -320,7 +320,6 @@
   "Of day": "दिन का",
   "Off": "बंद",
   "On AC power only": "केवल चार्जिंग पर",
-  "On GNOME Wayland, wallpapers are shown as a static frame. For live playback, use an X11 session or a layer-shell compositor (COSMIC, Hyprland, Sway, KDE Plasma).": "GNOME Wayland पर, वॉलपेपर केवल स्थिर फ़्रेम के रूप में दिखते हैं। लाइव प्लेबैक के लिए X11 सेशन या layer-shell कंपोज़िटर (COSMIC, Hyprland, Sway, KDE Plasma) का उपयोग करें।",
   "One entry per file. Keep one up for days and switch when the mood strikes.": "हर फ़ाइल के लिए एक अलग प्रविष्टि। एक वॉलपेपर को दिनों तक लगा रहने दें और मन करे तो बदल लें।",
   "One entry per image or video in the folder, so you can pick between them.": "फ़ोल्डर के हर इमेज या वीडियो के लिए एक अलग प्रविष्टि, ताकि आप उनमें से चुन सकें।",
   "One oversized time that fills the screen": "एक बहुत बड़ा समय जो पूरी स्क्रीन भर देता है",

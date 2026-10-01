@@ -320,7 +320,6 @@
   "Of day": "今日进度",
   "Off": "关闭",
   "On AC power only": "仅接通电源时",
-  "On GNOME Wayland, wallpapers are shown as a static frame. For live playback, use an X11 session or a layer-shell compositor (COSMIC, Hyprland, Sway, KDE Plasma).": "在 GNOME Wayland 下，壁纸只显示为静态画面。如需动态播放，请使用 X11 会话或支持 layer-shell 的合成器（COSMIC、Hyprland、Sway、KDE Plasma）。",
   "One entry per file. Keep one up for days and switch when the mood strikes.": "每个文件一张壁纸。可以挂着一张用上几天，想换的时候再换。",
   "One entry per image or video in the folder, so you can pick between them.": "文件夹里每个图片或视频各建一张壁纸，方便你逐张挑选。",
   "One oversized time that fills the screen": "超大时间铺满整个屏幕",

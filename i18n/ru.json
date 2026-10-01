@@ -320,7 +320,6 @@
   "Of day": "От дня",
   "Off": "Выключено",
   "On AC power only": "Только от сети",
-  "On GNOME Wayland, wallpapers are shown as a static frame. For live playback, use an X11 session or a layer-shell compositor (COSMIC, Hyprland, Sway, KDE Plasma).": "В GNOME на Wayland обои показываются статичным кадром. Для живого воспроизведения используйте сессию X11 или композитор с layer-shell (COSMIC, Hyprland, Sway, KDE Plasma).",
   "One entry per file. Keep one up for days and switch when the mood strikes.": "Отдельная запись для каждого файла. Держите одни обои неделями и меняйте по настроению.",
   "One entry per image or video in the folder, so you can pick between them.": "Отдельная запись для каждого изображения или видео в папке — можно выбирать между ними.",
   "One oversized time that fills the screen": "Одно огромное время, заполняющее весь экран",

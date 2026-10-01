@@ -320,7 +320,6 @@
   "Of day": "Gün ilerlemesi",
   "Off": "Kapalı",
   "On AC power only": "Yalnızca güç adaptöründeyken",
-  "On GNOME Wayland, wallpapers are shown as a static frame. For live playback, use an X11 session or a layer-shell compositor (COSMIC, Hyprland, Sway, KDE Plasma).": "GNOME Wayland’da duvar kâğıtları sabit bir kare olarak gösterilir. Canlı oynatma için X11 oturumu veya layer-shell destekli bir pencere yöneticisi kullanın (COSMIC, Hyprland, Sway, KDE Plasma).",
   "One entry per file. Keep one up for days and switch when the mood strikes.": "Her dosya için ayrı bir kayıt. Birini günlerce açık tutup canınız istediğinde değiştirebilirsiniz.",
   "One entry per image or video in the folder, so you can pick between them.": "Klasördeki her görsel veya video için ayrı bir kayıt; böylece aralarından seçim yapabilirsiniz.",
   "One oversized time that fills the screen": "Tüm ekranı dolduran, çok büyük tek bir saat",

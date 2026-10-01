@@ -339,7 +339,11 @@ fn build_ui(app: &adw::Application) {
     stack.add_named(&editor_view, Some("editor"));
 
     toast.set_child(Some(&stack));
-    match capability_banner_text(capability) {
+    // Only a still-frame session needs to know whether an Xorg session exists to
+    // log into; skip the xsessions scan everywhere else.
+    let gnome_x11_session = capability == crate::capability::Capability::WaylandGnomeStatic
+        && crate::capability::gnome_x11_session_available();
+    match capability_banner_text(capability, gnome_x11_session) {
         Some(text) => {
             // Stack the capability banner above the toast-wrapped content.
             let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -502,13 +506,23 @@ fn build_ui(app: &adw::Application) {
 }
 
 /// Informational banner text for sessions where live playback is limited.
-/// `None` for X11 (full live support — no banner needed).
-fn capability_banner_text(cap: crate::capability::Capability) -> Option<&'static str> {
+/// `None` for X11 and layer-shell compositors (full live support — no banner
+/// needed). On GNOME Wayland the advice depends on `gnome_x11_session`
+/// (whether an Xorg GNOME/Ubuntu session is installed to log into): pointing
+/// at an "Xorg session" that Ubuntu 25.10+ / 26.04 LTS, Fedora 43+ and GNOME 50
+/// no longer ship would send the user hunting for something that does not exist.
+fn capability_banner_text(
+    cap: crate::capability::Capability,
+    gnome_x11_session: bool,
+) -> Option<&'static str> {
     use crate::capability::Capability;
     match cap {
         Capability::X11 | Capability::WaylandLayerShell => None,
+        Capability::WaylandGnomeStatic if gnome_x11_session => Some(
+            t!("GNOME on Wayland can only show a still frame. For a live wallpaper, log out and choose the GNOME/Ubuntu on Xorg session."),
+        ),
         Capability::WaylandGnomeStatic => Some(
-            t!("On GNOME Wayland, wallpapers are shown as a static frame. For live playback, use an X11 session or a layer-shell compositor (COSMIC, Hyprland, Sway, KDE Plasma)."),
+            t!("GNOME on Wayland can't play video wallpapers yet, so Fresco shows a still frame. Live video works on KDE Plasma, COSMIC, Hyprland, Sway and X11 desktops; a Fresco GNOME extension is planned."),
         ),
     }
 }
@@ -10242,6 +10256,29 @@ mod tests {
 
     use super::*;
     use std::path::PathBuf;
+
+    /// Only GNOME Wayland gets a banner, and which one depends on whether an
+    /// Xorg session exists to log into: never advise a session that is not there.
+    #[test]
+    fn capability_banner_variant_follows_xorg_session_availability() {
+        use crate::capability::Capability;
+        for cap in [Capability::X11, Capability::WaylandLayerShell] {
+            for x11 in [false, true] {
+                assert_eq!(capability_banner_text(cap, x11), None, "{cap:?} {x11}");
+            }
+        }
+        let with_xorg = capability_banner_text(Capability::WaylandGnomeStatic, true).unwrap();
+        let without = capability_banner_text(Capability::WaylandGnomeStatic, false).unwrap();
+        assert_ne!(with_xorg, without);
+        assert!(with_xorg.contains("Xorg session"), "{with_xorg}");
+        assert!(with_xorg.contains("still frame"), "{with_xorg}");
+        assert!(!without.contains("Xorg"), "{without}");
+        assert!(
+            without.contains("can't play video wallpapers yet"),
+            "{without}"
+        );
+        assert!(without.contains("extension is planned"), "{without}");
+    }
 
     /// The rename box (#21) should never write back blank, whitespace-only,
     /// or effectively-unchanged names — those are all "nothing to do", not

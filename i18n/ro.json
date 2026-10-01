@@ -320,7 +320,6 @@
   "Of day": "Progresul zilei",
   "Off": "Dezactivat",
   "On AC power only": "Doar la priză",
-  "On GNOME Wayland, wallpapers are shown as a static frame. For live playback, use an X11 session or a layer-shell compositor (COSMIC, Hyprland, Sway, KDE Plasma).": "Pe GNOME Wayland, imaginile de fundal sunt afișate ca un cadru static. Pentru redare animată, folosiți o sesiune X11 sau un compozitor layer-shell (COSMIC, Hyprland, Sway, KDE Plasma).",
   "One entry per file. Keep one up for days and switch when the mood strikes.": "Câte o intrare pentru fiecare fișier. Păstrați una activă zile în șir și schimbați-o după cum aveți chef.",
   "One entry per image or video in the folder, so you can pick between them.": "Câte o intrare pentru fiecare imagine sau videoclip din dosar, ca să puteți alege între ele.",
   "One oversized time that fills the screen": "O oră supradimensionată care umple tot ecranul",

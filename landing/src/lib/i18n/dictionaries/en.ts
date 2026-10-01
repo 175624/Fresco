@@ -124,7 +124,7 @@ export const en = {
     labelInstall: "Install",
     what: "Fresco is a free, open-source live wallpaper app for Linux: it sets video, GIF, image, slideshow, and playlist wallpapers as your animated desktop background, with GPU hardware decoding. A free Wallpaper Engine alternative and a GUI for mpvpaper on Wayland.",
     platforms:
-      "Any X11 desktop (Ubuntu, Pop!_OS, Linux Mint, Debian, Kali Linux), plus Wayland layer-shell compositors: COSMIC, Hyprland, Sway, KDE Plasma 6. GNOME Wayland falls back to a static frame.",
+      "Any X11 desktop (Ubuntu, Pop!_OS, Linux Mint, Debian, Kali Linux), plus Wayland layer-shell compositors: COSMIC, Hyprland, Sway, KDE Plasma 6. GNOME Wayland shows a still frame only until a Fresco GNOME extension ships.",
     widgets:
       "Four widgets painted into the wallpaper itself, not into a window: time-synced song lyrics, a clock with six themes, an audio visualiser, and album art on a turning record. Nothing floats over your windows and nothing intercepts a click. All off by default; unavailable on GNOME Wayland, which has no live wallpaper surface.",
     licenseLead: "GPL-3.0, free forever.",
@@ -143,7 +143,7 @@ export const en = {
     thWhatYouGet: "What you get",
     thStatus: "Status",
     footnote:
-      "GNOME Wayland: static-frame fallback (Mutter exposes no live surface), and widgets need that surface too, so they are unavailable there. Everything else above is live.",
+      "GNOME Wayland: still frame only. Mutter exposes no live surface, and GNOME 50, Ubuntu 25.10+ and Fedora 43+ no longer ship an Xorg session to fall back to. Widgets need that surface too, so they are unavailable there, and live video waits on a planned Fresco GNOME extension. Everything else above is live.",
     tally: (shipping: number, total: number, soon: number) =>
       `${shipping} of ${total} shipping · ${soon} in-preview · 0 deprecated`,
     rows: {
@@ -158,7 +158,7 @@ export const en = {
         tag: "Sessions",
         title: "X11 and Wayland",
         description:
-          "A desktop-window backend on any X11 desktop, plus a layer-shell backend for COSMIC, Hyprland, Sway, and KDE Plasma 6. GNOME Wayland gets a static-frame fallback.",
+          "A desktop-window backend on any X11 desktop, plus a layer-shell backend for COSMIC, Hyprland, Sway, and KDE Plasma 6. GNOME Wayland shows a still frame until the planned GNOME extension.",
         status: "X11 · layer-shell",
       },
       catalog: {
@@ -362,7 +362,7 @@ export const en = {
 
   supported: {
     title: "Where Fresco runs.",
-    lead: "On any X11 desktop, including deepin 25's DDE, and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, and KDE Plasma 6) across the popular Debian, Ubuntu, and Kali Linux distributions. GNOME Wayland gets a static-frame fallback.",
+    lead: "On any X11 desktop, including deepin 25's DDE, and on Wayland layer-shell compositors (COSMIC, Hyprland, Sway, and KDE Plasma 6) across the popular Debian, Ubuntu, and Kali Linux distributions. GNOME Wayland shows a still frame only for now.",
     sessionsTitle: "Sessions and compositors",
     distrosTitle: (n: number) => `Tested distributions · ${n}`,
     formatsTitle: (n: number) => `Supported formats · ${n}`,
@@ -384,7 +384,7 @@ export const en = {
       },
       gnome: {
         label: "GNOME on Wayland",
-        detail: "Static-frame fallback (Mutter has no live surface)",
+        detail: "Still frame only (Mutter has no live surface)",
       },
     },
     fieldReport: "Field report · deepin 25",
@@ -447,7 +447,7 @@ export const en = {
       },
       {
         q: "Does Fresco work on GNOME?",
-        a: "On GNOME with an X11 session, yes, full live wallpapers. On GNOME with Wayland, Mutter does not expose a live wallpaper surface, so Fresco falls back to showing a static frame of your chosen wallpaper instead of pretending to animate.",
+        a: "On GNOME with an X11 session, yes, full live wallpapers. But GNOME 49 disabled its X11 session and GNOME 50 removed it, so Ubuntu 25.10 and newer (including 26.04 LTS) and Fedora 43 and newer have none; Ubuntu 22.04 and 24.04 still offer \"Ubuntu on Xorg\". On GNOME with Wayland, Mutter does not expose a live wallpaper surface, so Fresco shows a still frame of your chosen wallpaper and says so instead of pretending to animate. Live video on GNOME Wayland needs a Fresco GNOME extension, which is planned.",
       },
       {
         q: "Can a video wallpaper play sound?",
