@@ -69,6 +69,28 @@ impl HostKind {
             HostKind::Unsupported => "unsupported",
         }
     }
+
+    /// Whether this host's real lock screen shows at least a still frame of
+    /// Fresco's wallpaper today — [`crate::ipc::LockStatus::still_frame`], the
+    /// datum the Lock Screen page uses to tell "still frame only" from
+    /// "nothing reaches the lock screen yet".
+    ///
+    /// Exhaustive on purpose (no `_` arm): a host that gains a still-frame
+    /// writer must be flipped here, in the one place the GUI's claim comes
+    /// from, and a new [`HostKind`] cannot compile without being decided.
+    /// Deepin and `Unsupported` have no still-frame writer, so their lock
+    /// screen keeps the desktop's own background.
+    pub fn shows_still_frame(&self) -> bool {
+        match self {
+            // Live video / widgets hosts (Cosmic's still frame via
+            // `cosmic_bg` is unconditional, live layer or not).
+            HostKind::Cosmic { .. } | HostKind::Kde | HostKind::Wlroots | HostKind::X11Wm => true,
+            // Still-frame hosts: the `overview` background sync (GNOME,
+            // Cinnamon, MATE) and the screensaver-theme route (Xfce).
+            HostKind::Gnome | HostKind::Cinnamon | HostKind::Mate | HostKind::Xfce => true,
+            HostKind::Deepin | HostKind::Unsupported => false,
+        }
+    }
 }
 
 /// Everything [`classify`] needs to decide a [`HostKind`] — gathered by
@@ -585,6 +607,36 @@ mod tests {
         assert_eq!(HostKind::Wlroots.id(), "wlroots");
         assert_eq!(HostKind::X11Wm.id(), "x11");
         assert_eq!(HostKind::Unsupported.id(), "unsupported");
+    }
+
+    // -- HostKind::shows_still_frame() ---------------------------------------
+
+    #[test]
+    fn shows_still_frame_follows_what_each_host_actually_writes() {
+        // Every host that can play live video shows at least a frame of it.
+        for k in [
+            HostKind::Cosmic { live: true },
+            HostKind::Wlroots,
+            HostKind::X11Wm,
+            HostKind::Kde,
+        ] {
+            assert!(k.shows_still_frame(), "{k:?}");
+        }
+        // The still-frame-only hosts, COSMIC without the show-on-lock layer
+        // included (its `cosmic_bg` sync does not depend on it).
+        for k in [
+            HostKind::Cosmic { live: false },
+            HostKind::Gnome,
+            HostKind::Cinnamon,
+            HostKind::Mate,
+            HostKind::Xfce,
+        ] {
+            assert!(k.shows_still_frame(), "{k:?}");
+        }
+        // No still-frame writer: the desktop keeps its own lock background.
+        for k in [HostKind::Deepin, HostKind::Unsupported] {
+            assert!(!k.shows_still_frame(), "{k:?}");
+        }
     }
 
     // -- LogindHost / CosmicHost: the pure half (never calls loginctl) ------

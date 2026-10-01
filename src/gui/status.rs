@@ -12,6 +12,8 @@ use gtk4::{glib, glib::ControlFlow};
 use crate::ipc::{self, MonitorInfo, Request, StatusReply};
 use crate::{t, tf};
 
+use super::lockscreen::{lock_support_of, LockSupport};
+
 thread_local! {
     /// Last `monitors_info` this poll loop saw, so other GUI code (e.g. the
     /// card menu's "move to display" list) can read connected displays
@@ -37,6 +39,9 @@ thread_local! {
     static PLAYING_HOOK: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     /// The pill the poll loop feeds, kept so [`poll_soon`] can poll on demand.
     static POLL_WIDGETS: RefCell<Option<Rc<PillWidgets>>> = const { RefCell::new(None) };
+    /// What the last status poll said reaches this desktop's real lock screen,
+    /// for the app menu's "Lock Screen…" row — see `cached_lock_support`.
+    static LAST_LOCK_SUPPORT: Cell<Option<LockSupport>> = const { Cell::new(None) };
 }
 
 /// How long [`poll_soon`] waits: long enough for the daemon to have finished
@@ -106,6 +111,14 @@ fn note_playing_path(path: Option<PathBuf>) {
             hook();
         }
     }
+}
+
+/// What reaches the real lock screen on this desktop, as of the last status
+/// poll. `None` before the first poll lands, while the daemon isn't running,
+/// or when it predates the capability data. Never blocks, like
+/// [`cached_monitors`].
+pub(crate) fn cached_lock_support() -> Option<LockSupport> {
+    LAST_LOCK_SUPPORT.with(Cell::get)
 }
 
 /// Callback that shows/hides the service notice from a reachability result.
@@ -329,6 +342,8 @@ fn poll_once(widgets: Rc<PillWidgets>) {
             Ok(crate::ipc::Response::Status(status)) => {
                 LAST_MONITORS.with(|m| *m.borrow_mut() = status.monitors_info.clone());
                 note_playing_path(status.wallpaper_path.clone());
+                LAST_LOCK_SUPPORT
+                    .with(|c| c.set(status.lockscreen.as_ref().and_then(lock_support_of)));
                 apply_status(&widgets, &status);
                 notify_reachable(status.running);
             }
@@ -338,6 +353,7 @@ fn poll_once(widgets: Rc<PillWidgets>) {
                 log::debug!("status poll: daemon unreachable: {e:#}");
                 LAST_MONITORS.with(|m| m.borrow_mut().clear());
                 note_playing_path(None);
+                LAST_LOCK_SUPPORT.with(|c| c.set(None));
                 apply_off(&widgets);
                 notify_reachable(false);
             }
