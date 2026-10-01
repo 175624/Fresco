@@ -177,6 +177,14 @@ pub struct StatusReply {
     /// parses as `None`; a current daemon always sets `Some(..)`.
     #[serde(default)]
     pub lockscreen: Option<LockStatus>,
+    /// Media file the DEFAULT wallpaper is showing right now, from the
+    /// daemon's in-memory config — which a day/night boundary swap updates
+    /// without ever saving, so unlike `config.toml` it says what is actually
+    /// on screen. `None` for playlists/slideshows (no single file) and from
+    /// an older daemon (`#[serde(default)]`), in which case the GUI falls
+    /// back to its own config.
+    #[serde(default)]
+    pub wallpaper_path: Option<PathBuf>,
 }
 
 /// Outcome of a [`Request::Lock`] attempt.
@@ -189,6 +197,10 @@ pub struct LockReply {
     pub message: Option<String>,
 }
 
+// `StatusReply` is a fat but short-lived value (one per request, never stored
+// in bulk); boxing it would ripple through every `Response::Status(..)`
+// pattern in the daemon, CLI and GUI for no real saving.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "lowercase")]
 pub enum Response {
@@ -656,6 +668,29 @@ mod tests {
         });
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""lockscreen":{"#), "{s}");
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+    }
+
+    /// `wallpaper_path` arrived after the other status fields: a reply from an
+    /// older daemon (no such key) must parse as `None`, and a current one must
+    /// carry the path through unchanged.
+    #[test]
+    fn status_reply_wallpaper_path_backcompat_and_roundtrip() {
+        let old = r#"{"result":"status","running":true,"paused":false,"hwdec":null,
+                      "wallpaper":null,"cpu_percent":0.0,"rss_mb":10,"monitors":[],"error":null}"#;
+        match serde_json::from_str::<Response>(old).unwrap() {
+            Response::Status(s) => assert_eq!(s.wallpaper_path, None),
+            other => panic!("expected a status reply, got {other:?}"),
+        }
+
+        let r = Response::Status(StatusReply {
+            running: true,
+            wallpaper_path: Some(PathBuf::from("/walls/night.mp4")),
+            ..Default::default()
+        });
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""wallpaper_path":"/walls/night.mp4""#), "{s}");
         let back: Response = serde_json::from_str(&s).unwrap();
         assert_eq!(r, back);
     }

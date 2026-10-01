@@ -1087,6 +1087,20 @@ fn build_library_view(
     state.borrow_mut().refresh = Some(refresh.clone());
     refresh();
 
+    // A day/night swap moves the playing file without touching config.toml, so
+    // the status poll is the only thing that can tell the grid its active card
+    // changed. It fires on a change only (never per tick), and only matters
+    // while a live schedule is what populate_library defers to.
+    {
+        let state = state.clone();
+        let refresh = refresh.clone();
+        status::on_playing_path_changed(move || {
+            if schedule_active(&state.borrow().config) {
+                refresh();
+            }
+        });
+    }
+
     // Search re-runs populate with the query (rebuilds the matching sections).
     {
         let home_query = home_query.clone();
@@ -1534,10 +1548,20 @@ fn build_behavior_page(state: &Rc<RefCell<AppState>>) -> gtk4::Box {
                 move |active| {
                     let config = {
                         let mut s = state2.borrow_mut();
-                        s.config.schedule_paused = !active;
-                        s.config.save().ok();
-                        s.config.clone()
+                        let st = &mut *s;
+                        // Read before the pause hides the schedule from the
+                        // clock fallback.
+                        let playing = playing_path_now(&st.config);
+                        set_schedule_paused(
+                            &mut st.config,
+                            &st.entries,
+                            !active,
+                            playing.as_deref(),
+                        );
+                        st.config.save().ok();
+                        st.config.clone()
                     };
+                    redraw_library(&state2);
                     daemon_ctl::apply_async(&config, |_| {});
                 }
             },
@@ -2104,6 +2128,9 @@ fn populate_library(
         let s = state.borrow();
         (s.entries.clone(), s.config.clone())
     };
+    // Judge "active" by what the daemon is showing while a schedule swaps
+    // wallpapers behind config.toml's back, not by the stale saved default.
+    let cfg = config_for_active_cards(&cfg, &entries, status::cached_playing_path().as_deref());
 
     if entries.is_empty() {
         welcome.set_visible(true);
@@ -5588,12 +5615,16 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
                     e.remove_css_class("error");
                 }
             }
+            let wallpaper_before = state.borrow().config.wallpaper.clone();
             let config = {
                 let mut s = state.borrow_mut();
                 if !on {
-                    if s.config.schedule.take().is_some() {
-                        s.config.save().ok();
-                        Some(s.config.clone())
+                    let st = &mut *s;
+                    if st.config.schedule.is_some() {
+                        let playing = playing_path_now(&st.config);
+                        remove_schedule(&mut st.config, &st.entries, playing.as_deref());
+                        st.config.save().ok();
+                        Some(st.config.clone())
                     } else {
                         None
                     }
@@ -5640,6 +5671,13 @@ fn add_schedule_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>)
             refresh_hint();
             service_row.refresh();
             if let Some(config) = config {
+                // The default wallpaper may have just moved (adopted on Off,
+                // synced to the slot on On): redraw so the active card agrees.
+                // Only then — the time fields save on every valid keystroke.
+                let moved = state.borrow().config.wallpaper != wallpaper_before;
+                if moved {
+                    redraw_library(&state);
+                }
                 let state = state.clone();
                 let service_row = service_row.clone();
                 daemon_ctl::apply_async(&config, move |outcome| {
@@ -5814,6 +5852,136 @@ fn sync_wallpaper_to_schedule(cfg: &mut Config) {
     let off = now.offset().fix().local_minus_utc() / 60;
     if let Some(w) = crate::schedule::desired(sch, now.naive_local(), off) {
         cfg.wallpaper = w.clone();
+    }
+}
+
+/// Every wallpaper a schedule can put on screen.
+fn schedule_wallpapers(
+    sch: &crate::config::Schedule,
+) -> impl Iterator<Item = &crate::config::Wallpaper> {
+    sch.day
+        .iter()
+        .chain(sch.night.iter())
+        .chain(sch.at.iter().map(|slot| &slot.wallpaper))
+}
+
+/// Make `cfg.wallpaper` say what is actually playing.
+///
+/// The daemon swaps the default wallpaper at a day/night boundary in memory
+/// only, so config.toml keeps the slot that was applied last and drifts from
+/// the screen. Anything that reloads that file (turning the schedule off or
+/// pausing it re-applies the config) would otherwise rebuild the wallpaper
+/// from the stale slot, and the library would show a card that isn't playing.
+///
+/// `None` (daemon unreachable / nothing known) changes nothing. A config that
+/// already names `playing` is left alone: it carries editor state (crop, fit)
+/// that a library entry doesn't. Otherwise the library entry wins, then the
+/// schedule's own slot (config-file slots keep their rotation/crop), and last
+/// resort only the path is patched so a file that left the library still
+/// keeps playing.
+fn adopt_playing_wallpaper(
+    cfg: &mut Config,
+    entries: &[LibraryEntry],
+    playing: Option<&std::path::Path>,
+) {
+    let Some(playing) = playing else {
+        return;
+    };
+    if matches!(cfg.wallpaper.kind, Kind::Video | Kind::Image)
+        && cfg.wallpaper.effective_path() == Some(playing)
+    {
+        return;
+    }
+    if let Some(e) = entries
+        .iter()
+        .find(|e| matches!(e.kind, Kind::Video | Kind::Image) && e.path.as_deref() == Some(playing))
+    {
+        cfg.wallpaper = e.to_wallpaper();
+        return;
+    }
+    let slot = cfg
+        .schedule
+        .as_ref()
+        .and_then(|sch| schedule_wallpapers(sch).find(|w| w.effective_path() == Some(playing)))
+        .cloned();
+    match slot {
+        Some(w) => cfg.wallpaper = w,
+        None => cfg.wallpaper.path = Some(playing.to_path_buf()),
+    }
+}
+
+/// The menu's "Day/night schedule" switch, on the config.
+///
+/// Pausing keeps what is on screen playing (see [`adopt_playing_wallpaper`]):
+/// the re-apply that follows rebuilds from `config.wallpaper`, which a
+/// boundary swap never updated. Resuming points the default at the slot due
+/// now, as enabling does — left stale, the daemon's manual-Apply hold would
+/// read it as an override and pin it until the next boundary.
+fn set_schedule_paused(
+    cfg: &mut Config,
+    entries: &[LibraryEntry],
+    paused: bool,
+    playing: Option<&std::path::Path>,
+) {
+    if paused {
+        adopt_playing_wallpaper(cfg, entries, playing);
+        cfg.schedule_paused = true;
+    } else {
+        cfg.schedule_paused = false;
+        sync_wallpaper_to_schedule(cfg);
+    }
+}
+
+/// Advanced → Schedule → Off: drop the schedule but leave the wallpaper that
+/// is playing in place, for the same reason as pausing.
+fn remove_schedule(cfg: &mut Config, entries: &[LibraryEntry], playing: Option<&std::path::Path>) {
+    adopt_playing_wallpaper(cfg, entries, playing);
+    cfg.schedule = None;
+}
+
+/// The config to judge "which card is active" against: while a live schedule
+/// is swapping wallpapers, what the daemon reports is the truth; otherwise
+/// (no schedule, or paused) config.toml is.
+fn config_for_active_cards(
+    cfg: &Config,
+    entries: &[LibraryEntry],
+    playing: Option<&std::path::Path>,
+) -> Config {
+    let mut view = cfg.clone();
+    if schedule_active(cfg) {
+        adopt_playing_wallpaper(&mut view, entries, playing);
+    }
+    view
+}
+
+/// The media file on screen now, for [`adopt_playing_wallpaper`]: the
+/// daemon's last report, else — daemon unreachable or too old to say — the
+/// slot a live schedule wants at this moment. The daemon's answer wins when it
+/// has one because it also knows about a manual override held until the next
+/// boundary. The clock fallback only applies to a single-file default: a
+/// playlist/slideshow in the config is a deliberate choice, not a slot.
+fn playing_path_now(cfg: &Config) -> Option<PathBuf> {
+    use chrono::Offset as _;
+    if let Some(p) = status::cached_playing_path() {
+        return Some(p);
+    }
+    if !matches!(cfg.wallpaper.kind, Kind::Video | Kind::Image) {
+        return None;
+    }
+    let sch = cfg.schedule.as_ref().filter(|_| schedule_active(cfg))?;
+    let now = chrono::Local::now();
+    let off = now.offset().fix().local_minus_utc() / 60;
+    crate::schedule::desired(sch, now.naive_local(), off)?
+        .effective_path()
+        .map(std::path::Path::to_path_buf)
+}
+
+/// Redraw the library grid (keeps the scroll position — see the refresh
+/// closure built in `build_library_view`). Call with no `state` borrow held.
+fn redraw_library(state: &Rc<RefCell<AppState>>) {
+    let refresh = state.borrow().refresh.clone();
+    if let Some(r) = refresh {
+        r();
     }
 }
 
@@ -10301,6 +10469,200 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!(got, want);
+    }
+
+    /// A one-slot `times` schedule wants `slot` at every hour, so tests that go
+    /// through the real wall clock (`sync_wallpaper_to_schedule`) stay
+    /// deterministic. `showing` is what config.toml (the stale default) says.
+    fn always_slot_config(slot: &str, showing: &str) -> Config {
+        use crate::config::{Schedule, ScheduleMode, TimeSlot};
+        Config {
+            enabled: true,
+            wallpaper: entry(showing).to_wallpaper(),
+            schedule: Some(Schedule {
+                mode: ScheduleMode::Times,
+                day: None,
+                night: None,
+                day_start: "07:00".into(),
+                night_start: "19:00".into(),
+                lat: None,
+                lon: None,
+                at: vec![TimeSlot {
+                    time: "00:00".into(),
+                    wallpaper: entry(slot).to_wallpaper(),
+                }],
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn path_of(cfg: &Config) -> Option<&std::path::Path> {
+        cfg.wallpaper.effective_path()
+    }
+
+    /// The reported bug: a boundary swapped the screen to B in memory only, so
+    /// config.toml still says A and A's card was marked. After adopting what
+    /// the daemon reports, B is the active card.
+    #[test]
+    fn adopt_playing_wallpaper_marks_the_playing_card() {
+        let (a, b) = (entry("/a.mp4"), entry("/b.mp4"));
+        let mut cfg = Config {
+            enabled: true,
+            wallpaper: a.to_wallpaper(),
+            ..Default::default()
+        };
+        assert!(entry_is_active(&a, &cfg) && !entry_is_active(&b, &cfg));
+
+        adopt_playing_wallpaper(
+            &mut cfg,
+            &[a.clone(), b.clone()],
+            Some(std::path::Path::new("/b.mp4")),
+        );
+        assert_eq!(path_of(&cfg), Some(std::path::Path::new("/b.mp4")));
+        assert!(entry_is_active(&b, &cfg));
+        assert!(!entry_is_active(&a, &cfg));
+    }
+
+    #[test]
+    fn adopt_playing_wallpaper_is_a_noop_when_nothing_is_known() {
+        let a = entry("/a.mp4");
+        let mut cfg = Config {
+            wallpaper: a.to_wallpaper(),
+            ..Default::default()
+        };
+        let before = cfg.clone();
+        adopt_playing_wallpaper(&mut cfg, &[a], None);
+        assert_eq!(cfg, before);
+    }
+
+    /// A file that left the library still has to keep playing: only the path
+    /// moves, everything else the default carried stays.
+    #[test]
+    fn adopt_playing_wallpaper_patches_only_the_path_outside_the_library() {
+        let a = entry("/a.mp4");
+        let mut cfg = Config {
+            wallpaper: a.to_wallpaper(),
+            ..Default::default()
+        };
+        cfg.wallpaper.fit = Fit::Contain;
+        cfg.wallpaper.volume = 9;
+        let mut want = cfg.clone();
+        want.wallpaper.path = Some(PathBuf::from("/gone.mp4"));
+
+        adopt_playing_wallpaper(&mut cfg, &[a], Some(std::path::Path::new("/gone.mp4")));
+        assert_eq!(cfg, want);
+    }
+
+    /// When config.toml already names the playing file there is nothing to
+    /// adopt, and rebuilding it from the library entry would drop the crop and
+    /// fit the editor saved.
+    #[test]
+    fn adopt_playing_wallpaper_keeps_editor_state_when_already_in_sync() {
+        let a = entry("/a.mp4");
+        let mut cfg = Config {
+            wallpaper: a.to_wallpaper(),
+            ..Default::default()
+        };
+        cfg.wallpaper.fit = Fit::Contain;
+        cfg.wallpaper.rotation = 90;
+        let before = cfg.clone();
+        adopt_playing_wallpaper(&mut cfg, &[a], Some(std::path::Path::new("/a.mp4")));
+        assert_eq!(cfg, before);
+    }
+
+    /// A config-file slot (times/solar) that was never added to the library
+    /// keeps its own rotation when it is what is playing.
+    #[test]
+    fn adopt_playing_wallpaper_uses_the_schedule_slot_outside_the_library() {
+        let mut cfg = always_slot_config("/slot.mp4", "/a.mp4");
+        if let Some(sch) = cfg.schedule.as_mut() {
+            sch.at[0].wallpaper.rotation = 90;
+        }
+        adopt_playing_wallpaper(&mut cfg, &[], Some(std::path::Path::new("/slot.mp4")));
+        assert_eq!(path_of(&cfg), Some(std::path::Path::new("/slot.mp4")));
+        assert_eq!(cfg.wallpaper.rotation, 90);
+    }
+
+    /// While a live schedule swaps wallpapers the daemon's answer decides the
+    /// active card; with no schedule, or a paused one, config.toml does.
+    #[test]
+    fn active_cards_follow_the_daemon_only_while_the_schedule_is_live() {
+        let (a, b) = (entry("/a.mp4"), entry("/b.mp4"));
+        let entries = [a.clone(), b.clone()];
+        let playing = Some(std::path::Path::new("/b.mp4"));
+
+        let live = always_slot_config("/b.mp4", "/a.mp4");
+        let view = config_for_active_cards(&live, &entries, playing);
+        assert!(entry_is_active(&b, &view) && !entry_is_active(&a, &view));
+        // A daemon that can't say falls back to the config.
+        let view = config_for_active_cards(&live, &entries, None);
+        assert!(entry_is_active(&a, &view));
+
+        let mut paused = live.clone();
+        paused.schedule_paused = true;
+        let view = config_for_active_cards(&paused, &entries, playing);
+        assert!(entry_is_active(&a, &view) && !entry_is_active(&b, &view));
+
+        let mut off = live;
+        off.schedule = None;
+        let view = config_for_active_cards(&off, &entries, playing);
+        assert!(entry_is_active(&a, &view) && !entry_is_active(&b, &view));
+    }
+
+    /// Advanced "Off" then "Day / night" again: the wallpaper keeps playing
+    /// (and its card stays marked) through Off, and turning it back on points
+    /// the default at the slot due now.
+    #[test]
+    fn schedule_off_then_on_round_trip() {
+        let (a, b) = (entry("/a.mp4"), entry("/b.mp4"));
+        let entries = [a.clone(), b.clone()];
+        let mut cfg = always_slot_config("/b.mp4", "/a.mp4");
+        let schedule = cfg.schedule.clone();
+
+        // Screen shows B (a swap nobody saved); config.toml still says A.
+        remove_schedule(&mut cfg, &entries, Some(std::path::Path::new("/b.mp4")));
+        assert!(cfg.schedule.is_none());
+        assert_eq!(path_of(&cfg), Some(std::path::Path::new("/b.mp4")));
+        assert!(entry_is_active(&b, &cfg) && !entry_is_active(&a, &cfg));
+
+        // The user then picked A by hand; turning the schedule back on syncs
+        // to the due slot so the daemon doesn't treat A as an override.
+        cfg.wallpaper = a.to_wallpaper();
+        cfg.schedule = schedule;
+        sync_wallpaper_to_schedule(&mut cfg);
+        assert_eq!(path_of(&cfg), Some(std::path::Path::new("/b.mp4")));
+    }
+
+    /// The menu switch: pausing keeps the playing wallpaper; resuming syncs to
+    /// the due slot (it used to leave a stale default for the daemon to hold).
+    #[test]
+    fn schedule_pause_then_resume_round_trip() {
+        let (a, b, c) = (entry("/a.mp4"), entry("/b.mp4"), entry("/c.mp4"));
+        let entries = [a.clone(), b.clone(), c.clone()];
+        let mut cfg = always_slot_config("/b.mp4", "/a.mp4");
+
+        set_schedule_paused(
+            &mut cfg,
+            &entries,
+            true,
+            Some(std::path::Path::new("/b.mp4")),
+        );
+        assert!(cfg.schedule_paused && cfg.schedule.is_some());
+        assert_eq!(path_of(&cfg), Some(std::path::Path::new("/b.mp4")));
+        assert!(entry_is_active(&b, &cfg) && !entry_is_active(&a, &cfg));
+
+        // Daemon unreachable while pausing: nothing to adopt, nothing lost.
+        let mut unknown = always_slot_config("/b.mp4", "/a.mp4");
+        set_schedule_paused(&mut unknown, &entries, true, None);
+        assert!(unknown.schedule_paused);
+        assert_eq!(path_of(&unknown), Some(std::path::Path::new("/a.mp4")));
+
+        // Paused, the user picks C; resuming hands the screen back to the
+        // schedule's current slot instead of leaving C as a stale override.
+        cfg.wallpaper = c.to_wallpaper();
+        set_schedule_paused(&mut cfg, &entries, false, None);
+        assert!(!cfg.schedule_paused);
+        assert_eq!(path_of(&cfg), Some(std::path::Path::new("/b.mp4")));
     }
 
     /// The lyric combos map selection index → enum through these tables, so a
