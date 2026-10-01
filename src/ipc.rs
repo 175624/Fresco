@@ -112,6 +112,14 @@ pub struct LockStatus {
     pub live_video: bool,
     /// Whether this host can show Fresco's own widgets while locked.
     pub widgets: bool,
+    /// Whether the real lock screen shows at least a still frame of Fresco's
+    /// wallpaper on this host. Implied by `live_video`; what separates "still
+    /// frame only" from "nothing reaches the lock screen yet" for a host with
+    /// neither live video nor widgets (the Lock Screen page's support
+    /// summary). `None` from a daemon that predates the field — the GUI then
+    /// says nothing rather than guess.
+    #[serde(default)]
+    pub still_frame: Option<bool>,
     /// Whether the session is locked right now.
     pub locked: bool,
     pub setup: LockSetupState,
@@ -571,13 +579,14 @@ mod tests {
             host: "cosmic".into(),
             live_video: true,
             widgets: true,
+            still_frame: Some(true),
             locked: false,
             setup: LockSetupState::NotNeeded,
             notes: vec!["cosmic-greeter's own panel stays put for now".into()],
         };
         assert_eq!(
             serde_json::to_string(&status).unwrap(),
-            r#"{"enabled":true,"host":"cosmic","live_video":true,"widgets":true,"locked":false,"setup":"notneeded","notes":["cosmic-greeter's own panel stays put for now"]}"#
+            r#"{"enabled":true,"host":"cosmic","live_video":true,"widgets":true,"still_frame":true,"locked":false,"setup":"notneeded","notes":["cosmic-greeter's own panel stays put for now"]}"#
         );
     }
 
@@ -648,6 +657,7 @@ mod tests {
                 host: "wlroots".into(),
                 live_video: false,
                 widgets: false,
+                still_frame: Some(false),
                 locked: true,
                 setup: LockSetupState::Unavailable,
                 notes: Vec::new(),

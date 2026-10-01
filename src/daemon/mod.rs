@@ -429,6 +429,7 @@ impl LockRuntime {
             host: self.kind.id().to_string(),
             live_video: capable,
             widgets: capable,
+            still_frame: Some(self.kind.shows_still_frame()),
             locked: self.locked,
             setup: self.host.setup_state(ctx),
             notes: self.host.notes(ctx),

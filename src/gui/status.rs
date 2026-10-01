@@ -11,6 +11,8 @@ use gtk4::{glib, glib::ControlFlow};
 use crate::ipc::{self, MonitorInfo, Request, StatusReply};
 use crate::{t, tf};
 
+use super::lockscreen::{lock_support_of, LockSupport};
+
 thread_local! {
     /// Last `monitors_info` this poll loop saw, so other GUI code (e.g. the
     /// card menu's "move to display" list) can read connected displays
@@ -23,6 +25,20 @@ thread_local! {
 /// read of state `poll_once` already fetched in the background.
 pub(crate) fn cached_monitors() -> Vec<MonitorInfo> {
     LAST_MONITORS.with(|m| m.borrow().clone())
+}
+
+thread_local! {
+    /// What the last status poll said reaches this desktop's real lock screen,
+    /// for the app menu's "Lock Screen…" row — see `cached_lock_support`.
+    static LAST_LOCK_SUPPORT: Cell<Option<LockSupport>> = const { Cell::new(None) };
+}
+
+/// What reaches the real lock screen on this desktop, as of the last status
+/// poll. `None` before the first poll lands, while the daemon isn't running,
+/// or when it predates the capability data. Never blocks, like
+/// [`cached_monitors`].
+pub(crate) fn cached_lock_support() -> Option<LockSupport> {
+    LAST_LOCK_SUPPORT.with(Cell::get)
 }
 
 /// Callback that shows/hides the service notice from a reachability result.
@@ -236,6 +252,8 @@ fn poll_once(widgets: Rc<PillWidgets>) {
         match result {
             Ok(crate::ipc::Response::Status(status)) => {
                 LAST_MONITORS.with(|m| *m.borrow_mut() = status.monitors_info.clone());
+                LAST_LOCK_SUPPORT
+                    .with(|c| c.set(status.lockscreen.as_ref().and_then(lock_support_of)));
                 apply_status(&widgets, &status);
                 notify_reachable(status.running);
             }
@@ -244,6 +262,7 @@ fn poll_once(widgets: Rc<PillWidgets>) {
                 // Daemon not running — expected and common, not an error.
                 log::debug!("status poll: daemon unreachable: {e:#}");
                 LAST_MONITORS.with(|m| m.borrow_mut().clear());
+                LAST_LOCK_SUPPORT.with(|c| c.set(None));
                 apply_off(&widgets);
                 notify_reachable(false);
             }

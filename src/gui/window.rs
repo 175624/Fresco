@@ -1348,7 +1348,9 @@ fn build_menu_root(
         let win_lock = window.clone();
         move || super::lockscreen::show_lockscreen_window(&win_lock, state_lock.clone())
     });
-    lockscreen_btn.set_tooltip_text(Some(t!("Show Fresco on the lock screen")));
+    // Tooltip and trailing tag say what this desktop will actually show on its
+    // lock screen once a status poll has answered (issue #37).
+    super::lockscreen::decorate_menu_row(&lockscreen_btn, popover);
     popover_box.append(&lockscreen_btn);
 
     let browse_btn = menu_item_opening_window(t!("Browse wallpapers…"), popover, {
