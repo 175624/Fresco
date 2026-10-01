@@ -106,7 +106,7 @@ fn cinnamon_modern() -> bool {
 /// Escape a string for use as a GVariant text-format string literal, e.g. for
 /// `gsettings set schema key <literal>`. Only `\` and `'` need escaping
 /// inside a single-quoted GVariant string.
-fn gvariant_string_literal(s: &str) -> String {
+pub(super) fn gvariant_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -124,7 +124,7 @@ fn gvariant_string_literal(s: &str) -> String {
 /// contains spaces or quotes), a `picture-uri-list` entry is itself embedded
 /// inside a GVariant string literal, so any byte that isn't an unreserved URI
 /// character must be percent-encoded up front.
-fn encode_file_uri(path: &Path) -> String {
+pub(super) fn encode_file_uri(path: &Path) -> String {
     let mut out = String::from("file://");
     for byte in path.to_string_lossy().bytes() {
         match byte {

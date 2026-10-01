@@ -272,6 +272,17 @@ screen instead of your distro's stock image, through the same background
 sync that already keeps these desktops' own wallpaper setting pointed at
 whatever Fresco is playing.
 
+On Deepin that sync only runs while **Show Fresco on the lock screen** is on.
+Deepin keeps a separate lock-screen picture per user (not the desktop
+wallpaper), so Fresco saves yours the first time, sets a still frame as the
+lock-screen picture, and puts yours back when you stop Fresco or turn the
+setting off. If you pick a different lock-screen picture in the meantime,
+yours is kept. Deepin blurs that picture itself, so Fresco's own blur setting
+does not apply there. The frame is kept in `~/.cache/fresco`, or in
+`/var/tmp/fresco-<uid>` when that folder is not readable by other users —
+Deepin's login screen and blur service run as other users and fall back to
+the stock picture if they cannot read it.
+
 ### Flatpak
 
 Flatpak builds are no longer provided. The lock screen needs files and

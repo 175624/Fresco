@@ -108,7 +108,8 @@ pub struct LockStatus {
     /// `"unsupported"`. See `daemon::lock::hosts::HostKind::id`.
     pub host: String,
     /// Whether this host can show the wallpaper as live video while locked
-    /// — false means still-frame only (GNOME, Cinnamon, MATE, Xfce, Deepin).
+    /// — false means no live surface (GNOME, Cinnamon, MATE, Xfce, Deepin);
+    /// [`LockStatus::still_frame`] says whether a still is shown instead.
     pub live_video: bool,
     /// Whether this host can show Fresco's own widgets while locked.
     pub widgets: bool,
@@ -600,6 +601,16 @@ mod tests {
             serde_json::to_string(&status).unwrap(),
             r#"{"enabled":true,"host":"cosmic","live_video":true,"widgets":true,"still_frame":true,"locked":false,"setup":"notneeded","notes":["cosmic-greeter's own panel stays put for now"]}"#
         );
+    }
+
+    /// A status from a daemon that predates `still_frame` still parses, and
+    /// reads as "unknown" (`None`) rather than guessing either way — the GUI
+    /// says nothing about the still frame then.
+    #[test]
+    fn lock_status_without_still_frame_parses_as_unknown() {
+        let old = r#"{"enabled":true,"host":"deepin","live_video":false,"widgets":false,"locked":false,"setup":"notneeded","notes":[]}"#;
+        let status: LockStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(status.still_frame, None);
     }
 
     // -- lock screen: round-trips -------------------------------------------

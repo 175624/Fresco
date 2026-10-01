@@ -100,7 +100,7 @@ fn non_empty_env(key: &str) -> Option<String> {
 /// `ipc.rs`'s private `libc_getuid`, but kept as `Option` rather than
 /// defaulting to 0: a wrong uid would look up the wrong (or root's) passwd
 /// row, which is worse than simply having none to look up with.
-fn current_uid() -> Option<u32> {
+pub(crate) fn current_uid() -> Option<u32> {
     std::fs::metadata("/proc/self")
         .ok()
         .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
