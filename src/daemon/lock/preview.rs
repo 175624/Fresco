@@ -48,6 +48,7 @@ use crate::widgetkit::lockscene::LockSceneSpec;
 use crate::widgetkit::{FontStack, Rect, Size, Theme};
 
 use super::super::widgets::Snapshot;
+use super::avatar::AvatarCache;
 use super::engine::{self, ReservedZoneKind};
 use super::hosts::HostKind;
 
@@ -107,7 +108,10 @@ pub struct PreviewRenderer {
     path: PathBuf,
     fonts: FontStack,
     user: UserInfo,
-    avatar: Option<Arc<RgbaImage>>,
+    /// Re-checked on every render (see [`AvatarCache`]): unlike a real lock,
+    /// which resolves the avatar afresh each time the screen locks, this lives
+    /// as long as the daemon.
+    avatar: AvatarCache,
     cached_wallpaper: Option<Wallpaper>,
     background: Option<Arc<RgbaImage>>,
     last_render: Option<Instant>,
@@ -119,8 +123,8 @@ impl PreviewRenderer {
         PreviewRenderer {
             path: preview_path(),
             fonts: FontStack::system(),
-            user: userinfo::current(),
-            avatar: None,
+            user: userinfo::current_identity(),
+            avatar: AvatarCache::new(),
             cached_wallpaper: None,
             background: None,
             last_render: None,
@@ -208,11 +212,8 @@ impl PreviewRenderer {
 
         let slots = engine::slots_for(resolved);
         let wants_avatar = resolved.widgets.contains(&LockWidget::Avatar);
-        if wants_avatar && self.avatar.is_none() {
-            self.avatar = engine::decode_avatar(&self.user);
-        }
         let avatar = if wants_avatar {
-            self.avatar.clone()
+            self.avatar.get(now)
         } else {
             None
         };
