@@ -101,7 +101,7 @@ The wallpaper keeps playing after the window closes and comes back automatically
 
 | Environment | Live wallpaper | Notes |
 |---|---|---|
-| X11 (GNOME, Cinnamon, XFCE, …) | ✅ | Embedded renderer |
+| X11 (GNOME, Cinnamon, XFCE, …) | ✅ | Embedded renderer. GNOME only where the distro still ships an Xorg session (see the GNOME note below) |
 | Kali Linux (Xfce, X11) | ✅ | Runs on Kali's default Xfce-on-X11 session via the same embedded renderer as other X11 desktops |
 | MATE (X11) | ✅ | Desktop icons stay visible and clickable over the wallpaper |
 | Deepin 25 (DDE, X11) | ✅ | Automatic DDE adaptation — community-verified on Deepin 25 Community build1 |
@@ -109,9 +109,11 @@ The wallpaper keeps playing after the window closes and comes back automatically
 | Hyprland | ✅ | layer-shell |
 | Sway | ✅ | layer-shell |
 | KDE Plasma 6 (Wayland) | ✅ | layer-shell |
-| GNOME on Wayland | ⚠️ | Static-frame fallback — Mutter exposes no live wallpaper surface, so no widgets either |
+| GNOME on Wayland | ⚠️ | Still frame only — Mutter exposes no live wallpaper surface, so no video and no widgets. Live video needs a Fresco GNOME extension (planned) |
 
 Every environment above is exercised headlessly in CI on each release.
+
+**GNOME note.** GNOME on Wayland is the one mainstream desktop where Fresco can only show a still frame. The old way around it, logging into an Xorg session, is going away: GNOME 49 disabled its X11 session and GNOME 50 removed it, so Ubuntu 25.10 and newer (including 26.04 LTS) and Fedora 43 and newer ship no Xorg session to switch to. Ubuntu 22.04 and 24.04 still offer "Ubuntu on Xorg". Where there is no Xorg session, live video on the stock GNOME desktop has to wait for a Fresco GNOME extension, which is planned; Fresco says so in the app instead of pretending the video is playing. KDE Plasma, COSMIC, Hyprland, Sway and every X11 desktop are unaffected.
 
 > "Easy to use with a clean interface — one of the few live wallpaper apps properly adapted for Deepin 25, installable via .deb and running smoothly with hardware-accelerated playback."
 >
@@ -163,7 +165,7 @@ Not natively. Wallpaper Engine is a Windows application; on Linux it can only be
 
 ### How do I set a video as my wallpaper on Ubuntu?
 
-Install Fresco, open it, click **Add**, pick your video, and click **Set**. The video plays as your desktop background and is restored on login. Ubuntu's default GNOME-on-Wayland session falls back to a static frame — log into an **Ubuntu on Xorg** session for full live playback.
+Install Fresco, open it, click **Add**, pick your video, and click **Set**. The video plays as your desktop background and is restored on login. Ubuntu's default GNOME-on-Wayland session can only show a still frame. On Ubuntu 22.04 and 24.04 you can log into an **Ubuntu on Xorg** session for full live playback; Ubuntu 25.10 and newer (including 26.04 LTS) ship no Xorg session, so there live video on the stock GNOME desktop needs a Fresco GNOME extension, which is planned. Ubuntu flavours that use KDE Plasma, Xfce or MATE are not affected.
 
 ### Do live wallpapers use a lot of CPU or battery?
 
@@ -173,7 +175,7 @@ Fresco decodes video on the GPU (VA-API / NVDEC), so CPU usage stays near idle. 
 
 ### Does Fresco work on Wayland?
 
-Yes, on compositors that implement the layer-shell protocol — COSMIC, Hyprland, Sway, and KDE Plasma 6. GNOME on Wayland is the exception: Mutter exposes no wallpaper surface, so Fresco falls back to a static frame there. X11 sessions are fully supported.
+Yes, on compositors that implement the layer-shell protocol — COSMIC, Hyprland, Sway, and KDE Plasma 6. GNOME on Wayland is the exception: Mutter exposes no wallpaper surface, so Fresco shows a still frame there and says so in the app. X11 sessions are fully supported.
 
 ### Is Fresco free?
 
@@ -181,7 +183,7 @@ Yes. Fresco is free and open source under GPL-3.0-or-later. There are no ads, no
 
 ### Does Fresco work on GNOME?
 
-Yes on X11, with the full live wallpaper — video, widgets, everything. On **GNOME under Wayland**, Mutter exposes no wallpaper surface for any app to draw into, so Fresco falls back to a static frame there and widgets are unavailable; log into a GNOME on Xorg (X11) session for full live playback.
+Yes on X11, with the full live wallpaper — video, widgets, everything. On **GNOME under Wayland**, Mutter exposes no wallpaper surface for any app to draw into, so Fresco shows a still frame there and widgets are unavailable. If your distro still ships an Xorg session (Ubuntu 22.04 and 24.04 do), log out and choose "GNOME on Xorg" or "Ubuntu on Xorg" for full live playback. GNOME 49 disabled that session and GNOME 50 removed it, so Ubuntu 25.10 and newer (including 26.04 LTS) and Fedora 43 and newer have none: on those, live video on GNOME needs a Fresco GNOME extension, which is planned. `fresco doctor` tells you which case you are in.
 
 ### What's the difference between Fresco and mpvpaper?
 

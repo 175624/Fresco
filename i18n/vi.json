@@ -320,7 +320,6 @@
   "Of day": "Trong ngày",
   "Off": "Tắt",
   "On AC power only": "Chỉ khi cắm sạc",
-  "On GNOME Wayland, wallpapers are shown as a static frame. For live playback, use an X11 session or a layer-shell compositor (COSMIC, Hyprland, Sway, KDE Plasma).": "Trên GNOME Wayland, hình nền chỉ hiển thị dưới dạng khung hình tĩnh. Để phát động, hãy dùng phiên X11 hoặc một trình quản lý hợp thành layer-shell (COSMIC, Hyprland, Sway, KDE Plasma).",
   "One entry per file. Keep one up for days and switch when the mood strikes.": "Mỗi tệp là một mục riêng. Có thể dùng một hình nền trong nhiều ngày rồi đổi khi muốn.",
   "One entry per image or video in the folder, so you can pick between them.": "Mỗi ảnh hoặc video trong thư mục là một mục riêng, để bạn dễ dàng chọn lựa.",
   "One oversized time that fills the screen": "Một đồng hồ khổng lồ lấp đầy toàn màn hình",
