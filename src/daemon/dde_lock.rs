@@ -42,9 +42,9 @@
 //!   does not draw the picture itself: it asks `org.deepin.dde.ImageBlur1.Get`
 //!   for a blurred copy and draws that, falling back to
 //!   `/usr/share/backgrounds/default_background.jpg` when the service returns
-//!   nothing (`src/widgets/fullscreenbackground.cpp`). So (a) the lock screen is
-//!   always blurred by Deepin, whatever Fresco's own blur setting says, and (b)
-//!   an unreadable frame silently shows Deepin's default again.
+//!   nothing (`src/widgets/fullscreenbackground.cpp`). So (a) Deepin always
+//!   blurs the lock screen itself, on top of the blur Fresco bakes into the
+//!   frame, and (b) an unreadable frame silently shows Deepin's default again.
 //! * **Who must be able to read the frame.** `ImageBlur1` is served by
 //!   `deepin-daemon` (`linuxdeepin/dde-services`:
 //!   `src/plugin-qt/wallpapercache/`), the login greeter runs as `lightdm`;
@@ -58,7 +58,15 @@
 //!   a `0755` directory under `/var/tmp` — see [`pick_frame_dir`].
 //! * **Blur cache.** The blur service caches by `md5(path)` and returns the
 //!   cached image without comparing contents, so every frame gets a fresh
-//!   timestamped name (the same trick `overview::render_still` uses).
+//!   timestamped name (the same trick `overview::render_still` uses). That
+//!   also covers the user's dim and blur: every apply (and the GUI sends one on
+//!   each slider change) re-renders the frame under a new name, so a changed
+//!   setting is never served from that cache.
+//! * **Dim and blur.** The frame has the user's `[lockscreen]` dim and blur
+//!   baked in ([`grade_still`], through the same backdrop painter the in-app
+//!   preview uses). Widgets are not: the greeter background is one frozen
+//!   picture, so a clock in it would be wrong a minute later. Deepin may blur
+//!   the frame again on top (see **Reading**).
 //!
 //! # Backup and restore
 //!
@@ -678,9 +686,33 @@ fn pick_frame_dir(uid: u32) -> PathBuf {
     dir
 }
 
+/// Bake the lock screen's `blur` radius and `dim` (as `lockscreen::resolve`
+/// gives them) into the still at `path`, in place. A no-op at 0 and 0, so the
+/// frame is then exactly the plain still. If the picture cannot be read or
+/// redrawn the plain still stays: an ungraded lock background beats the
+/// default one.
+fn grade_still(path: &Path, blur: f32, dim: f32) {
+    if blur <= 0.0 && dim <= 0.0 {
+        return;
+    }
+    let graded = image::open(path).ok().and_then(|img| {
+        let img = img.to_rgba8();
+        let size = crate::widgetkit::geom::Size::new(img.width() as f32, img.height() as f32);
+        crate::widgetkit::lockscene::compose_backdrop(&img, size, blur, dim)
+    });
+    let written = graded.is_some_and(|bgra| {
+        let rgba = super::lock::engine::bgra_to_rgba_image(&bgra);
+        super::lock::engine::write_png_atomic(path, &rgba).is_ok()
+    });
+    if !written {
+        log::warn!("DDE lock screen: could not apply dim/blur to the frame; using it plain");
+    }
+}
+
 /// Render a still of the wallpaper (the global one, else the first per-monitor
-/// one — the greeter background is a single picture per user) into `dir` under
-/// a fresh name, readable by everyone.
+/// one — the greeter background is a single picture per user), with the user's
+/// lock-screen dim and blur applied, into `dir` under a fresh name, readable by
+/// everyone.
 fn render_frame(config: &Config, dir: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let rendered = super::overview::render_still(&config.wallpaper).or_else(|| {
@@ -689,6 +721,10 @@ fn render_frame(config: &Config, dir: &Path) -> Option<PathBuf> {
             .values()
             .find_map(super::overview::render_still)
     })?;
+    if let Some(lock) = &config.lockscreen {
+        let resolved = crate::lockscreen::resolve(lock);
+        grade_still(&rendered, resolved.blur, resolved.dim);
+    }
     std::fs::create_dir_all(dir).ok()?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -780,6 +816,42 @@ mod tests {
         let p = dir.join(format!("{FRAME_PREFIX}{stamp}.png"));
         std::fs::write(&p, b"png").unwrap();
         p
+    }
+
+    // -- dim and blur ------------------------------------------------------------
+
+    #[test]
+    fn grading_bakes_in_dim_and_blur_and_leaves_a_plain_frame_untouched() {
+        let dir = tempdir("grade");
+        let path = dir.join("frame.png");
+        let save = |img: &image::RgbaImage| img.save(&path).unwrap();
+        let open = || image::open(&path).unwrap().to_rgba8();
+
+        let grey = image::RgbaImage::from_pixel(64, 36, image::Rgba([200, 200, 200, 255]));
+        save(&grey);
+        let before = std::fs::read(&path).unwrap();
+        grade_still(&path, 0.0, 0.0);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "0/0 must not rewrite"
+        );
+
+        grade_still(&path, 0.0, 0.5);
+        let out = open();
+        assert_eq!(out.dimensions(), (64, 36));
+        let v = out.get_pixel(32, 18).0[0];
+        assert!((96..=104).contains(&v), "half dim of 200 gave {v}");
+
+        // A hard black|white edge: blur softens the seam, dim is not involved.
+        let edge = image::RgbaImage::from_fn(64, 36, |x, _| {
+            let c = if x < 32 { 0 } else { 255 };
+            image::Rgba([c, c, c, 255])
+        });
+        save(&edge);
+        grade_still(&path, 0.1, 0.0);
+        let seam = open().get_pixel(32, 18).0[0];
+        assert!((40..=215).contains(&seam), "seam still hard: {seam}");
     }
 
     // -- decisions -------------------------------------------------------------

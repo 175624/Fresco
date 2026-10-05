@@ -54,6 +54,15 @@ fn apply_blocking() -> Result<()> {
             return Err(anyhow::anyhow!("daemon error: {message}"));
         }
     } else {
+        // A Stop that landed while this Apply was queued already saved
+        // `enabled = false` to disk and took the daemon down: spawning a
+        // fresh daemon here would resurrect the wallpaper the user just
+        // stopped, reading as "Stop did nothing" (issue #33). The disk
+        // config is the source of truth — when it says off, there is
+        // nothing to apply to.
+        if !Config::load().unwrap_or_default().enabled {
+            return Ok(());
+        }
         spawn_daemon()?;
         // Poll instead of one fixed sleep: most daemons bind well under a
         // second, and this thread isn't the GTK thread so polling costs
@@ -75,12 +84,38 @@ fn apply_blocking() -> Result<()> {
     Ok(())
 }
 
+/// How long a daemon that acknowledged `Stop` gets to actually exit before
+/// the stop worker calls it a failure. The daemon replies before tearing
+/// down, and teardown joins the icon-mirror thread (bounded; see
+/// `caja_mirror::Mirror::stop`) plus a handful of `gsettings` restores —
+/// seconds, not tens of seconds, even on weak hardware.
+const STOP_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Blocking `Stop`, off the GTK main thread; see `stop_async`.
 fn stop_blocking() -> Result<()> {
     if ipc::daemon_alive() {
         let resp = ipc::request_with_timeout(&Request::Stop, APPLY_TIMEOUT)?;
         if let Response::Err { message } = resp {
             return Err(anyhow::anyhow!("daemon error: {message}"));
+        }
+        // The daemon sends `Ok` before it tears anything down (see
+        // `Daemon::handle_request`), so a hung shutdown used to read as a
+        // successful Stop while the video kept playing (issue #33). Wait,
+        // bounded, for the daemon to actually go away. Not `daemon_alive()`:
+        // that is a real Status request, and after Stop the control thread no
+        // longer services requests, so it reads "dead" the moment the daemon
+        // stops answering — even if teardown then hangs. The daemon removes its
+        // socket as the very last step of shutdown, so a bare connect (which a
+        // wedged-but-alive daemon's backlog still accepts, and a SIGKILLed
+        // one's stale socket file refuses) is the real "gone" signal.
+        let start = std::time::Instant::now();
+        while std::os::unix::net::UnixStream::connect(ipc::socket_path()).is_ok() {
+            if start.elapsed() >= STOP_EXIT_TIMEOUT {
+                return Err(anyhow::anyhow!(
+                    "daemon acknowledged Stop but is still running"
+                ));
+            }
+            std::thread::sleep(STARTUP_POLL_INTERVAL);
         }
     }
     Ok(())

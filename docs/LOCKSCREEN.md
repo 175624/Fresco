@@ -277,8 +277,10 @@ Deepin keeps a separate lock-screen picture per user (not the desktop
 wallpaper), so Fresco saves yours the first time, sets a still frame as the
 lock-screen picture, and puts yours back when you stop Fresco or turn the
 setting off. If you pick a different lock-screen picture in the meantime,
-yours is kept. Deepin blurs that picture itself, so Fresco's own blur setting
-does not apply there. The frame is kept in `~/.cache/fresco`, or in
+yours is kept. Fresco applies your Dim and Blur settings to that frame, so the
+lock screen picks them up; Deepin may add a blur of its own on top. Widgets are
+not part of the frame (they would be frozen at one moment), so they appear in
+the preview only. The frame is kept in `~/.cache/fresco`, or in
 `/var/tmp/fresco-<uid>` when that folder is not readable by other users —
 Deepin's login screen and blur service run as other users and fall back to
 the stock picture if they cannot read it.
