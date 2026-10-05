@@ -4,7 +4,49 @@ All notable changes to Fresco are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.47] — Unreleased
+## [1.1.48] — 2026-10-05
+
+### Changed
+- **On deepin, the real lock screen now gets your dim and blur** (issue #37).
+  The still frame Fresco sets as deepin's lock-screen picture has your Lock
+  Screen dim and blur settings applied, and is redrawn when you change them.
+  Widgets stay preview-only, since a frozen clock would be wrong a minute
+  later, and the Lock Screen page now says so.
+
+### Fixed
+- **The daemon starts again after updating from 1.1.45 or older.** The
+  control-socket hardening (new in 1.1.46) refused a socket directory with
+  group/other permission bits — but every older release created exactly
+  such a directory (`0755` via `create_dir_all`), so the daemon exited on
+  startup and the diagnostics page reported "Daemon: not running". A
+  directory the user owns whose only fault is wide mode bits is now
+  tightened to `0700` in place; anything else untrustworthy (a symlink, a
+  non-directory, another user's directory) is still refused.
+- **Desktop icons stay hidden behind the wallpaper after login on Cinnamon
+  (X11)** (issue #39). If another app had focus when the wallpaper started,
+  Cinnamon's window manager silently ignored Fresco's request to sit below
+  the desktop-icon window, so the icons stayed covered until you opened and
+  closed an app. Fresco now also sends the standard pager restack request,
+  which Cinnamon honours, so the icons come back within two seconds.
+- **Stop Wallpaper now reliably stops the wallpaper** (issue #33). The
+  daemon answered Stop before it had torn anything down, so a shutdown that
+  hung read as a successful stop while the video kept playing. The window now
+  waits up to 5 seconds for the daemon to actually exit and reports a
+  failure instead of silently doing nothing. A change that was still queued
+  behind the Stop no longer starts the wallpaper you just stopped, and the
+  icon mirror's shutdown is now bounded to 3 seconds so it can't hold
+  the daemon open.
+- **Switching "Show desktop icons" on or off with no wallpaper playing no
+  longer shows "Couldn't start the wallpaper"** (issue #33). The setting is
+  saved and a short message says it takes effect once a wallpaper is
+  playing.
+- **One unreadable icon band no longer stops the rest of the desktop icon
+  mirror from repainting** (issue #33). It used to give up on every later
+  icon window as well, so on a multi-monitor desktop only some icons
+  refreshed. Fresco now skips just that one and catches up on the next
+  redraw.
+
+## [1.1.47] — 2026-10-01
 
 ### Added
 - **A "Video previews on hover" switch in the main menu.** Turn it off and

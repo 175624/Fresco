@@ -182,6 +182,10 @@ enum Cmd {
     Stop,
 }
 
+/// How long [`Mirror::stop`] waits for the mirror thread before detaching
+/// and letting shutdown proceed (see `stop`).
+const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Handle to the mirror thread. Dropping it without [`Mirror::stop`] leaves the
 /// thread running until the process exits, which is harmless.
 pub struct Mirror {
@@ -244,13 +248,42 @@ impl Mirror {
         self.failed.load(Ordering::SeqCst)
     }
 
-    /// Stop the thread and wait for it. Closing its connection undoes the
-    /// redirect and destroys the icon windows.
+    /// Stop the thread and wait for it — bounded. Closing its connection
+    /// undoes the redirect and destroys the icon windows.
+    ///
+    /// The thread may be parked in `wait_for_event()` or mid-`refresh()`'s
+    /// banded `GetImage` loop when Stop lands; an unbounded `join` there
+    /// would hang `shutdown()` forever while the GUI already got its `Ok`
+    /// (issue #33). So the join runs on a throwaway waiter and `stop`
+    /// gives it [`STOP_JOIN_TIMEOUT`]: on timeout the waiter keeps the
+    /// `JoinHandle` and finishes the thread's own cleanup in the
+    /// background (its `State::drop` plus connection close handle the
+    /// window side), while shutdown proceeds to the restores and socket
+    /// removal. Harmless even when the daemon keeps running (the mid-run
+    /// stops in `sync_caja_mirror` and `fall_back_to_restack`): the detached
+    /// thread exits on its own once `tx` is dropped.
     pub fn stop<C: Connection>(mut self, conn: &C) {
         let _ = self.tx.send(Cmd::Stop);
         self.wake(conn);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("caja-mirror-join".into())
+                .spawn(move || {
+                    let _ = t.join();
+                    let _ = done_tx.send(());
+                })
+                .ok();
+            if done_rx.recv_timeout(STOP_JOIN_TIMEOUT).is_err() {
+                // One last nudge in case the wake was lost, then detach:
+                // the waiter still owns the handle and reaps the thread.
+                self.wake(conn);
+                log::warn!(
+                    "{}: icon mirror thread did not stop in {:?}; continuing shutdown without it",
+                    self.desktop.label(),
+                    STOP_JOIN_TIMEOUT
+                );
+            }
         }
     }
 
@@ -1201,7 +1234,12 @@ impl State {
                 continue;
             };
             let Some(changed) = read_part(conn, caja, c, part, desktop, msb_first)? else {
-                return Ok(());
+                // One unreadable child must not poison the rest: skip it only
+                // (its cache is untouched, so it catches up on the next
+                // damage) instead of abandoning this and every later parent —
+                // that skew read as "only some icons repaint" on multi-monitor
+                // desktops (issue #33).
+                continue;
             };
             let (dst_x, dst_y) = (part.x - c.parent.x, part.y - c.parent.y);
             conn.copy_area(
@@ -1237,9 +1275,13 @@ impl State {
 /// Read `part` (root coordinates) of Caja's offscreen copy into `c`'s mask.
 ///
 /// Returns whether the visible pixels changed (so the shape must be re-sent),
-/// or `None` when the pixels could not be read. Caja: a pixel is visible when
-/// it is not exactly the key. Deepin: the pixels are classified and the mask is
-/// refined from the cached classes of the whole icon — see [`mask`].
+/// or `None` when not even the first band could be read (the cache is then
+/// untouched). A band that fails after earlier ones were read stops the read
+/// there and reports what those bands changed: they are already in the cache,
+/// so dropping that would hide the change from every later read. Caja: a pixel
+/// is visible when it is not exactly the key. Deepin: the pixels are classified
+/// and the mask is refined from the cached classes of the whole icon — see
+/// [`mask`].
 fn read_part(
     conn: &RustConnection,
     caja: &Caja,
@@ -1273,7 +1315,10 @@ fn read_part(
             .reply()
             .ok()
         else {
-            return Ok(None);
+            if row == 0 {
+                return Ok(None);
+            }
+            break; // keep the earlier bands' changes; see the doc comment
         };
         let stride = usize::from(part.width) * 4;
         for dy in 0..usize::from(h) {

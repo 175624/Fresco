@@ -7540,6 +7540,25 @@ fn add_deepin_group(page: &adw::PreferencesPage, state: Rc<RefCell<AppState>>) {
                 s.config.clone()
             };
             let state = state.clone();
+            // A preset, not a wallpaper: with nothing configured to play (or
+            // Fresco itself disabled) there is nothing to apply to, so save
+            // only. Forcing an Apply here would spawn a daemon with nothing
+            // to show and surface a scary "Couldn't start the wallpaper"
+            // toast for a setting that saved fine (issue #33).
+            let has = |w: &crate::config::Wallpaper| {
+                w.effective_path().is_some() || w.slideshow.is_some()
+            };
+            let apply = config.enabled
+                && (has(&config.wallpaper)
+                    || config.monitors.values().any(has)
+                    || schedule_active(&config));
+            if !apply {
+                show_toast(
+                    &state,
+                    t!("Saved — takes effect when a wallpaper is playing."),
+                );
+                return;
+            }
             daemon_ctl::apply_async(&config, move |outcome| {
                 if outcome.superseded {
                     return;

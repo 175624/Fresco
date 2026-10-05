@@ -1645,8 +1645,9 @@ impl Daemon {
         if x11win::at_bottom(&stack, &ours) == Some(true) {
             return;
         }
+        let root = self.screen().root;
         for r in &self.renderers {
-            let _ = x11win::lower(&self.conn, r.window.window);
+            let _ = x11win::lower_wallpaper(&self.conn, &self.atoms, root, r.window.window);
         }
         let _ = self.conn.flush();
     }

@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -276,6 +276,15 @@ fn libc_getuid() -> u32 {
 /// only if it is a real directory (not a symlink), owned by our own uid, with
 /// no group/other permission bits set at all.
 ///
+/// One exception: a real directory we own whose *only* problem is wide mode
+/// bits is tightened to `0o700` in place and then accepted. Releases before
+/// 1.1.46 created this directory with `create_dir_all` (umask `022` →
+/// `0755`), so every upgrading user has exactly such a directory; refusing
+/// it would brick the daemon on update with "refusing to trust it". A
+/// directory owned by someone else, a symlink, or a non-directory is still
+/// refused — tightening those would hand an attacker-owned path to the
+/// socket, which is the attack this gate exists to stop.
+///
 /// Even under `$XDG_RUNTIME_DIR` (created `0700` by systemd-logind, and so
 /// already unreachable by any other uid) this same check runs on the `fresco`
 /// subdirectory this function creates inside it — belt and suspenders costs
@@ -327,10 +336,34 @@ fn dir_is_trustworthy(
 
 /// Real-filesystem half of [`ensure_safe_socket_dir`]'s `AlreadyExists` path:
 /// `lstat`s `dir` (never following a symlink — that is exactly the case this
-/// must catch) and runs [`dir_is_trustworthy`] against what it finds.
+/// must catch) and runs [`dir_is_trustworthy`] against what it finds, with
+/// one self-heal first: a real directory owned by us whose only fault is
+/// wide mode bits (what pre-1.1.46 releases left behind — see
+/// [`ensure_safe_socket_dir`]) is chmodded to `0o700` and re-checked rather
+/// than refused. Anything else untrustworthy (symlink, non-directory, another
+/// uid's directory) is an error, as is a chmod that fails or still leaves
+/// the directory untrustworthy.
 fn verify_safe_dir(dir: &Path) -> Result<()> {
     let meta =
         std::fs::symlink_metadata(dir).with_context(|| format!("checking {}", dir.display()))?;
+    if !meta.file_type().is_symlink()
+        && meta.is_dir()
+        && meta.uid() == libc_getuid()
+        && meta.mode() & 0o077 != 0
+    {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("tightening {}", dir.display()))?;
+        let meta = std::fs::symlink_metadata(dir)
+            .with_context(|| format!("re-checking {}", dir.display()))?;
+        return dir_is_trustworthy(
+            meta.file_type().is_symlink(),
+            meta.is_dir(),
+            meta.uid(),
+            meta.mode(),
+            libc_getuid(),
+        )
+        .map_err(|reason| anyhow!("{} {reason} — refusing to trust it", dir.display()));
+    }
     dir_is_trustworthy(
         meta.file_type().is_symlink(),
         meta.is_dir(),
@@ -411,7 +444,6 @@ pub fn daemon_alive() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn request_json_shape() {
@@ -867,16 +899,22 @@ mod tests {
     }
 
     #[test]
-    fn ensure_safe_socket_dir_rejects_a_pre_existing_dir_with_a_wide_mode() {
+    fn ensure_safe_socket_dir_repairs_a_pre_existing_dir_with_a_wide_mode() {
+        // Pre-1.1.46 releases created this directory with `create_dir_all`
+        // (umask 022 → 0755), so every upgrading user has one: it must be
+        // tightened to 0700 and accepted, not refused (which bricked the
+        // daemon on update with "refusing to trust it").
         let parent = ipc_tempdir("wide-mode");
         let target = parent.join("fresco");
         std::fs::create_dir_all(&target).unwrap();
-        // World-readable/traversable: exactly the kind of pre-created
-        // directory another local user could have left behind.
+        // World-readable/traversable: exactly what the old releases left.
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let err = ensure_safe_socket_dir(&target).unwrap_err();
-        assert!(format!("{err:#}").contains("other users"), "{err:#}");
+        ensure_safe_socket_dir(&target)
+            .expect("a 0755 dir we own must be tightened and accepted, not refused");
+
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o700);
 
         std::fs::remove_dir_all(&parent).ok();
     }

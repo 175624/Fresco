@@ -27,6 +27,7 @@ x11rb::atom_manager! {
         _NET_WM_STATE_FULLSCREEN,
         _NET_WM_STATE_HIDDEN,
         _NET_CLIENT_LIST_STACKING,
+        _NET_RESTACK_WINDOW,
         _NET_WM_NAME,
         UTF8_STRING,
         _MOTIF_WM_HINTS,
@@ -196,7 +197,7 @@ impl WallpaperWindow {
         )?;
 
         conn.map_window(window)?;
-        restack(conn, window, kind)?;
+        restack(conn, atoms, screen.root, window, kind)?;
         conn.flush()?;
 
         // Wait until the window is actually viewable before the caller embeds mpv
@@ -257,11 +258,51 @@ pub fn raise<C: Connection>(conn: &C, window: Window) -> Result<()> {
     Ok(())
 }
 
+/// Lower one of OUR wallpaper windows: the plain [`lower`], plus the EWMH
+/// `_NET_RESTACK_WINDOW` form of the same request.
+///
+/// Muffin (Cinnamon, X11) drops a plain ConfigureWindow stacking request from
+/// any client that isn't the active application once the active window has a
+/// newer user time than ours (`meta_window_x11_configure_request`'s
+/// focus-stealing guard) — and our window never gets a newer one. A wallpaper
+/// mapped after `nemo-desktop` (both are DESKTOP-layer, so the later one sits
+/// on top) while anything else has focus, as on a busy login, therefore stays
+/// above the icons until focus moves on (issue #39). The pager-flagged message
+/// goes through `handle_net_restack_window`, which has no such guard.
+pub fn lower_wallpaper<C: Connection>(
+    conn: &C,
+    atoms: &Atoms,
+    root: Window,
+    window: Window,
+) -> Result<()> {
+    lower(conn, window)?;
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        restack_below_event(atoms, window),
+    )?;
+    Ok(())
+}
+
+/// `_NET_RESTACK_WINDOW` asking for `window` at the bottom: source indication
+/// 2 ("pager" — muffin ignores anything else), no sibling, detail `Below`.
+fn restack_below_event(atoms: &Atoms, window: Window) -> ClientMessageEvent {
+    let detail = u32::from(StackMode::BELOW);
+    ClientMessageEvent::new(32, window, atoms._NET_RESTACK_WINDOW, [2, 0, detail, 0, 0])
+}
+
 /// Put `window` where its `kind` belongs in the stack. Called at creation and
 /// again on the daemon's periodic stacking pass.
-pub fn restack<C: Connection>(conn: &C, window: Window, kind: WindowKind) -> Result<()> {
+pub fn restack<C: Connection>(
+    conn: &C,
+    atoms: &Atoms,
+    root: Window,
+    window: Window,
+    kind: WindowKind,
+) -> Result<()> {
     match kind {
-        WindowKind::Desktop => lower(conn, window),
+        WindowKind::Desktop => lower_wallpaper(conn, atoms, root, window),
         WindowKind::DdeRaised => raise(conn, window),
     }
 }
@@ -328,6 +369,7 @@ mod tests {
             _NET_WM_STATE_FULLSCREEN: 9,
             _NET_WM_STATE_HIDDEN: 10,
             _NET_CLIENT_LIST_STACKING: 11,
+            _NET_RESTACK_WINDOW: 16,
             _NET_WM_NAME: 12,
             UTF8_STRING: 13,
             _MOTIF_WM_HINTS: 14,
@@ -378,6 +420,20 @@ mod tests {
                 a._NET_WM_STATE_SKIP_TASKBAR,
                 a._NET_WM_STATE_SKIP_PAGER,
             ]
+        );
+    }
+
+    /// Muffin only honours `_NET_RESTACK_WINDOW` from a "pager" (source 2), and
+    /// the stack detail must be the X `Below` value with no sibling.
+    #[test]
+    fn restack_below_event_is_a_pager_request_for_the_bottom() {
+        let ev = restack_below_event(&atoms(), 77);
+        assert_eq!(ev.format, 32);
+        assert_eq!(ev.window, 77);
+        assert_eq!(ev.type_, 16);
+        assert_eq!(
+            ev.data.as_data32(),
+            [2, 0, u32::from(StackMode::BELOW), 0, 0]
         );
     }
 

@@ -1004,26 +1004,57 @@ pub fn compose_still(
     blur: f32,
     dim: f32,
 ) -> Bgra {
-    let out_scale = sane_scale(spec.scale);
-    let logical = Size::new(
-        (spec.output.w / out_scale).max(1.0),
-        (spec.output.h / out_scale).max(1.0),
-    );
-
-    let mut render_scale = out_scale;
-    let mut canvas = loop {
-        match Canvas::for_logical(logical, render_scale) {
-            Ok(c) => break c,
-            Err(_) if render_scale > 0.05 => render_scale = (render_scale * 0.5).max(0.05),
-            Err(_) => {
-                return Bgra {
-                    w: 1,
-                    h: 1,
-                    data: vec![0, 0, 0, 0],
-                }
-            }
-        }
+    let Some(mut canvas) = still_canvas(spec.output, spec.scale) else {
+        return Bgra {
+            w: 1,
+            h: 1,
+            data: vec![0, 0, 0, 0],
+        };
     };
+    paint_backdrop(&mut canvas, background, blur, dim);
+    compose(&mut canvas, fonts, spec, data);
+    canvas.into_bgra()
+}
+
+/// [`compose_still`] without the widgets: just `background` scaled to fill,
+/// blurred and dimmed, at `output`'s aspect ratio (device pixels, scale 1). The
+/// same two functions paint the backdrop for both, so a host that can only show
+/// a plain picture (Deepin's greeter background) gets exactly the preview's
+/// blur and dim. `blur` and `dim` mean what they do for [`compose_still`].
+/// `None` only when no canvas could be made at all.
+pub fn compose_backdrop(
+    background: &image::RgbaImage,
+    output: Size,
+    blur: f32,
+    dim: f32,
+) -> Option<Bgra> {
+    let mut canvas = still_canvas(output, 1.0)?;
+    paint_backdrop(&mut canvas, background, blur, dim);
+    Some(canvas.into_bgra())
+}
+
+/// A canvas for `output` at its HiDPI `scale`, halving the density until it
+/// fits [`crate::widgetkit::MAX_CANVAS_AREA`] — see [`compose_still`]'s note on
+/// degrading rather than failing.
+fn still_canvas(output: Size, scale: f32) -> Option<Canvas> {
+    let out_scale = sane_scale(scale);
+    let logical = Size::new(
+        (output.w / out_scale).max(1.0),
+        (output.h / out_scale).max(1.0),
+    );
+    let mut render_scale = out_scale;
+    loop {
+        match Canvas::for_logical(logical, render_scale) {
+            Ok(c) => return Some(c),
+            Err(_) if render_scale > 0.05 => render_scale = (render_scale * 0.5).max(0.05),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// `background` filling `canvas`, blurred by the `blur` radius and veiled by
+/// `dim` — the part of [`compose_still`] that sits under the widgets.
+fn paint_backdrop(canvas: &mut Canvas, background: &image::RgbaImage, blur: f32, dim: f32) {
     let bounds = canvas.bounds();
 
     if background.width() > 0 && background.height() > 0 {
@@ -1056,9 +1087,6 @@ pub fn compose_still(
     if d > 0.0 {
         canvas.rounded_rect(bounds, 0.0, &Fill::solid(Color::BLACK.with_alpha(d)));
     }
-
-    compose(&mut canvas, fonts, spec, data);
-    canvas.into_bgra()
 }
 
 #[cfg(test)]

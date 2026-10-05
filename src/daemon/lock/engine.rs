@@ -1126,7 +1126,7 @@ fn render_layer_files(
 /// Reuses [`crate::widgetkit::Color::from_premul_rgba8`], the toolkit's own
 /// inverse of the premultiply it does on the way *into* a [`Bgra`], rather
 /// than re-deriving the divide-by-alpha arithmetic here.
-pub(super) fn bgra_to_rgba_image(bgra: &Bgra) -> RgbaImage {
+pub(in crate::daemon) fn bgra_to_rgba_image(bgra: &Bgra) -> RgbaImage {
     use crate::widgetkit::Color;
     let mut img = RgbaImage::new(bgra.w, bgra.h);
     for (i, px) in img.pixels_mut().enumerate() {
@@ -1145,7 +1145,7 @@ pub(super) fn bgra_to_rgba_image(bgra: &Bgra) -> RgbaImage {
 /// Write `img` as a PNG to `path` atomically: encode to a temp file in the
 /// same directory, then `rename` over the target — `packaging/kde/README.md`'s
 /// contract, so `main.qml` never reads a half-written file.
-pub(super) fn write_png_atomic(path: &Path, img: &RgbaImage) -> std::io::Result<()> {
+pub(in crate::daemon) fn write_png_atomic(path: &Path, img: &RgbaImage) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     // Best-effort: the directory may not exist yet (e.g. `preview_path`'s
     // `$XDG_RUNTIME_DIR/fresco` before anything else has created it, or a

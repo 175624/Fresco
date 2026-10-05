@@ -461,6 +461,17 @@ fn cosmic_hint(host: &str) -> Option<String> {
     })
 }
 
+/// Deepin's real lock screen only receives a still frame — with the dim and
+/// blur sliders baked in, but no widgets (a frozen clock would be wrong a
+/// minute later) — so the widgets show in Fresco's preview only. `None` for
+/// every other host.
+fn deepin_hint(host: &str) -> Option<String> {
+    (host == "deepin").then(|| {
+        t!("On Deepin the lock screen gets a still frame with your dim and blur. Widgets appear in the preview only.")
+            .to_string()
+    })
+}
+
 /// `"{base} ✓"` / `"{base} ✗"` — the capability chips' text.
 fn chip_label(base: &str, on: bool) -> String {
     format!("{base} {}", if on { "✓" } else { "✗" })
@@ -683,6 +694,9 @@ fn apply_status(
 
     let mut notes = ls.notes.clone();
     if let Some(hint) = cosmic_hint(&ls.host) {
+        notes.push(hint);
+    }
+    if let Some(hint) = deepin_hint(&ls.host) {
         notes.push(hint);
     }
     if notes.is_empty() {
@@ -1712,6 +1726,22 @@ mod tests {
         assert!(cosmic_hint("cosmic").is_some());
         for other in ["kde", "gnome", "wlroots", "x11", "unsupported", ""] {
             assert!(cosmic_hint(other).is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn deepin_hint_only_fires_for_deepin() {
+        assert!(deepin_hint("deepin").is_some());
+        for other in [
+            "kde",
+            "gnome",
+            "cosmic",
+            "wlroots",
+            "x11",
+            "unsupported",
+            "",
+        ] {
+            assert!(deepin_hint(other).is_none(), "{other}");
         }
     }
 
