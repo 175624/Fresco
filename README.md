@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/DibbayajyotiRoy/fresco/main/data/icons/hicolor/256x256/apps/io.github.dibbayajyotiroy.Fresco.png" width="112" alt="Fresco application icon — a free, open-source live wallpaper app for Linux" />
+<img src="./data/icons/hicolor/256x256/apps/io.github.dibbayajyotiroy.Fresco.png" width="112" alt="Fresco application icon — a free, open-source live wallpaper app for Linux" />
 
 # Fresco — Live Wallpapers for Linux
 
-English | [简体中文](README_zh.md)
+English | [简体中文](README.zh-CN.md)
 
 **Fresco is a free, open-source live wallpaper app for Linux that sets any video, GIF or image as an animated desktop wallpaper on X11 and Wayland.** A **Wallpaper Engine alternative for Linux**, working on COSMIC, Hyprland, Sway, KDE Plasma 6, and Deepin DDE.
 
@@ -17,7 +17,7 @@ English | [简体中文](README_zh.md)
 
 [Website](https://fresco.dibbayajyoti.com) · [Install](#install) · [Supported environments](#supported-environments) · [Comparison](#fresco-vs-other-live-wallpaper-options) · [FAQ](#faq) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/DibbayajyotiRoy/fresco/issues)
 
-<img src="https://raw.githubusercontent.com/DibbayajyotiRoy/fresco/main/data/screenshots/gallery.png" alt="Fresco wallpaper library window showing a grid of video wallpapers on a Linux desktop" width="800" />
+<img src="./data/screenshots/gallery.png" alt="Fresco wallpaper library window showing a grid of video wallpapers on a Linux desktop" width="800" />
 
 </div>
 

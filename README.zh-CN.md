@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/DibbayajyotiRoy/fresco/main/data/icons/hicolor/256x256/apps/io.github.dibbayajyotiroy.Fresco.png" width="112" alt="Fresco 应用图标——免费开源的 Linux 动态壁纸应用" />
+<img src="./data/icons/hicolor/256x256/apps/io.github.dibbayajyotiroy.Fresco.png" width="112" alt="Fresco 应用图标——免费开源的 Linux 动态壁纸应用" />
 
 # Fresco — Linux 动态壁纸
 
@@ -17,7 +17,7 @@
 
 [官网](https://fresco.dibbayajyoti.com) · [安装](#安装) · [支持的环境](#支持的环境) · [对比](#fresco-与其他动态壁纸方案的对比) · [常见问题](#常见问题) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/DibbayajyotiRoy/fresco/issues)
 
-<img src="https://raw.githubusercontent.com/DibbayajyotiRoy/fresco/main/data/screenshots/gallery_zh.png" alt="Fresco 壁纸库窗口，在 Linux 桌面上以网格形式展示视频壁纸" width="800" />
+<img src="./data/screenshots/gallery_zh.png" alt="Fresco 壁纸库窗口，在 Linux 桌面上以网格形式展示视频壁纸" width="800" />
 
 </div>
 
