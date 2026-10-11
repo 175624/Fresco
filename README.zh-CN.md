@@ -1,5 +1,4 @@
 <div align="center">
-
 <img src="./data/icons/hicolor/256x256/apps/io.github.dibbayajyotiroy.Fresco.png" width="112" alt="Fresco 应用图标——免费开源的 Linux 动态壁纸应用" />
 
 # Fresco — Linux 动态壁纸
@@ -52,7 +51,7 @@ Fresco 是一款免费、开源的 Linux 动态壁纸应用，可将任意视频
 | **安装** | Deepin 应用商店、`.deb` 安装包或一行脚本命令 |
 | **用户规模** | 来自 110+ 国家/地区的 1,500+ 名用户 |
 | **语言** | 英文及 12 种翻译语言 |
-| **最新版本** | 1.1.45 |
+| **最新版本** | 1.1.49 |
 
 ## 安装
 
@@ -94,7 +93,7 @@ sudo apt install ./fresco_*.deb
 - **批量管理**——一次选中多张壁纸，一键移除
 - **内置目录**——在应用内浏览精选的、授权合规的壁纸
 - **命令面板**——Ctrl+K 唤出面板，用键盘设定任意壁纸或使用任意功能
-- **全屏自动暂停**——按显示器生效，COSMIC 上同样支持；另有电池供电时暂停
+- **全屏自动暂停**——在每台显示器上，支持X11、wlroots合成器、COSMIC和KDE Plasma（通过其壁纸插件）；也可选择适用于最大化窗口，并支持电池供电时暂停。
 - **浏览器新标签页扩展**——在每个新标签页镜像你的壁纸（Chrome/Brave/Edge/Firefox；从 [`./extension`](extension) 以未打包方式加载）
 - **Deepin DDE 支持**——在 Deepin 25 上自动适配 DDE 桌面，需要时点击桌面即可让图标重新显示十秒（见 [Deepin 上播放动态壁纸时桌面图标被隐藏了](#deepin-上播放动态壁纸时桌面图标被隐藏了)）
 - **裁剪与旋转编辑器**——每张壁纸独立的音频/音量、幻灯片切换效果、可搜索的壁纸库
@@ -110,7 +109,7 @@ sudo apt install ./fresco_*.deb
 | COSMIC（Wayland） | ✅ | layer-shell |
 | Hyprland | ✅ | layer-shell |
 | Sway | ✅ | layer-shell |
-| KDE Plasma 6（Wayland） | ✅ | layer-shell |
+| KDE Plasma 6（X11 和 Wayland） | ✅ | 通过 plasmashell 自带的壁纸插件进行设置，因此桌面图标保持可见。视频播放需要 `qml6-module-qtmultimedia`。播放由 Qt 负责，而非 mpv：静音、无硬件解码调优、无裁剪或转场；播放列表仅播放其第一个文件，幻灯片仅显示其第一帧。 |
 | GNOME on Wayland | ⚠️ | 仅静帧——Mutter 不提供动态壁纸绘制面，无视频、无挂件。动态视频需要一个 Fresco GNOME 扩展（规划中） |
 
 以上每个环境都在每次发布时于 CI 中无头运行验证。
@@ -177,7 +176,7 @@ Fresco 在 GPU 上解码视频（VA-API / NVDEC），CPU 占用保持接近空�
 
 ### Fresco 支持 Wayland 吗？
 
-支持，在实现了 layer-shell 协议的合成器上——COSMIC、Hyprland、Sway 与 KDE Plasma 6。GNOME on Wayland 是例外：Mutter 不提供壁纸绘制面，Fresco 在那里显示静帧并在应用内说明。X11 会话则完全支持。
+支持，在实现了 layer-shell 协议的合成器上——COSMIC、Hyprland 与 Sway——以及 KDE Plasma 6（X11 和 Wayland，通过 plasmashell 自带的壁纸插件设置）。GNOME on Wayland 是例外：Mutter 不提供壁纸绘制面，Fresco 在那里显示静帧并在应用内说明。X11 会话则完全支持。
 
 ### Fresco 是免费的吗？
 
@@ -332,4 +331,4 @@ echo 'FRESCO_MPVPAPER=/home/YOU/.local/bin/mpvpaper' > ~/.config/environment.d/f
 
 ---
 
-<sub>Fresco——面向 Linux（X11 与 Wayland）的动态壁纸、视频壁纸与动画桌面背景，带有绘制进壁纸的桌面挂件：桌面歌词、桌面时钟挂件、音频可视化（音乐可视化壁纸）与专辑封面。可作为 Ubuntu、Pop!_OS、Linux Mint、Debian、elementary OS、Deepin 与 Kali Linux 的 Wallpaper Engine 替代品，也是 COSMIC 与 Wayland 上壁纸挂件的 Conky 替代品。已有 110+ 国家/地区的 1,500+ 人在使用。最后更新：2026-09-28。</sub>
+<sub>Fresco——面向 Linux（X11 与 Wayland）的动态壁纸、视频壁纸与动画桌面背景，带有绘制进壁纸的桌面挂件：桌面歌词、桌面时钟挂件、音频可视化（音乐可视化壁纸）与专辑封面。可作为 Ubuntu、Pop!_OS、Linux Mint、Debian、elementary OS、Deepin 与 Kali Linux 的 Wallpaper Engine 替代品，也是 COSMIC 与 Wayland 上壁纸挂件的 Conky 替代品。已有 110+ 国家/地区的 1,500+ 人在使用。最后更新：2026-10-11。</sub>

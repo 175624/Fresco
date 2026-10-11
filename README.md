@@ -177,7 +177,7 @@ Fresco decodes video on the GPU (VA-API / NVDEC), so CPU usage stays near idle. 
 
 ### Does Fresco work on Wayland?
 
-Yes, on compositors that implement the layer-shell protocol — COSMIC, Hyprland, Sway, and KDE Plasma 6. GNOME on Wayland is the exception: Mutter exposes no wallpaper surface, so Fresco shows a still frame there and says so in the app. X11 sessions are fully supported.
+Yes, on compositors that implement the layer-shell protocol — COSMIC, Hyprland, and Sway — and on KDE Plasma 6 (X11 and Wayland) through plasmashell's own wallpaper plugin. GNOME on Wayland is the exception: Mutter exposes no wallpaper surface, so Fresco shows a still frame there and says so in the app. X11 sessions are fully supported.
 
 ### Is Fresco free?
 
@@ -426,4 +426,4 @@ Bug reports, feature requests, and PRs are welcome — open an [issue](https://g
 
 ---
 
-<sub>Fresco — live wallpaper, video wallpaper, and animated desktop background for Linux (X11 and Wayland), with desktop widgets drawn into the wallpaper: desktop lyrics, a desktop clock widget, an audio visualiser (music visualizer wallpaper), and album art. A Wallpaper Engine alternative for Ubuntu, Pop!_OS, Linux Mint, Debian, elementary OS, Deepin, and Kali Linux, and a Conky alternative for wallpaper widgets on COSMIC and Wayland. Used by 1,500+ people in 110+ countries. Last updated: 2026-10-10.</sub>
+<sub>Fresco — live wallpaper, video wallpaper, and animated desktop background for Linux (X11 and Wayland), with desktop widgets drawn into the wallpaper: desktop lyrics, a desktop clock widget, an audio visualiser (music visualizer wallpaper), and album art. A Wallpaper Engine alternative for Ubuntu, Pop!_OS, Linux Mint, Debian, elementary OS, Deepin, and Kali Linux, and a Conky alternative for wallpaper widgets on COSMIC and Wayland. Used by 1,500+ people in 110+ countries. Last updated: 2026-10-11.</sub>
